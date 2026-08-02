@@ -858,7 +858,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// Start capture before SetupMirror. Modern receivers start a deadline for
 	// the first video data during setup, while the Wayland screencast portal may
 	// wait indefinitely for user selection.
-	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID)
+	capMaxW, capMaxH := info.DisplaySize()
+	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID, capMaxW, capMaxH)
 	if err != nil {
 		client.Close()
 		removeStream(fmt.Sprintf("capture failed: %v", err))
@@ -933,7 +934,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 // getOrStartBroadcastLocked ensures a shared BroadcastCapture is running and
 // returns a new sink registered with it. If no capture is running, it starts one.
 // Must NOT be called with d.mu held.
-func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airplay.BroadcastSink, error) {
+// maxW/maxH clamp the encoded size for the receiver that starts the capture;
+// sinks that join later share it.
+func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, maxH int) (*airplay.BroadcastSink, error) {
 	d.mu.Lock()
 	bc := d.broadcast
 	d.mu.Unlock()
@@ -949,6 +952,8 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
+		MaxWidth:     maxW,
+		MaxHeight:    maxH,
 		ShowCursor:   d.cfg.ShowCursor,
 		RestoreToken: restoreToken,
 	}

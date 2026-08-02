@@ -21,6 +21,11 @@ type CaptureConfig struct {
 	Bitrate int    // Video bitrate in kbps (0 = auto)
 	HWAccel string // "auto", "nvenc", "vaapi", "openh264", or "none" (x264)
 
+	// MaxWidth/MaxHeight clamp the encoded frame to the size the receiver
+	// advertised in /info. Zero leaves the capture at its native size.
+	MaxWidth  int
+	MaxHeight int
+
 	X11WindowID   uint64
 	X11WindowName string
 
@@ -189,34 +194,60 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	//   - Wayland compositors may stop publishing an undamaged screen. A forced-live
 	//     GStreamer compositor repeats its input pad's latest frame at a regular
 	//     rate, because AirPlay requires continuous video even for a static image.
-	// The stream is encoded at the portal's native resolution; we do not rescale
-	// because the captured surface size is whatever the compositor hands us. The
-	// actual encoded dimensions are read back from the H.264 SPS downstream.
+	// The encoded dimensions are capped to the receiver's advertised display size
+	// when available. The actual result is read back from the H.264 SPS downstream.
 	const pwFdNum = 3
 	source := gstStage{
 		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
 		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
 	}
 
+	// Receivers advertise the largest frame their decoder accepts; an oversized
+	// stream makes some of them stop consuming after the first IDR. add-borders
+	// preserves the display aspect ratio when the source and receiver differ.
+	scaleToReceiver := cfg.MaxWidth > 0 && cfg.MaxHeight > 0
+	hasCompositor := streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor")
+
 	var beforeConvert []gstStage
 	if hasGstElement("vapostproc") {
-		beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
+		stage := gstStage{"vapostproc"}
+		if scaleToReceiver && !hasCompositor {
+			stage = append(stage, "add-borders=true")
+		}
+		beforeConvert = append(beforeConvert, stage)
 	} else {
 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
+		if scaleToReceiver && !hasCompositor {
+			beforeConvert = append(beforeConvert, gstStage{"videoscale", "add-borders=true"})
+		}
 	}
-	afterFormat := []gstStage{lowLatencyVideoQueueStage()}
-	if streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor") {
+
+	var afterFormat []gstStage
+	if hasCompositor {
 		beforeConvert = append(beforeConvert,
 			gstStage{"compositor", "force-live=true", "ignore-inactive-pads=true", "background=black"},
 			gstStage{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", streamSize[0], streamSize[1], fps)},
 		)
+		// The compositor fixes its output to the portal size, so scale downstream.
+		if scaleToReceiver {
+			afterFormat = append(afterFormat, gstStage{"videoscale", "add-borders=true"})
+		}
 	} else {
 		log.Printf("[CAPTURE] idle-frame compositor unavailable; using portal frame timing")
-		afterFormat = []gstStage{
-			{"videorate", "drop-only=true", "skip-to-first=true"},
+	}
+	if scaleToReceiver {
+		afterFormat = append(afterFormat, gstStage{fmt.Sprintf(
+			"video/x-raw,width=%d,height=%d,pixel-aspect-ratio=1/1", cfg.MaxWidth, cfg.MaxHeight,
+		)})
+	}
+	if hasCompositor {
+		afterFormat = append(afterFormat, lowLatencyVideoQueueStage())
+	} else {
+		afterFormat = append(afterFormat,
+			gstStage{"videorate", "drop-only=true", "skip-to-first=true"},
 			frameRateStage(fps),
 			lowLatencyVideoQueueStage(),
-		}
+		)
 	}
 	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterFormat, encoderParts)
 

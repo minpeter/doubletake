@@ -324,10 +324,13 @@ func main() {
 		if creds := credStore.Lookup(info.DeviceID); creds != nil {
 			restoreToken = creds.RestoreToken
 		}
+		maxW, maxH := info.DisplaySize()
 		captureCfg := airplay.CaptureConfig{
 			FPS:           *fps,
 			Bitrate:       *bitrate,
 			HWAccel:       *hwaccel,
+			MaxWidth:      maxW,
+			MaxHeight:     maxH,
 			X11WindowID:   xid,
 			X11WindowName: *x11WindowName,
 			ShowCursor:    !*noCursor,
