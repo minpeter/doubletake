@@ -137,7 +137,7 @@ doubletake -target 192.168.1.77 -pair
 doubletake -target 192.168.1.77 -creds airplay-credentials.json
 
 # Adjust stream settings (bitrate 0 = auto)
-doubletake -target 192.168.1.77 -width 1920 -height 1080 -fps 30 -bitrate 0
+doubletake -target 192.168.1.77 -fps 30 -bitrate 0
 
 # Force a lower bitrate on weaker Wi-Fi
 doubletake -target 192.168.1.77 -bitrate 4500
@@ -171,8 +171,6 @@ doubletake-ctl disconnect
 | `-cred-backend` | `file` | Credential backend (`file` or `keyring`) |
 | `-creds` | `~/.config/doubletake/credentials.json` | Credentials file path |
 | `-pair` | false | Force new pairing |
-| `-width` | 1920 | Stream width |
-| `-height` | 1080 | Stream height |
 | `-fps` | 30 | Frames per second |
 | `-bitrate` | 0 | Video bitrate in kbps (`0` = auto) |
 | `-target-latency-ms` | 100 | Target end-to-end latency in milliseconds (audio + video timing) |
