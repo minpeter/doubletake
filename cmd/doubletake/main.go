@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -58,7 +59,7 @@ func parsePortRange(s string) (int, int, error) {
 func main() {
 	target := flag.String("target", "", "Apple TV IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
-	pin := flag.String("pin", "", "4-digit PIN for pairing (shown on Apple TV)")
+	code := flag.String("code", "", "Pairing PIN shown on the receiver, or the password set on it when \"Require Password\" is enabled; prefer $DOUBLETAKE_CODE so it stays out of shell history and ps output")
 	credFile := flag.String("creds", airplay.DefaultCredentialsPath(), "Path to saved pairing credentials")
 	credBackend := flag.String("cred-backend", "file", "Credential storage backend: file or keyring (system keyring via Secret Service)")
 	forcePair := flag.Bool("pair", false, "Force new pairing even if credentials exist")
@@ -127,7 +128,15 @@ func main() {
 		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
 	}
 
+	// The environment wins over the flag: it keeps the code out of shell history
+	// and out of `ps`, where a command line is readable by other users.
+	airPlayCode := *code
+	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
+		airPlayCode = env
+	}
+
 	client := airplay.NewAirPlayClient(addr, *port)
+	client.SetPassword(airPlayCode)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
 	}
@@ -140,10 +149,15 @@ func main() {
 	log.Printf("connected to: %s (model: %s, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
 
 	// Pairing flow:
-	// 1. If --pin provided or --pair forced, do full pair-setup + save credentials
+	// 1. If --pair is forced, do full pair-setup + save credentials
 	// 2. If saved credentials exist, load them and do pair-verify only
 	// 3. Otherwise, do transient (ephemeral) pairing
-	needFullPair := *forcePair || *pin != ""
+	//
+	// -code alone does not force pairing. A receiver with "Require Password"
+	// needs the code on every session, so treating its presence as "pair again"
+	// would re-pair on every run and throw away working credentials. When a
+	// pairing PIN is what is actually wanted, -pair asks for one.
+	needFullPair := *forcePair
 
 	credStore, err := newCredentialStore(*credBackend, *credFile)
 	if err != nil {
@@ -157,15 +171,7 @@ func main() {
 
 	if needFullPair {
 		// Full pair-setup with PIN
-		pinVal := *pin
-		if pinVal == "" {
-			// Trigger PIN display on the TV first, then ask user
-			if err := client.StartPINDisplay(); err != nil {
-				log.Fatalf("failed to trigger PIN display: %v", err)
-			}
-			fmt.Print("Enter the PIN shown on Apple TV: ")
-			fmt.Scanln(&pinVal)
-		}
+		pinVal := codeOrPrompt(airPlayCode, client)
 		if err := client.Pair(ctx, pinVal); err != nil {
 			log.Fatalf("pairing failed: %v", err)
 		}
@@ -195,11 +201,12 @@ func main() {
 				log.Fatalf("get info after reconnect failed: %v", err)
 			}
 			if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("transient pairing fallback failed: %v, prompting for PIN", err)
-				pinVal := promptForPIN(client)
+				log.Printf("transient pairing fallback failed: %v, pairing with a code", err)
+				pinVal := codeOrPrompt(airPlayCode, client)
 				// Reconnect for fresh PIN pairing attempt
 				client.Close()
 				client = airplay.NewAirPlayClient(addr, *port)
+				client.SetPassword(airPlayCode)
 				if err := client.Connect(ctx); err != nil {
 					log.Fatalf("reconnect failed: %v", err)
 				}
@@ -220,11 +227,12 @@ func main() {
 	} else {
 		// Transient pairing (no saved creds, no PIN)
 		if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("transient pairing failed: %v, prompting for PIN", err)
-			pinVal := promptForPIN(client)
+			log.Printf("transient pairing failed: %v, pairing with a code", err)
+			pinVal := codeOrPrompt(airPlayCode, client)
 			// Reconnect for fresh PIN pairing attempt
 			client.Close()
 			client = airplay.NewAirPlayClient(addr, *port)
+			client.SetPassword(airPlayCode)
 			if err := client.Connect(ctx); err != nil {
 				log.Fatalf("reconnect failed: %v", err)
 			}
@@ -263,13 +271,13 @@ func main() {
 		log.Fatalf("invalid -port-range: %v", err)
 	}
 	streamCfg := airplay.StreamConfig{
-		FPS:       *fps,
-		Bitrate:   *bitrate,
-		NoEncrypt: *noEncrypt,
-		DirectKey: *directKey,
-		NoAudio:   *noAudio,
-		PortMin:   portMin,
-		PortMax:   portMax,
+		FPS:            *fps,
+		Bitrate:        *bitrate,
+		NoEncrypt:      *noEncrypt,
+		DirectKey:      *directKey,
+		NoAudio:        *noAudio,
+		PortMin:        portMin,
+		PortMax:        portMax,
 	}
 	session, err := client.SetupMirror(ctx, streamCfg)
 	if err != nil {
@@ -295,6 +303,10 @@ func main() {
 			log.Fatalf("test capture failed: %v", err)
 		}
 	} else {
+		restoreToken := ""
+		if creds := credStore.Lookup(info.DeviceID); creds != nil {
+			restoreToken = creds.RestoreToken
+		}
 		captureCfg := airplay.CaptureConfig{
 			FPS:           *fps,
 			Bitrate:       *bitrate,
@@ -302,6 +314,10 @@ func main() {
 			X11WindowID:   xid,
 			X11WindowName: *x11WindowName,
 			ShowCursor:    !*noCursor,
+			RestoreToken:  restoreToken,
+			SaveRestoreToken: func(token string) error {
+				return credStore.SaveRestoreToken(info.DeviceID, token)
+			},
 		}
 		var err error
 		capture, err = airplay.StartCapture(ctx, captureCfg)
@@ -341,14 +357,34 @@ func main() {
 	log.Println("stream ended")
 }
 
+// codeOrPrompt uses the code supplied on the command line if there is one, and
+// otherwise asks for it interactively. The same value serves as the pairing PIN
+// and as the password for Digest auth, so a user who supplied one is never
+// asked for it again mid-run.
+func codeOrPrompt(code string, client *airplay.AirPlayClient) string {
+	if code != "" {
+		return code
+	}
+	return promptForPIN(client)
+}
+
+// promptForPIN asks the receiver to display a pairing code and reads the user's
+// answer. Receivers configured with a fixed password rather than an onscreen
+// code show nothing at all -- that is not an error, the user simply types the
+// password they set, so a failed pair-pin-start is only a warning.
 func promptForPIN(client *airplay.AirPlayClient) string {
 	if err := client.StartPINDisplay(); err != nil {
 		log.Printf("warning: failed to trigger PIN display: %v", err)
 	}
-	fmt.Print("Enter the PIN shown on Apple TV: ")
-	var pinVal string
-	fmt.Scanln(&pinVal)
-	return pinVal
+	fmt.Print("Enter the code shown on the receiver, or its configured password: ")
+
+	// Read the whole line rather than using fmt.Scanln, which stops at the
+	// first space and would silently truncate a password containing one.
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		log.Printf("warning: failed to read PIN: %v", err)
+	}
+	return strings.TrimRight(line, "\r\n")
 }
 
 func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {

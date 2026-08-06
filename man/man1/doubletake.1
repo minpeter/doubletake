@@ -33,8 +33,13 @@ Connect to a specific Apple TV by IP address (skips mDNS discovery)
 .B \-port \fIPORT\fR
 AirPlay port (default: 7000)
 .TP
-.B \-pin \fIPIN\fR
-4-digit PIN for pairing
+.B \-code \fICODE\fR
+Pairing PIN shown on the receiver, or its configured password when
+"Require Password" is enabled. Prefer the
+.B DOUBLETAKE_CODE
+environment variable, which keeps the code out of shell history and
+.BR ps (1)
+output.
 .TP
 .B \-pair
 Force new pairing even if credentials exist
@@ -44,12 +49,6 @@ Credential storage backend: \fBfile\fR or \fBkeyring\fR (default: file)
 .TP
 .B \-creds \fIPATH\fR
 Path to credentials file (default: ~/.config/doubletake/credentials.json)
-.TP
-.B \-width \fIWIDTH\fR
-Stream width in pixels (default: 1920)
-.TP
-.B \-height \fIHEIGHT\fR
-Stream height in pixels (default: 1080)
 .TP
 .B \-fps \fIFPS\fR
 Frames per second (default: 30)
@@ -81,10 +80,13 @@ Connect to a specific Apple TV:
 .B doubletake \-target 192.168.1.77
 .TP
 Pair with a PIN (saves credentials for reuse):
-.B doubletake \-target 192.168.1.77 \-pair \-pin 1234
+.B doubletake \-target 192.168.1.77 \-pair \-code 1234
 .TP
-Stream with custom resolution and bitrate:
-.B doubletake \-target 192.168.1.77 \-width 1280 \-height 720 \-fps 30 \-bitrate 4500
+Connect to a receiver with "Require Password" enabled:
+.B DOUBLETAKE_CODE=... doubletake \-target 192.168.1.77
+.TP
+Stream with a custom frame rate and bitrate:
+.B doubletake \-target 192.168.1.77 \-fps 30 \-bitrate 4500
 .TP
 Force lower bitrate on weak Wi-Fi:
 .B doubletake \-target 192.168.1.77 \-bitrate 3000

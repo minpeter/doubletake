@@ -5,7 +5,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 ## Features
 
 - Full AirPlay 2 mirroring protocol (RTSP/HTTP + encrypted video stream)
-- FairPlay SAP authentication (snapshot-backed Go ARM64 execution)
+- FairPlay SAP authentication (clean Go implementation)
 - SRP-6a pairing with PIN and persistent credential storage
 - Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture
 - Hardware-accelerated H.264 encoding (NVENC, VA-API) with software fallback
@@ -19,6 +19,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 
 - Go 1.23+
 - GStreamer 1.0 (with plugins-base, plugins-good, plugins-bad, plugins-ugly, libav)
+- PulseAudio utilities (`pactl`; `pulseaudio-utils` on Ubuntu/Debian or the equivalent package on other distributions)
 - PipeWire (Wayland) or X11 for screen capture
 
 ### Ubuntu/Debian
@@ -26,14 +27,14 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 ```sh
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly gstreamer1.0-libav
+  gstreamer1.0-plugins-ugly gstreamer1.0-libav pulseaudio-utils
 ```
 
 ### Arch Linux
 
 ```sh
 sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
-  gst-plugins-ugly gst-libav
+  gst-plugins-ugly gst-libav libpulse
 ```
 
 You can also install from the AUR:
@@ -46,7 +47,10 @@ You can also install from the AUR:
 
 These are devices that have been tested with doubletake. If there are devices not listed here that you have confirmed working or non-functional, please open an issue.
 
+- AppleTV3,2 (2013 3rd generation) (currently non-functional, see [#17](https://github.com/omarroth/doubletake/issues/17))
+- AppleTV11,1 (4K, 2021 2nd gen)
 - AppleTV14,1 (4K, 2022 3rd gen) + Homepod (1st gen)
+- AppleTV14,1 (4K, 2022 3rd gen)
 - Mac17,2 (MacBook Pro, M5 14")
 - Mac16,10 (Mac mini, M4)
 - Roku Streaming Stick 4K (3820R2)
@@ -115,6 +119,34 @@ sudo ufw allow from any proto tcp to any port 60000:60010
 For nftables/firewalld, add equivalent rules allowing inbound UDP and TCP from
 the Apple TV's address on the chosen range.
 
+## Password-protected receivers
+
+If the receiver has **Require Password** enabled (on an Apple TV: Settings →
+AirPlay and HomeKit), it challenges the mirroring `SETUP` request with HTTP
+Digest auth and mirroring fails with `HTTP 401` until doubletake answers it.
+Pass the password with `-code`:
+
+```sh
+DOUBLETAKE_CODE='...' doubletake -target 192.168.1.77
+```
+
+`-code` carries whatever the receiver is asking for — the onscreen pairing PIN
+during `-pair`, or the fixed password when "Require Password" is enabled.
+`$DOUBLETAKE_CODE` is preferred over the flag: a command line is visible to
+other users via `ps` and lands in shell history. The environment variable takes
+precedence when both are set.
+
+Note that this is separate from pairing. Pairing (`-pair`) authenticates the
+client identity via SRP and saves credentials; the password authenticates
+individual RTSP requests. A receiver may require either, both, or neither.
+Supplying `-code` does not by itself trigger re-pairing.
+
+One thing that makes this confusing to diagnose: **"Require Password" is a
+fixed password you set, not a rotating onscreen code.** Nothing appears on the
+TV during `-pair`, and the prompt is asking for that configured password.
+
+Run with `-debug` to see the challenge and whether the retry was accepted.
+
 ## Usage
 
 ```sh
@@ -134,7 +166,7 @@ doubletake -target 192.168.1.77 -pair
 doubletake -target 192.168.1.77 -creds airplay-credentials.json
 
 # Adjust stream settings (bitrate 0 = auto)
-doubletake -target 192.168.1.77 -width 1920 -height 1080 -fps 30 -bitrate 0
+doubletake -target 192.168.1.77 -fps 30 -bitrate 0
 
 # Force a lower bitrate on weaker Wi-Fi
 doubletake -target 192.168.1.77 -bitrate 4500
@@ -164,12 +196,10 @@ doubletake-ctl disconnect
 |------|---------|-------------|
 | `-target` | | Apple TV IP (skip mDNS discovery) |
 | `-port` | 7000 | AirPlay port |
-| `-pin` | | 4-digit PIN for pairing |
+| `-code` | | Pairing PIN shown on the receiver, or its configured password when "Require Password" is enabled (see [Password-protected receivers](#password-protected-receivers)); prefer `$DOUBLETAKE_CODE` |
 | `-cred-backend` | `file` | Credential backend (`file` or `keyring`) |
 | `-creds` | `~/.config/doubletake/credentials.json` | Credentials file path |
 | `-pair` | false | Force new pairing |
-| `-width` | 1920 | Stream width |
-| `-height` | 1080 | Stream height |
 | `-fps` | 30 | Frames per second |
 | `-bitrate` | 0 | Video bitrate in kbps (`0` = auto) |
 | `-target-latency-ms` | 100 | Target end-to-end latency in milliseconds (audio + video timing) |
