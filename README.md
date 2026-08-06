@@ -8,7 +8,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 - FairPlay SAP authentication (clean Go implementation)
 - SRP-6a pairing with PIN and persistent credential storage
 - Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture
-- Hardware-accelerated H.264 encoding (NVENC, VA-API) with software fallback
+- H.264 encoding with NVENC, VA-API, OpenH264, and x264
 - ChaCha20-Poly1305 stream encryption
 - mDNS device discovery
 - Daemon mode with multi-target streaming control (`doubletake-ctl`)
@@ -36,6 +36,10 @@ sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
 sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
   gst-plugins-ugly gst-libav libpulse
 ```
+
+The `openh264` encoder requires the GStreamer `openh264enc` element, normally
+provided by the plugins-bad package. Check availability with
+`gst-inspect-1.0 openh264enc`.
 
 You can also install from the AUR:
 
@@ -178,6 +182,9 @@ doubletake -target 192.168.1.77 -target-latency-ms 100
 doubletake -target 192.168.1.77 -hwaccel nvenc   # NVIDIA
 doubletake -target 192.168.1.77 -hwaccel vaapi   # Intel/AMD
 
+# OpenH264 software encoding
+doubletake -target 192.168.1.77 -hwaccel openh264
+
 # Debug mode (verbose protocol logging)
 doubletake -target 192.168.1.77 -debug
 
@@ -203,7 +210,7 @@ doubletake-ctl disconnect
 | `-fps` | 30 | Frames per second |
 | `-bitrate` | 0 | Video bitrate in kbps (`0` = auto) |
 | `-target-latency-ms` | 100 | Target end-to-end latency in milliseconds (audio + video timing) |
-| `-hwaccel` | auto | Hardware accel: `auto`, `nvenc`, `vaapi`, `none` |
+| `-hwaccel` | auto | H.264 encoder: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
 | `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
 | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
 | `-no-audio` | false | Disable audio streaming |
@@ -211,6 +218,10 @@ doubletake-ctl disconnect
 | `-daemonize` | false | Run as background daemon with Unix socket control interface |
 | `-socket` | `$XDG_RUNTIME_DIR/doubletake.sock` | Daemon control socket path |
 | `-debug` | false | Verbose debug logging |
+
+Only `-hwaccel auto` tries fallback encoders, in the order `vulkanh264enc`,
+`nvh264enc`, `vah264enc`, `openh264enc`, then `x264enc`. Explicit selections
+fail if their required GStreamer encoder is unavailable; `none` forces x264.
 
 ### Daemon Control (`doubletake-ctl`)
 

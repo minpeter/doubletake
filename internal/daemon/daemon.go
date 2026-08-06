@@ -129,6 +129,12 @@ type Daemon struct {
 
 // New creates a new Daemon with the given configuration.
 func New(cfg Config) (*Daemon, error) {
+	if err := airplay.ValidateHWAccel(cfg.HWAccel); err != nil {
+		return nil, fmt.Errorf("hwaccel: %w", err)
+	}
+	if cfg.HWAccel == "" {
+		cfg.HWAccel = "auto"
+	}
 	var cs *airplay.CredentialStore
 	switch cfg.CredBackend {
 	case "keyring":

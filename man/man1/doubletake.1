@@ -8,7 +8,7 @@ doubletake \- AirPlay 2 screen mirroring sender for Linux
 .B doubletake
 is an AirPlay 2 screen mirroring sender that streams your Linux desktop to an Apple TV
 using the AirPlay 2 mirroring protocol. It supports both Wayland (PipeWire/xdg-desktop-portal)
-and X11 screen capture with hardware-accelerated H.264 encoding.
+and X11 screen capture with hardware or software H.264 encoding.
 .SH FEATURES
 .IP \(bu 2
 Full AirPlay 2 mirroring protocol (RTSP/HTTP + encrypted video stream)
@@ -17,7 +17,7 @@ FairPlay SAP authentication
 .IP \(bu 2
 SRP-6a pairing with PIN and persistent credential storage
 .IP \(bu 2
-Hardware-accelerated H.264 encoding (NVENC, VA-API) with software fallback
+H.264 encoding with NVENC, VA-API, OpenH264, and x264
 .IP \(bu 2
 ChaCha20-Poly1305 stream encryption
 .IP \(bu 2
@@ -63,7 +63,10 @@ Target playout latency in milliseconds (default: 100)
 Disable audio for video-only mirroring
 .TP
 .B \-hwaccel \fIMETHOD\fR
-Hardware acceleration method: \fBnvenc\fR (NVIDIA) or \fBvaapi\fR (Intel/AMD)
+H.264 encoder preference: \fBauto\fR, \fBnvenc\fR (NVIDIA), \fBvaapi\fR
+(Intel/AMD), \fBopenh264\fR (software), or \fBnone\fR (x264).
+Only \fBauto\fR tries fallback encoders. An explicit method fails if its
+required GStreamer encoder is unavailable. The default is \fBauto\fR.
 .TP
 .B \-debug
 Enable verbose protocol logging
@@ -94,6 +97,9 @@ Force lower bitrate on weak Wi-Fi:
 Use hardware acceleration (NVIDIA):
 .B doubletake \-target 192.168.1.77 \-hwaccel nvenc
 .TP
+Use OpenH264 software encoding:
+.B doubletake \-target 192.168.1.77 \-hwaccel openh264
+.TP
 Run in daemon mode:
 .B doubletake \-daemonize
 .TP
@@ -109,6 +115,8 @@ to manage the daemon.
 Go 1.23 or later
 .IP \(bu 2
 GStreamer 1.0 (with plugins-base, plugins-good, plugins-bad, plugins-ugly, libav)
+.IP \(bu 2
+The \fBopenh264\fR method requires the GStreamer \fBopenh264enc\fR element
 .IP \(bu 2
 PipeWire (Wayland) or X11 for screen capture
 .SH FILES

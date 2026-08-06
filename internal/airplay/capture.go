@@ -19,7 +19,7 @@ import (
 type CaptureConfig struct {
 	FPS     int
 	Bitrate int    // Video bitrate in kbps (0 = auto)
-	HWAccel string // "auto", "vaapi", "none"
+	HWAccel string // "auto", "nvenc", "vaapi", "openh264", or "none" (x264)
 
 	X11WindowID   uint64
 	X11WindowName string
@@ -28,6 +28,17 @@ type CaptureConfig struct {
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error
+}
+
+// ValidateHWAccel checks a capture encoder preference. An empty value keeps the
+// zero-value CaptureConfig useful and is treated as auto.
+func ValidateHWAccel(method string) error {
+	switch method {
+	case "", "auto", "nvenc", "vaapi", "openh264", "none":
+		return nil
+	default:
+		return fmt.Errorf("unknown H.264 encoder %q (want auto, nvenc, vaapi, openh264, or none)", method)
+	}
 }
 
 const (
@@ -57,6 +68,9 @@ type ScreenCapture struct {
 // capture accordingly. On Wayland it uses xdg-desktop-portal + PipeWire for
 // capture; on X11 it uses ximagesrc. Both use GStreamer for H.264 encoding.
 func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
+		return nil, err
+	}
 	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
 		return startX11Capture(ctx, cfg)
 	}
@@ -73,10 +87,72 @@ func hasGstElement(name string) bool {
 	return exec.Command("gst-inspect-1.0", name).Run() == nil
 }
 
+// gstStage is one GStreamer element (or caps filter) followed by its arguments.
+// Keeping separators out of stages makes it difficult for source-specific
+// pipelines to accidentally diverge in the shared encoding path.
+type gstStage []string
+
+// encoderResult holds the selected encoder stage and its input requirements.
+type encoderResult struct {
+	parts       gstStage
+	needsVulkan bool   // encoder needs vulkanupload immediately before it
+	rawFormat   string // system-memory format produced by videoconvert
+}
+
+func frameRateStage(fps int) gstStage {
+	return gstStage{fmt.Sprintf("video/x-raw,framerate=%d/1", fps)}
+}
+
+func lowLatencyVideoQueueStage() gstStage {
+	return gstStage{
+		"queue",
+		"max-size-buffers=1",
+		"max-size-bytes=0",
+		"max-size-time=0",
+		"leaky=downstream",
+	}
+}
+
+func appendGstStage(args []string, stage gstStage) []string {
+	if len(stage) == 0 {
+		return args
+	}
+	args = append(args, "!")
+	return append(args, stage...)
+}
+
+// buildGstVideoPipeline joins source-specific stages to the one encoding and
+// Annex-B output path used by Wayland, X11, and synthetic test capture.
+// beforeConvert and afterFormat preserve the few ordering requirements that
+// genuinely differ between capture sources.
+func buildGstVideoPipeline(source gstStage, beforeConvert, afterFormat []gstStage, encoder encoderResult) []string {
+	args := append([]string{"--quiet"}, source...)
+	for _, stage := range beforeConvert {
+		args = appendGstStage(args, stage)
+	}
+
+	args = appendGstStage(args, gstStage{"videoconvert"})
+	args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
+	for _, stage := range afterFormat {
+		args = appendGstStage(args, stage)
+	}
+	if encoder.needsVulkan {
+		args = appendGstStage(args, gstStage{"vulkanupload"})
+	}
+	args = appendGstStage(args, encoder.parts)
+	args = appendGstStage(args, gstStage{"h264parse", "config-interval=-1"})
+	args = appendGstStage(args, gstStage{"video/x-h264,stream-format=byte-stream,alignment=au"})
+	return appendGstStage(args, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
+}
+
 func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
 	// Check dependencies
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
+	}
+	encoderParts, err := detectGstEncoder(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor)
@@ -97,16 +173,9 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 		fps = 30
 	}
 
-	encoderParts := detectGstEncoder(cfg)
-
-	// Single GStreamer pipeline: capture from the PipeWire portal and encode to
-	// H.264.
+	// Capture from the PipeWire portal and feed the shared H.264 pipeline.
 	//   - vapostproc imports the portal's DMA-BUF via VA-API when available
 	//     Systems without VA-API (such as Asahi Linux) fall back to videoconvert.
-	//   - The raw format is pinned to the encoder's required 4:2:0 format. The
-	//     hardware encoders require NV12, while the software encoders use I420.
-	//     Pinning the format also prevents x264enc from emitting High 4:4:4
-	//     Predictive, which most receiver decoders reject (black).
 	//   - videorate re-stamps buffers onto a regular fps timeline: the portal can
 	//     deliver pts=0, which confuses encoder/muxer timing. drop-only=true never
 	//     duplicates frames during idle periods (no wasted bandwidth on a static
@@ -115,36 +184,23 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	// because the captured surface size is whatever the compositor hands us. The
 	// actual encoded dimensions are read back from the H.264 SPS downstream.
 	const pwFdNum = 3
-	gstArgs := []string{
-		"--quiet",
+	source := gstStage{
 		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
 	}
 
+	var beforeConvert []gstStage
 	if hasGstElement("vapostproc") {
-		gstArgs = append(gstArgs,
-			"!", "vapostproc",
-		)
+		beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
 	} else {
 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
 	}
 
-	gstArgs = append(gstArgs,
-		"!", "videoconvert",
-		"!", fmt.Sprintf("video/x-raw,format=%s", encoderParts.rawFormat),
-		"!", "videorate", "drop-only=true", "skip-to-first=true",
-		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
-		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-	)
-	if encoderParts.needsVulkan {
-		gstArgs = append(gstArgs, "!", "vulkanupload")
+	afterFormat := []gstStage{
+		{"videorate", "drop-only=true", "skip-to-first=true"},
+		frameRateStage(fps),
+		lowLatencyVideoQueueStage(),
 	}
-	gstArgs = append(gstArgs, "!")
-	gstArgs = append(gstArgs, encoderParts.parts...)
-	gstArgs = append(gstArgs,
-		"!", "h264parse", "config-interval=-1",
-		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
-		"!", "fdsink", "fd=1", "sync=false", "async=false",
-	)
+	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterFormat, encoderParts)
 
 	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -189,6 +245,10 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'ximagesrc' plugin not found; install gst-plugins-good")
 	}
+	encoder, err := detectGstEncoder(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	captureCtx, cancel := context.WithCancel(ctx)
 
@@ -199,9 +259,7 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 
 	display := os.Getenv("DISPLAY")
 
-	encoder := detectGstEncoder(cfg)
-
-	ximageSrcArgs := []string{
+	ximageSrcArgs := gstStage{
 		"ximagesrc",
 		fmt.Sprintf("display-name=%s", display),
 		"use-damage=false",
@@ -231,24 +289,8 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 		}
 	}
 
-	gstArgs := []string{"--quiet"}
-	gstArgs = append(gstArgs, ximageSrcArgs...)
-	gstArgs = append(gstArgs,
-		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
-		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-		"!", "videoconvert",
-		"!", fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat),
-	)
-	if encoder.needsVulkan {
-		gstArgs = append(gstArgs, "!", "vulkanupload")
-	}
-	gstArgs = append(gstArgs, "!")
-	gstArgs = append(gstArgs, encoder.parts...)
-	gstArgs = append(gstArgs,
-		"!", "h264parse", "config-interval=-1",
-		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
-		"!", "fdsink", "fd=1", "sync=false", "async=false",
-	)
+	beforeConvert := []gstStage{frameRateStage(fps), lowLatencyVideoQueueStage()}
+	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder)
 
 	dbg("[CAPTURE] gst-launch-1.0 (x11) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -261,13 +303,6 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	stderr, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
-		// If Vulkan encoder failed, retry with software fallback
-		if encoder.needsVulkan {
-			log.Printf("[CAPTURE] vulkanh264enc pipeline failed, falling back to x264enc")
-			cancel()
-			cfg.HWAccel = "none"
-			return startX11Capture(ctx, cfg)
-		}
 		cancel()
 		return nil, fmt.Errorf("start gst-launch: %w", err)
 	}
@@ -421,18 +456,14 @@ func parseXrandrGeometry(line string) (xOffset, yOffset, width, height int, ok b
 	return 0, 0, 0, 0, false
 }
 
-// encoderResult holds the detected encoder pipeline parts and whether it needs
-// a vulkanupload step before the encoder.
-type encoderResult struct {
-	parts       []string
-	needsVulkan bool   // encoder needs vulkanupload ! before it
-	rawFormat   string // system-memory format produced by videoconvert
+// detectGstEncoder selects an available GStreamer H.264 encoder. Only auto may
+// fall through the priority list; an explicit method either uses its own
+// encoder element (or elements, for NVENC) or returns an error.
+func detectGstEncoder(cfg CaptureConfig) (encoderResult, error) {
+	return detectGstEncoderWithProbe(cfg, hasGstElement)
 }
 
-// detectGstEncoder probes for available GStreamer H.264 encoders and returns
-// the encoder element + properties as gst-launch-1.0 arguments.
-// Priority: vulkanh264enc (NVENC via Vulkan) > nvh264enc > vah264enc > openh264enc > x264enc.
-func detectGstEncoder(cfg CaptureConfig) encoderResult {
+func detectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool) (encoderResult, error) {
 	fps := cfg.FPS
 	if fps <= 0 {
 		fps = 30
@@ -440,12 +471,26 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 	bitrate := captureBitrateKbps(cfg)
 	keyframeInterval := keyframeIntervalFrames(fps)
 	hwaccel := cfg.HWAccel
+	if hwaccel == "" {
+		hwaccel = "auto"
+	}
+	if err := ValidateHWAccel(hwaccel); err != nil {
+		return encoderResult{}, err
+	}
 
-	// Try Vulkan H.264 (NVENC via Vulkan API) — lowest latency, no CPU usage
-	if hwaccel == "auto" || hwaccel == "nvenc" {
-		if exec.Command("gst-inspect-1.0", "vulkanh264enc").Run() == nil {
-			log.Printf("[CAPTURE] using NVENC hardware encoding (vulkanh264enc)")
-			return encoderResult{
+	vbvBuf := vbvBufferKbit(bitrate, fps)
+	maxrate := bitrate + bitrate/4 // allow 25% overshoot on peaks
+	candidates := []struct {
+		method  string
+		element string
+		label   string
+		result  encoderResult
+	}{
+		{
+			method:  "nvenc",
+			element: "vulkanh264enc",
+			label:   "NVENC hardware encoding (vulkanh264enc)",
+			result: encoderResult{
 				parts: []string{
 					"vulkanh264enc",
 					"b-frames=0",
@@ -455,15 +500,13 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 				},
 				needsVulkan: true,
 				rawFormat:   "NV12",
-			}
-		}
-	}
-
-	// Try legacy NVENC
-	if hwaccel == "auto" || hwaccel == "nvenc" {
-		if exec.Command("gst-inspect-1.0", "nvh264enc").Run() == nil {
-			log.Printf("[CAPTURE] using NVENC hardware encoding (nvh264enc)")
-			return encoderResult{rawFormat: "NV12", parts: []string{
+			},
+		},
+		{
+			method:  "nvenc",
+			element: "nvh264enc",
+			label:   "NVENC hardware encoding (nvh264enc)",
+			result: encoderResult{rawFormat: "NV12", parts: []string{
 				"nvh264enc",
 				fmt.Sprintf("bitrate=%d", bitrate),
 				fmt.Sprintf("gop-size=%d", keyframeInterval),
@@ -471,69 +514,86 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 				"rc-mode=cbr",
 				"preset=low-latency-hq",
 				"zerolatency=true",
-			}}
-		}
-		if hwaccel == "nvenc" {
-			dbg("[CAPTURE] nvh264enc not available, falling back to software")
-		}
-	}
-
-	// Try VAAPI
-	if hwaccel == "auto" || hwaccel == "vaapi" {
-		if exec.Command("gst-inspect-1.0", "vah264enc").Run() == nil {
-			log.Printf("[CAPTURE] using VAAPI hardware encoding (vah264enc)")
-			return encoderResult{rawFormat: "NV12", parts: []string{
+			}},
+		},
+		{
+			method:  "vaapi",
+			element: "vah264enc",
+			label:   "VAAPI hardware encoding (vah264enc)",
+			result: encoderResult{rawFormat: "NV12", parts: []string{
 				"vah264enc",
 				fmt.Sprintf("bitrate=%d", bitrate),
 				fmt.Sprintf("key-int-max=%d", keyframeInterval),
 				"b-frames=0",
 				"rate-control=cbr",
-			}}
+			}},
+		},
+		{
+			method:  "openh264",
+			element: "openh264enc",
+			label:   "OpenH264 software encoding (openh264enc)",
+			result: encoderResult{rawFormat: "I420", parts: []string{
+				"openh264enc",
+				fmt.Sprintf("bitrate=%d", bitrate*1000),
+				fmt.Sprintf("gop-size=%d", keyframeInterval),
+				"rate-control=bitrate",
+				"usage-type=screen",
+			}},
+		},
+		{
+			method:  "none",
+			element: "x264enc",
+			label:   "x264 software encoding (x264enc)",
+			result: encoderResult{rawFormat: "I420", parts: []string{
+				"x264enc",
+				"tune=zerolatency",
+				"speed-preset=superfast",
+				fmt.Sprintf("bitrate=%d", bitrate),
+				fmt.Sprintf("vbv-buf-capacity=%d", vbvBuf),
+				fmt.Sprintf("key-int-max=%d", keyframeInterval),
+				"pass=0",
+				fmt.Sprintf("option-string=vbv-maxrate=%d", maxrate),
+				"bframes=0",
+				"sliced-threads=true",
+				"byte-stream=true",
+				"aud=true",
+			}},
+		},
+	}
+
+	for _, candidate := range candidates {
+		if hwaccel != "auto" && hwaccel != candidate.method {
+			continue
 		}
-		if hwaccel == "vaapi" {
-			dbg("[CAPTURE] vah264enc not available, falling back to software")
+		if hasElement(candidate.element) {
+			log.Printf("[CAPTURE] using %s", candidate.label)
+			return candidate.result, nil
 		}
 	}
 
-	// Try OpenH264 software encoding before falling back to x264.
-	if exec.Command("gst-inspect-1.0", "openh264enc").Run() == nil {
-		log.Printf("[CAPTURE] using OpenH264 software encoding (openh264enc)")
-		return encoderResult{parts: []string{
-			"openh264enc",
-			fmt.Sprintf("bitrate=%d", bitrate*1000),
-			fmt.Sprintf("gop-size=%d", keyframeInterval),
-			"rate-control=bitrate",
-			"usage-type=screen",
-		}}
+	if hwaccel == "auto" {
+		return encoderResult{}, fmt.Errorf("no supported GStreamer H.264 encoder is available")
 	}
-
-	// Software fallback: x264enc
-	log.Printf("[CAPTURE] using software encoding (x264enc)")
-	vbvBuf := vbvBufferKbit(bitrate, fps)
-	// Use VBR (pass=0) so the encoder can undershoot on simple scenes, saving
-	// headroom for complex frames. vbv-buf-capacity + vbv-maxrate cap bursts.
-	maxrate := bitrate + bitrate/4 // allow 25% overshoot on peaks
-	return encoderResult{rawFormat: "I420", parts: []string{
-		"x264enc",
-		"tune=zerolatency",
-		"speed-preset=superfast",
-		fmt.Sprintf("bitrate=%d", bitrate),
-		fmt.Sprintf("vbv-buf-capacity=%d", vbvBuf),
-		fmt.Sprintf("key-int-max=%d", keyframeInterval),
-		"pass=0",
-		"option-string=" + fmt.Sprintf("vbv-maxrate=%d", maxrate),
-		"bframes=0",
-		"sliced-threads=true",
-		"byte-stream=true",
-		"aud=true",
-	}}
+	if hwaccel == "nvenc" {
+		return encoderResult{}, fmt.Errorf("-hwaccel nvenc requires GStreamer element vulkanh264enc or nvh264enc; neither is available")
+	}
+	for _, candidate := range candidates {
+		if candidate.method == hwaccel {
+			return encoderResult{}, fmt.Errorf("-hwaccel %s requires GStreamer element %s, but it is not available", hwaccel, candidate.element)
+		}
+	}
+	panic("validated H.264 encoder has no candidate")
 }
 
-// StartTestCapture creates a synthetic H.264 video stream using GStreamer's
-// videotestsrc + x264enc, producing High profile Annex-B byte stream output.
-// This replicates the same GStreamer pipeline ecosystem that UxPlay uses on the
-// receiver side.
+// StartTestCapture creates a synthetic H.264 stream with the configured encoder.
 func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
+		return nil, err
+	}
+	encoder, err := detectGstEncoder(cfg)
+	if err != nil {
+		return nil, err
+	}
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
@@ -541,29 +601,16 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		fps = 30
 	}
 
-	bitrate := captureBitrateKbps(cfg)
-	keyframeInterval := keyframeIntervalFrames(fps)
-
-	// GStreamer pipeline: videotestsrc → timeoverlay → x264enc High profile → Annex-B byte stream → stdout
 	// pattern=18 = ball (bouncing ball with motion); timeoverlay adds a frame counter.
 	// Keep test source live/infinite so long-running audio tests do not stop with EOF.
-	gstArgs := []string{
-		"--quiet",
+	source := gstStage{
 		"videotestsrc", "pattern=18", "is-live=true", "do-timestamp=true",
-		"!", fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps),
-		"!", "timeoverlay",
-		"!", "videoconvert",
-		"!", "x264enc",
-		"tune=zerolatency",
-		"speed-preset=superfast",
-		fmt.Sprintf("bitrate=%d", bitrate),
-		fmt.Sprintf("key-int-max=%d", keyframeInterval),
-		"threads=1",
-		"sliced-threads=true",
-		"byte-stream=true",
-		"!", "video/x-h264,profile=high,stream-format=byte-stream",
-		"!", "fdsink", "fd=1",
 	}
+	beforeConvert := []gstStage{
+		{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps)},
+		{"timeoverlay"},
+	}
+	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder)
 
 	dbg("[CAPTURE] launching gst-launch-1.0 (test mode) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)

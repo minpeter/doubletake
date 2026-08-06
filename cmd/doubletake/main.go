@@ -66,7 +66,7 @@ func main() {
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 100, "Target end-to-end latency in milliseconds (applies to audio and video timing)")
-	hwaccel := flag.String("hwaccel", "auto", "Hardware acceleration: auto, nvenc, vaapi, none")
+	hwaccel := flag.String("hwaccel", "auto", "H.264 encoder: auto, nvenc, vaapi, openh264, none (x264)")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
@@ -79,6 +79,9 @@ func main() {
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	flag.Parse()
+	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
+		log.Fatalf("invalid -hwaccel: %v", err)
+	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
@@ -271,13 +274,13 @@ func main() {
 		log.Fatalf("invalid -port-range: %v", err)
 	}
 	streamCfg := airplay.StreamConfig{
-		FPS:            *fps,
-		Bitrate:        *bitrate,
-		NoEncrypt:      *noEncrypt,
-		DirectKey:      *directKey,
-		NoAudio:        *noAudio,
-		PortMin:        portMin,
-		PortMax:        portMax,
+		FPS:       *fps,
+		Bitrate:   *bitrate,
+		NoEncrypt: *noEncrypt,
+		DirectKey: *directKey,
+		NoAudio:   *noAudio,
+		PortMin:   portMin,
+		PortMax:   portMax,
 	}
 	session, err := client.SetupMirror(ctx, streamCfg)
 	if err != nil {
