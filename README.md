@@ -1,10 +1,10 @@
 # doubletake
 
-AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay 2 mirroring protocol.
+AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay mirroring protocol.
 
 ## Features
 
-- Full AirPlay 2 mirroring protocol (RTSP/HTTP + encrypted video stream)
+- Full AirPlay mirroring protocol (RTSP/HTTP + encrypted video stream)
 - FairPlay SAP authentication (clean Go implementation)
 - SRP-6a pairing with PIN and persistent credential storage
 - Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture

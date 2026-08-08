@@ -312,7 +312,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	dbg("[SETUP] consecutive UDP ports: base=%d ctrl=%d data=%d", timingPort, timingPort+1, timingPort+2)
 
 	// Legacy receivers establish an NTP mapping by probing this port during
-	// SETUP. Pair-verified AirPlay 2 sessions use the receiver's PTP clock instead.
+	// SETUP. Pair-verified AirPlay sessions use the receiver's PTP clock instead.
 	if timingProtocol == timingProtocolNTP {
 		go ntpTimingResponder(sessionCtx, timingConn)
 	}
@@ -327,7 +327,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		sessionLatency = floor
 	}
 
-	// AirPlay 2 prepares the receiver with a control-only SETUP before creating
+	// AirPlay prepares the receiver with a control-only SETUP before creating
 	// media streams. This ordering matters: the receiver starts an audio packet
 	// processor only when type 96 is created after the session is prepared.
 	modernControlSetup := c.encrypted
