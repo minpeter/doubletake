@@ -101,13 +101,15 @@ make test
 
 ## Firewall
 
-doubletake opens UDP ports (audio timing/control/data — 3 consecutive) and one
-TCP port (event channel) and advertises them to the Apple TV during SETUP. The
-Apple TV connects back to those ports — until that reverse handshake completes,
-the receiver silently stalls and SETUP never returns.
+doubletake reserves three consecutive UDP ports for timing and audio traffic.
+Legacy NTP receivers probe the timing port during SETUP; modern PTP sessions do
+not advertise it. The event and video data channels are outbound TCP connections
+from doubletake to ports returned by the receiver, so they do not require inbound
+firewall rules.
 
 By default the OS assigns ephemeral ports. Use `-port-range MIN-MAX` to confine
-them to a small window you can open in your firewall (needs at least 4 ports):
+the UDP ports to a small window you can open in your firewall (needs at least 3
+ports):
 
 ```sh
 doubletake -target 192.168.1.77 -port-range 60000-60010
@@ -117,11 +119,10 @@ Then with UFW:
 
 ```sh
 sudo ufw allow from any proto udp to any port 60000:60010
-sudo ufw allow from any proto tcp to any port 60000:60010
 ```
 
-For nftables/firewalld, add equivalent rules allowing inbound UDP and TCP from
-the Apple TV's address on the chosen range.
+For nftables/firewalld, add an equivalent rule allowing inbound UDP from the
+Apple TV's address on the chosen range.
 
 ## Password-protected receivers
 
@@ -204,6 +205,7 @@ doubletake-ctl disconnect
 | `-target` | | Apple TV IP (skip mDNS discovery) |
 | `-port` | 7000 | AirPlay port |
 | `-code` | | Pairing PIN shown on the receiver, or its configured password when "Require Password" is enabled (see [Password-protected receivers](#password-protected-receivers)); prefer `$DOUBLETAKE_CODE` |
+| `-port-range` | | Local UDP port range for timing/audio (at least 3 ports) |
 | `-cred-backend` | `file` | Credential backend (`file` or `keyring`) |
 | `-creds` | `~/.config/doubletake/credentials.json` | Credentials file path |
 | `-pair` | false | Force new pairing |
@@ -229,8 +231,8 @@ fail if their required GStreamer encoder is unavailable; `none` forces x264.
 doubletake-ctl status
 doubletake-ctl discover
 doubletake-ctl devices
-doubletake-ctl connect [target] [pin]
-doubletake-ctl pin <4-digit-PIN>
+doubletake-ctl connect [target] [PIN-or-password]
+doubletake-ctl pin <PIN-or-password>
 doubletake-ctl disconnect [target]
 doubletake-ctl mute [target]
 doubletake-ctl unmute [target]

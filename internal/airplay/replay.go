@@ -164,7 +164,7 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, frame)
+			err := writeAll(s.dataConn, frame)
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send codec frame %d: %w", i, err)
@@ -222,7 +222,7 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, frame)
+			err := writeAll(s.dataConn, frame)
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send VCL frame %d (sent=%d): %w", i, sentFrames, err)
@@ -232,7 +232,7 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 		case 0x02: // Heartbeat — send as-is
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, f.header[:])
+			err := writeAll(s.dataConn, f.header[:])
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send heartbeat frame %d: %w", i, err)

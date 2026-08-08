@@ -15,8 +15,12 @@ and manage multiple simultaneous mirroring sessions.
 .B status
 Query the status of the running doubletake daemon and list active connections
 .TP
-.B connect \fITARGET\fR
-Connect to an Apple TV at the specified IP address
+.B connect [\fITARGET\fR] [\fIPIN-OR-PASSWORD\fR]
+Connect to an Apple TV, optionally supplying pairing credentials. If no target
+is specified, connect to the first available discovered receiver
+.TP
+.B pin \fIPIN-OR-PASSWORD\fR
+Submit pairing credentials for a receiver waiting for input
 .TP
 .B disconnect [\fITARGET\fR]
 Disconnect from an Apple TV. If no target is specified, disconnects all active connections

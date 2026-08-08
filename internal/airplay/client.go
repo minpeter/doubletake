@@ -44,6 +44,16 @@ type ReceiverInfo struct {
 	Displays          []DisplayInfo `plist:"displays"`
 }
 
+// AirPlay receiver status flag used to choose the pairing flow.
+const statusFlagPINRequiredForPairing uint64 = 1 << 9
+
+// RequiresPINPairing reports whether the receiver requires one-time pairing
+// with an onscreen code. This is distinct from the receiver's per-session PIN
+// and fixed-password status bits.
+func (i *ReceiverInfo) RequiresPINPairing() bool {
+	return i != nil && i.StatusFlags&statusFlagPINRequiredForPairing != 0
+}
+
 // DisplayInfo describes a receiver display advertised in the /info response.
 type DisplayInfo struct {
 	Width        plistNumber `plist:"width"`
@@ -93,6 +103,7 @@ type AirPlayClient struct {
 	PairKeys  *PairKeys
 	sessionID string // X-Apple-Session-ID, set once per connection
 	PairingID string // Our pairing identifier (UUID)
+	pairType  int    // X-Apple-HKP pairing type for the current exchange
 
 	// Encryption state after pair-verify
 	encrypted     bool
@@ -129,6 +140,7 @@ func NewAirPlayClient(host string, port int) *AirPlayClient {
 		port:      port,
 		sessionID: generateUUID(),
 		PairingID: generateUUID(),
+		pairType:  pairingTypeScreenCapture,
 	}
 }
 
@@ -709,9 +721,9 @@ type StreamConfig struct {
 	NoAudio   bool // Disable audio streaming
 
 	// PortMin/PortMax bound the local ports used for the audio UDP triple
-	// (timing/control/data, 3 consecutive ports) and the event TCP listener.
-	// When both are zero the OS chooses ephemeral ports. Useful for narrowing
-	// host-firewall rules. The range must fit at least 4 ports.
+	// (timing/control/data, 3 consecutive ports). The receiver's event channel
+	// is an outbound TCP connection and does not consume this range. When both
+	// are zero the OS chooses ephemeral ports.
 	PortMin int
 	PortMax int
 }

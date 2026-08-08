@@ -51,7 +51,7 @@ func main() {
 		resp, err = client.Connect(target, 0, pin)
 	case "pin":
 		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl pin <4-digit-PIN>\n")
+			fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl pin <PIN-or-password>\n")
 			os.Exit(1)
 		}
 		resp, err = client.Connect("", 0, args[1])
@@ -94,5 +94,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl [-socket path] <command> [args]\n\nCommands:\n  status                      Show daemon state and all active streams\n  discover                    Discover AirPlay devices on the network\n  devices                     List cached discovered devices\n  connect [target] [pin]      Start mirroring (to target IP, or first free device)\n  pin <4-digit-PIN>           Submit PIN for a device waiting for pairing\n  disconnect [target]         Stop mirroring (all streams, or only the given IP)\n  mute [target]               Mute mirrored audio (all streams, or only the given IP)\n  unmute [target]             Unmute mirrored audio (all streams, or only the given IP)\n\nFlags:\n  -socket path                Override daemon socket path (default: %s)\n", daemon.DefaultSocketPath())
+	fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl [-socket path] <command> [args]\n\nCommands:\n  status                              Show daemon state and all active streams\n  discover                            Discover AirPlay devices on the network\n  devices                             List cached discovered devices\n  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)\n  pin <PIN-or-password>               Submit pairing credentials for a waiting device\n  disconnect [target]                 Stop mirroring (all streams, or only the given IP)\n  mute [target]                       Mute mirrored audio (all streams, or only the given IP)\n  unmute [target]                     Unmute mirrored audio (all streams, or only the given IP)\n\nFlags:\n  -socket path                        Override daemon socket path (default: %s)\n", daemon.DefaultSocketPath())
 }

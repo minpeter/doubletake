@@ -103,6 +103,7 @@ type activeStream struct {
 	client     *airplay.AirPlayClient
 	sink       *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
 	cancelFn   context.CancelFunc
+	pinCh      chan string
 }
 
 // Daemon manages a long-running doubletake service.
@@ -121,7 +122,6 @@ type Daemon struct {
 
 	// PIN-waiting state (at most one device waits for a PIN at a time)
 	pendingTarget string
-	pendingPort   int
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
@@ -417,30 +417,32 @@ func (d *Daemon) handleDevices() Response {
 func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
 
-	// If we're waiting for a PIN and one was provided, resume that pending stream.
+	// If we're waiting for a PIN, resume the existing connection rather than
+	// creating a new client and losing the receiver's pending pairing session.
 	if d.pendingTarget != "" && req.Pin != "" {
 		target := d.pendingTarget
-		port := d.pendingPort
-		d.pendingTarget = ""
-		d.pendingPort = 0
-
-		// Register a connecting entry so state is visible
-		d.streams[target] = &activeStream{
-			deviceIP: target,
-			state:    StateConnecting,
+		if req.Target != "" && req.Target != target {
+			d.mu.Unlock()
+			return Response{OK: false, State: StatePINRequired, Error: "a different device is waiting for a PIN"}
 		}
+		entry, ok := d.streams[target]
+		if !ok || entry.state != StatePINRequired || entry.pinCh == nil {
+			d.pendingTarget = ""
+			state := d.overallStateLocked()
+			d.mu.Unlock()
+			return Response{OK: false, State: state, Error: "pending PIN session is no longer available"}
+		}
+		d.pendingTarget = ""
+		entry.state = StateConnecting
+		// pinCh is buffered and each pending session can be claimed only once.
+		entry.pinCh <- req.Pin
 		d.mu.Unlock()
-
-		connCtx, cancel := context.WithCancel(context.Background())
-		d.mu.Lock()
-		d.streams[target].cancelFn = cancel
+		return Response{OK: true, State: StateConnecting, Device: target}
+	}
+	if req.Pin != "" && req.Target == "" {
+		state := d.overallStateLocked()
 		d.mu.Unlock()
-
-		go d.connectAndStream(connCtx, target, port, req.Pin)
-
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		return Response{OK: true, State: d.overallStateLocked(), Device: target}
+		return Response{OK: false, State: state, Error: "no device is waiting for a PIN"}
 	}
 
 	// Reject a duplicate connection to the same target.
@@ -458,8 +460,9 @@ func (d *Daemon) handleConnect(req Request) Response {
 	if target == "" {
 		target, port = d.pickFreeDeviceLocked(port)
 		if target == "" {
+			state := d.overallStateLocked()
 			d.mu.Unlock()
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no available devices found"}
+			return Response{OK: false, State: state, Error: "no available devices found"}
 		}
 	}
 
@@ -476,20 +479,19 @@ func (d *Daemon) handleConnect(req Request) Response {
 		port = 7000
 	}
 
-	// Register a connecting placeholder.
+	// Create the context before publishing the entry so a concurrent disconnect
+	// can always cancel the connection goroutine.
+	connCtx, cancel := context.WithCancel(context.Background())
 	entry := &activeStream{
 		deviceIP: target,
 		state:    StateConnecting,
+		cancelFn: cancel,
+		pinCh:    make(chan string, 1),
 	}
 	d.streams[target] = entry
 	d.mu.Unlock()
 
-	connCtx, cancel := context.WithCancel(context.Background())
-	d.mu.Lock()
-	entry.cancelFn = cancel
-	d.mu.Unlock()
-
-	go d.connectAndStream(connCtx, target, port, req.Pin)
+	go d.connectAndStream(connCtx, entry, target, port, req.Pin)
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -511,7 +513,7 @@ func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
 	return "", 0
 }
 
-func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, pin string) {
+func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, pin string) {
 	// removeStream cleans up this stream's entry and tears down the shared broadcast
 	// if no other streams remain.
 	removeStream := func(msg string) {
@@ -520,19 +522,49 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		d.removeStreamLocked(target)
+		if d.streams[target] == entry {
+			d.removeStreamLocked(target)
+		}
 	}
 
-	client := airplay.NewAirPlayClient(target, port)
-	if err := client.Connect(ctx); err != nil {
-		removeStream(fmt.Sprintf("connect to %s:%d failed: %v", target, port, err))
-		return
+	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
+		next := airplay.NewAirPlayClient(target, port)
+		if err := next.Connect(ctx); err != nil {
+			return nil, nil, err
+		}
+
+		// Publish the connected client immediately so disconnect/shutdown can
+		// interrupt GetInfo, pairing, or a pending PIN wait.
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			_ = next.Close()
+			return nil, nil, context.Canceled
+		}
+		entry.client = next
+		d.mu.Unlock()
+
+		nextInfo, err := next.GetInfo()
+		if err != nil {
+			_ = next.Close()
+			return nil, nil, err
+		}
+
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			_ = next.Close()
+			return nil, nil, context.Canceled
+		}
+		entry.device = nextInfo.Name
+		entry.deviceID = nextInfo.DeviceID
+		d.mu.Unlock()
+		return next, nextInfo, nil
 	}
 
-	info, err := client.GetInfo()
+	client, info, err := connectClient()
 	if err != nil {
-		client.Close()
-		removeStream(fmt.Sprintf("get info failed: %v", err))
+		removeStream(fmt.Sprintf("connect to %s:%d failed: %v", target, port, err))
 		return
 	}
 
@@ -542,24 +574,25 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	if savedCreds != nil {
 		screenCastRestoreToken = savedCreds.RestoreToken
 	}
-	d.mu.Lock()
-	if entry, ok := d.streams[target]; ok {
-		entry.device = info.Name
-		entry.deviceID = deviceID
+
+	reconnect := func() error {
+		_ = client.Close()
+		next, nextInfo, err := connectClient()
+		if err != nil {
+			return err
+		}
+		client = next
+		info = nextInfo
+		deviceID = info.DeviceID
+		return nil
 	}
-	d.mu.Unlock()
 
 	log.Printf("[daemon] connected to %s (model: %s, deviceID: %s)", info.Name, info.Model, deviceID)
 
-	// Pairing
-	paired := false
-	if pin != "" {
-		if err := client.Pair(ctx, pin); err != nil {
-			client.Close()
-			removeStream(fmt.Sprintf("pairing failed: %v", err))
-			return
+	pairWithPIN := func(pinValue string) error {
+		if err := client.Pair(ctx, pinValue); err != nil {
+			return err
 		}
-		paired = true
 		if client.PairKeys != nil {
 			if err := d.credStore.Save(deviceID, client.PairingID,
 				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
@@ -568,6 +601,52 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
 			}
 		}
+		return nil
+	}
+
+	waitForPIN := func() (string, error) {
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			return "", context.Canceled
+		}
+		if d.pendingTarget != "" && d.pendingTarget != target {
+			d.mu.Unlock()
+			return "", fmt.Errorf("another device is already waiting for a PIN")
+		}
+		entry.state = StatePINRequired
+		d.pendingTarget = target
+		d.mu.Unlock()
+
+		if err := client.StartPINDisplay(); err != nil {
+			// Fixed-password receivers may reject this request but still accept the
+			// password through pair-setup.
+			log.Printf("[daemon] start PIN display failed: %v", err)
+		}
+
+		log.Printf("[daemon] PIN required for %s — waiting for user input", info.Name)
+		select {
+		case pinValue := <-entry.pinCh:
+			return pinValue, nil
+		case <-ctx.Done():
+			d.mu.Lock()
+			if d.pendingTarget == target {
+				d.pendingTarget = ""
+			}
+			d.mu.Unlock()
+			return "", ctx.Err()
+		}
+	}
+
+	// Pairing
+	paired := false
+	if pin != "" {
+		if err := pairWithPIN(pin); err != nil {
+			_ = client.Close()
+			removeStream(fmt.Sprintf("pairing failed: %v", err))
+			return
+		}
+		paired = true
 	}
 
 	if !paired && savedCreds != nil && savedCreds.HasPairingCredentials() {
@@ -578,22 +657,10 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 			Ed25519Private: priv,
 		}
 		if err := client.PairVerify(ctx); err != nil {
-			log.Printf("[daemon] pair-verify with saved creds failed: %v, trying transient pairing", err)
-			client.Close()
-			client = airplay.NewAirPlayClient(target, port)
-			if err := client.Connect(ctx); err != nil {
+			log.Printf("[daemon] pair-verify with saved creds failed: %v", err)
+			if err := reconnect(); err != nil {
 				removeStream(fmt.Sprintf("reconnect failed: %v", err))
 				return
-			}
-			if _, err := client.GetInfo(); err != nil {
-				removeStream(fmt.Sprintf("get info after reconnect failed: %v", err))
-				return
-			}
-			if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("[daemon] transient pairing also failed: %v", err)
-			} else {
-				paired = true
-				log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
 			}
 		} else {
 			paired = true
@@ -604,25 +671,40 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	}
 
 	if !paired {
-		if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("[daemon] transient pairing failed: %v", err)
-			if err := client.StartPINDisplay(); err != nil {
-				log.Printf("[daemon] start PIN display failed: %v", err)
+		pairInteractively := func() error {
+			pinValue, err := waitForPIN()
+			if err != nil {
+				return fmt.Errorf("wait for PIN: %w", err)
 			}
-			client.Close()
-			d.mu.Lock()
-			// Remove the connecting placeholder and record the pending PIN state.
-			delete(d.streams, target)
-			d.pendingTarget = target
-			d.pendingPort = port
-			d.mu.Unlock()
-			log.Printf("[daemon] PIN required for %s — waiting for user input", info.Name)
-			return
+			if err := pairWithPIN(pinValue); err != nil {
+				return fmt.Errorf("PIN pairing: %w", err)
+			}
+			return nil
 		}
-		paired = true
-		log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
+
+		if info.RequiresPINPairing() {
+			if err := pairInteractively(); err != nil {
+				_ = client.Close()
+				removeStream(err.Error())
+				return
+			}
+		} else if err := client.Pair(ctx, ""); err != nil {
+			log.Printf("[daemon] transient pairing failed: %v", err)
+			// A failed setup may leave pairing state attached to this socket. Start
+			// and finish the PIN exchange together on a fresh connection.
+			if err := reconnect(); err != nil {
+				removeStream(fmt.Sprintf("reconnect for PIN pairing failed: %v", err))
+				return
+			}
+			if err := pairInteractively(); err != nil {
+				_ = client.Close()
+				removeStream(err.Error())
+				return
+			}
+		} else {
+			log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
+		}
 	}
-	_ = paired
 
 	// FairPlay setup
 	if err := client.FairPlaySetup(ctx); err != nil {
@@ -658,8 +740,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	}
 
 	d.mu.Lock()
-	entry, ok := d.streams[target]
-	if !ok {
+	current, ok := d.streams[target]
+	if !ok || current != entry {
 		// Stream was cancelled while we were setting up
 		d.mu.Unlock()
 		sink.Close()
@@ -670,11 +752,11 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 		d.mu.Unlock()
 		return
 	}
-	entry.state = StateStreaming
-	entry.session = session
-	entry.client = client
-	entry.sink = sink
-	entry.audioMuted = false
+	current.state = StateStreaming
+	current.session = session
+	current.client = client
+	current.sink = sink
+	current.audioMuted = false
 	d.mu.Unlock()
 
 	log.Printf("[daemon] streaming to %s (%s)", info.Name, target)
@@ -706,7 +788,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	client.Close()
 
 	d.mu.Lock()
-	d.removeStreamLocked(target)
+	if d.streams[target] == entry {
+		d.removeStreamLocked(target)
+	}
 	d.mu.Unlock()
 
 	log.Printf("[daemon] stream ended for %s", target)
@@ -792,6 +876,9 @@ func (d *Daemon) removeStreamLocked(target string) {
 	if !ok {
 		return
 	}
+	if d.pendingTarget == target {
+		d.pendingTarget = ""
+	}
 	if entry.cancelFn != nil {
 		entry.cancelFn()
 	}
@@ -826,9 +913,6 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 		if !ok {
 			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
 		}
-		if entry.cancelFn != nil {
-			entry.cancelFn()
-		}
 		if entry.sink != nil {
 			entry.sink.Close()
 		}
@@ -838,14 +922,9 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 		if entry.client != nil {
 			entry.client.Close()
 		}
-		delete(d.streams, req.Target)
-		d.maybeStopBroadcastLocked()
+		d.removeStreamLocked(req.Target)
 		return Response{OK: true, State: d.overallStateLocked()}
 	}
-
-	// Also clear any pending PIN state.
-	d.pendingTarget = ""
-	d.pendingPort = 0
 
 	// Disconnect all.
 	d.stopAllLocked()
@@ -859,8 +938,9 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	if req.Target != "" {
 		entry, ok := d.streams[req.Target]
 		if !ok {
+			state := d.overallStateLocked()
 			d.mu.Unlock()
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			return Response{OK: false, State: state, Error: "no active stream to " + req.Target}
 		}
 		targets = []*activeStream{entry}
 	} else {
@@ -908,6 +988,7 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 // stopAllLocked stops all active streams and tears down the capture.
 // Must be called with d.mu held.
 func (d *Daemon) stopAllLocked() {
+	d.pendingTarget = ""
 	for target, entry := range d.streams {
 		if entry.cancelFn != nil {
 			entry.cancelFn()

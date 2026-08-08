@@ -10,14 +10,24 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
+	"os"
+	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
+
+// ErrPINRequired indicates that the receiver advertises one-time PIN pairing,
+// so a caller must start the PIN display instead of probing transient setup.
+var ErrPINRequired = errors.New("receiver requires PIN pairing")
 
 // PairKeys holds the long-term and session keys from pairing.
 type PairKeys struct {
@@ -39,6 +49,7 @@ const (
 	tlvState         = 0x06
 	tlvError         = 0x07
 	tlvSignature     = 0x0A
+	tlvACL           = 0x12
 	tlvFlags         = 0x13
 )
 
@@ -47,11 +58,70 @@ const (
 	pairingFlagTransient = 0x00000010 // Bit 4: ephemeral/transient pairing
 )
 
-// pairHeaders returns extra HTTP headers required for pair-setup / pair-verify.
-func (c *AirPlayClient) pairHeaders() map[string]string {
-	return map[string]string{
-		"X-Apple-HKP": "3",
+// X-Apple-HKP pairing types used by current Apple senders. Screen capture has
+// its own system-pairing type and ACL; transient pairing is a separate type.
+const (
+	pairingTypeTransient     = 4
+	pairingTypeScreenCapture = 5
+)
+
+const defaultPairingClientName = "doubletake device"
+
+// OPACK encoding of {"com.apple.ScreenCapture": true}. Apple includes this
+// access request in pair-setup M5 for X-Apple-HKP type 5, and current receivers
+// reject a screen-capture identity that omits it.
+const screenCaptureACL = "\xe1\x57com.apple.ScreenCapture\x01"
+
+// pairingClientName is shown by the receiver while it asks the user to allow
+// pairing. Prefer the machine's familiar hostname, but never put an empty or
+// malformed value into the hand-built RTSP headers.
+func pairingClientName() string {
+	hostname, _ := os.Hostname()
+	return sanitizePairingClientName(hostname)
+}
+
+func sanitizePairingClientName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || !utf8.ValidString(name) {
+		return defaultPairingClientName
 	}
+	if strings.IndexFunc(name, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
+		return defaultPairingClientName
+	}
+	return name
+}
+
+// pairHeaders identifies this sender on Apple pairing requests.
+func (c *AirPlayClient) pairHeaders() map[string]string {
+	headers := map[string]string{
+		"X-Apple-Client-Name": pairingClientName(),
+		"X-Apple-HKP":         strconv.Itoa(c.effectivePairType()),
+	}
+	if c.PairingID != "" {
+		headers["X-Apple-Client-ID"] = c.PairingID
+	}
+	return headers
+}
+
+// pairVerifyHeaders identifies a paired-device verification exchange.
+func (c *AirPlayClient) pairVerifyHeaders() map[string]string {
+	headers := c.pairHeaders()
+	headers["X-Apple-PD"] = "1"
+	return headers
+}
+
+func (c *AirPlayClient) effectivePairType() int {
+	if c.pairType == 0 {
+		return pairingTypeScreenCapture
+	}
+	return c.pairType
+}
+
+func (c *AirPlayClient) pinStartHeaders() map[string]string {
+	headers := c.pairHeaders()
+	// Keep the generated code compatible with the four-digit plasmoid input.
+	headers["X-Apple-SupportedPINLengths"] = "4"
+	return headers
 }
 
 // SRP-6a parameters (3072-bit group from RFC 5054).
@@ -78,6 +148,11 @@ var (
 
 // pairTransient performs transient pairing (no PIN required).
 func (c *AirPlayClient) pairTransient(ctx context.Context) error {
+	if c.info != nil && c.info.RequiresPINPairing() {
+		return ErrPINRequired
+	}
+	c.pairType = pairingTypeTransient
+
 	// Generate Ed25519 key pair for this session
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -95,6 +170,17 @@ func (c *AirPlayClient) pairTransient(ctx context.Context) error {
 // performTransientSetupAndVerify does transient (PIN-less) pair-setup + pair-verify.
 func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) error {
 	dbg("[PAIR] starting transient pair-setup")
+	if c.info != nil && c.info.SupportsTransientPairing() {
+		dbg("[PAIR] receiver advertises modern transient pairing; using TLV8 directly")
+		if err := c.pairSetupTransient(ctx); err != nil {
+			return fmt.Errorf("pair-setup: %w", err)
+		}
+		if err := c.PairVerify(ctx); err != nil {
+			return fmt.Errorf("pair-verify: %w", err)
+		}
+		dbg("[PAIR] pair-verify complete, channel is now encrypted")
+		return nil
+	}
 
 	// Try raw binary pair-setup first (UxPlay / legacy AirPlay protocol).
 	// Send 32-byte Ed25519 public key, expect 32-byte server public key back.
@@ -178,7 +264,13 @@ func (c *AirPlayClient) pairSetupTransient(ctx context.Context) error {
 // StartPINDisplay triggers the PIN display on the Apple TV.
 // Call this before prompting the user so the PIN is visible when they're asked.
 func (c *AirPlayClient) StartPINDisplay() error {
-	if _, err := c.httpRequest("POST", "/pair-pin-start", "", nil, c.pairHeaders()); err != nil {
+	c.pairType = pairingTypeScreenCapture
+	if _, err := c.httpRequest("POST", "/pair-pin-start", "", nil, c.pinStartHeaders()); err != nil {
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == 453 {
+			dbg("[PAIR] receiver accepted PIN request asynchronously (HTTP 453)")
+			return nil
+		}
 		return fmt.Errorf("pair-pin-start: %w", err)
 	}
 	return nil
@@ -186,6 +278,8 @@ func (c *AirPlayClient) StartPINDisplay() error {
 
 // pairWithPIN performs PIN-based pairing.
 func (c *AirPlayClient) pairWithPIN(ctx context.Context, pin string) error {
+	c.pairType = pairingTypeScreenCapture
+
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate ed25519: %w", err)
@@ -254,13 +348,23 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 	k := new(big.Int).SetBytes(kHash[:])
 
 	aBytes := make([]byte, 32)
-	rand.Read(aBytes)
+	if _, err := rand.Read(aBytes); err != nil {
+		return fmt.Errorf("generate SRP private key: %w", err)
+	}
 	a := new(big.Int).SetBytes(aBytes)
+	if a.Sign() == 0 {
+		a.SetInt64(1)
+	}
 	A := new(big.Int).Exp(srpG, a, srpN)
+	clientPublic := A.Bytes()
 
 	B := new(big.Int).SetBytes(serverPubB)
+	if B.Sign() <= 0 || B.Cmp(srpN) >= 0 {
+		return fmt.Errorf("M2: invalid server public key")
+	}
+	serverPublic := B.Bytes()
 
-	uHash := sha512.Sum512(append(padTo(A.Bytes(), 384), padTo(B.Bytes(), 384)...))
+	uHash := sha512.Sum512(append(padTo(clientPublic, 384), padTo(serverPublic, 384)...))
 	u := new(big.Int).SetBytes(uHash[:])
 
 	// S = (B - k * g^x mod N)^(a + u*x) mod N
@@ -291,14 +395,14 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 
 	proofInput := bytes.Join([][]byte{
 		hxor, huHash[:], salt,
-		A.Bytes(), B.Bytes(), K,
+		clientPublic, serverPublic, K,
 	}, nil)
 	m1Proof := sha512.Sum512(proofInput)
 
 	// M3: Send client public key + proof
 	m3 := tlv8EncodeOrdered([]tlv8Item{
 		{Tag: tlvState, Value: []byte{0x03}},
-		{Tag: tlvPublicKey, Value: padTo(A.Bytes(), 384)},
+		{Tag: tlvPublicKey, Value: padTo(clientPublic, 384)},
 		{Tag: tlvProof, Value: m1Proof[:]},
 	})
 	m4Bytes, err := c.httpRequest("POST", "/pair-setup", "application/octet-stream", m3, c.pairHeaders())
@@ -312,7 +416,7 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 	}
 
 	// Verify server proof: H(A, M1, K) — A unpadded
-	m2ProofInput := bytes.Join([][]byte{A.Bytes(), m1Proof[:], K}, nil)
+	m2ProofInput := bytes.Join([][]byte{clientPublic, m1Proof[:], K}, nil)
 	m2ProofExpected := sha512.Sum512(m2ProofInput)
 	if serverProof, ok := m4[tlvProof]; ok {
 		if !bytes.Equal(serverProof, m2ProofExpected[:]) {
@@ -334,11 +438,15 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 	sigInput := bytes.Join([][]byte{sigKey, clientID, c.PairKeys.Ed25519Public}, nil)
 	signature := ed25519.Sign(c.PairKeys.Ed25519Private, sigInput)
 
-	subTLV := tlv8EncodeOrdered([]tlv8Item{
+	subTLVItems := []tlv8Item{
 		{Tag: tlvIdentifier, Value: clientID},
 		{Tag: tlvPublicKey, Value: c.PairKeys.Ed25519Public},
 		{Tag: tlvSignature, Value: signature},
-	})
+	}
+	if c.effectivePairType() == pairingTypeScreenCapture {
+		subTLVItems = append(subTLVItems, tlv8Item{Tag: tlvACL, Value: []byte(screenCaptureACL)})
+	}
+	subTLV := tlv8EncodeOrdered(subTLVItems)
 
 	aead, err := chacha20poly1305.New(sessionKey)
 	if err != nil {
@@ -349,8 +457,8 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 	encrypted := aead.Seal(nil, nonce, subTLV, nil)
 
 	m5 := tlv8EncodeOrdered([]tlv8Item{
-		{Tag: tlvState, Value: []byte{0x05}},
 		{Tag: tlvEncryptedData, Value: encrypted},
+		{Tag: tlvState, Value: []byte{0x05}},
 	})
 	m6Bytes, err := c.httpRequest("POST", "/pair-setup", "application/octet-stream", m5, c.pairHeaders())
 	if err != nil {
@@ -370,7 +478,9 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 func (c *AirPlayClient) PairVerify(ctx context.Context) error {
 	// Generate ephemeral X25519 key pair
 	var clientPrivate, clientPublic [32]byte
-	rand.Read(clientPrivate[:])
+	if _, err := rand.Read(clientPrivate[:]); err != nil {
+		return fmt.Errorf("generate X25519 private key: %w", err)
+	}
 	curve25519.ScalarBaseMult(&clientPublic, &clientPrivate)
 
 	// V1: Send our ephemeral X25519 public key only.
@@ -380,7 +490,7 @@ func (c *AirPlayClient) PairVerify(ctx context.Context) error {
 		{Tag: tlvPublicKey, Value: clientPublic[:]},
 	})
 	dbg("[PAIR-VERIFY] V1: sending %d-byte X25519 public key", len(clientPublic[:]))
-	v2Bytes, err := c.httpRequest("POST", "/pair-verify", "application/octet-stream", v1, c.pairHeaders())
+	v2Bytes, err := c.httpRequest("POST", "/pair-verify", "application/octet-stream", v1, c.pairVerifyHeaders())
 	if err != nil {
 		return fmt.Errorf("V1: %w", err)
 	}
@@ -451,7 +561,7 @@ func (c *AirPlayClient) PairVerify(ctx context.Context) error {
 		{Tag: tlvEncryptedData, Value: encrypted},
 	})
 	dbg("[PAIR-VERIFY] V3: sending encrypted proof")
-	v4Bytes, err := c.httpRequest("POST", "/pair-verify", "application/octet-stream", v3, c.pairHeaders())
+	v4Bytes, err := c.httpRequest("POST", "/pair-verify", "application/octet-stream", v3, c.pairVerifyHeaders())
 	if err != nil {
 		return fmt.Errorf("V3: %w", err)
 	}

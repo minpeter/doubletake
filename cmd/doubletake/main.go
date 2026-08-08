@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -50,8 +51,8 @@ func parsePortRange(s string) (int, int, error) {
 	if lo < 1 || hi > 65535 || lo > hi {
 		return 0, 0, fmt.Errorf("range %d-%d out of bounds (1-65535, min<=max)", lo, hi)
 	}
-	if hi-lo+1 < 4 {
-		return 0, 0, fmt.Errorf("range %d-%d too small; need at least 4 ports (3 UDP + 1 TCP)", lo, hi)
+	if hi-lo+1 < 3 {
+		return 0, 0, fmt.Errorf("range %d-%d too small; need 3 consecutive UDP ports", lo, hi)
 	}
 	return lo, hi, nil
 }
@@ -71,7 +72,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
-	portRange := flag.String("port-range", "", "Local UDP/TCP port range for the receiver to reach back (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 4 ports.")
+	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Unix socket path for daemon control interface")
@@ -143,7 +144,7 @@ func main() {
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	info, err := client.GetInfo()
 	if err != nil {
@@ -152,9 +153,10 @@ func main() {
 	log.Printf("connected to: %s (model: %s, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
 
 	// Pairing flow:
-	// 1. If --pair is forced, do full pair-setup + save credentials
-	// 2. If saved credentials exist, load them and do pair-verify only
-	// 3. Otherwise, do transient (ephemeral) pairing
+	// 1. If --pair is forced, do full pair-setup and save credentials.
+	// 2. If saved credentials exist, load them and do pair-verify only.
+	// 3. If the receiver advertises one-time PIN pairing, request the PIN directly.
+	// 4. Otherwise, try transient pairing and use a fresh connection for PIN fallback.
 	//
 	// -code alone does not force pairing. A receiver with "Require Password"
 	// needs the code on every session, so treating its presence as "pair again"
@@ -172,19 +174,41 @@ func main() {
 		savedCreds = credStore.Lookup(info.DeviceID)
 	}
 
-	if needFullPair {
-		// Full pair-setup with PIN
-		pinVal := codeOrPrompt(airPlayCode, client)
-		if err := client.Pair(ctx, pinVal); err != nil {
-			log.Fatalf("pairing failed: %v", err)
+	reconnect := func() {
+		_ = client.Close()
+		client = airplay.NewAirPlayClient(addr, *port)
+		client.SetPassword(airPlayCode)
+		if err := client.Connect(ctx); err != nil {
+			log.Fatalf("reconnect failed: %v", err)
 		}
-		// Save credentials for next time
+		var err error
+		info, err = client.GetInfo()
+		if err != nil {
+			log.Fatalf("get info after reconnect failed: %v", err)
+		}
+	}
+
+	pairWithPIN := func(pinVal string) {
+		if pinVal == "" {
+			pinVal = codeOrPrompt(airPlayCode, client)
+		}
+		if err := client.Pair(ctx, pinVal); err != nil {
+			log.Fatalf("PIN pairing failed: %v", err)
+		}
+		if client.PairKeys == nil {
+			return
+		}
 		if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
 			log.Printf("warning: failed to save credentials: %v", err)
 		} else {
 			log.Printf("credentials saved (%s)", *credBackend)
 		}
-	} else if savedCreds != nil {
+	}
+
+	if needFullPair {
+		// Full pair-setup with a supplied PIN/password, or request an onscreen PIN.
+		pairWithPIN(airPlayCode)
+	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		// Use saved credentials — pair-verify
 		log.Printf("using saved credentials (%s)", *credBackend)
 		pub, priv := savedCreds.Ed25519Keys()
@@ -194,63 +218,25 @@ func main() {
 			Ed25519Private: priv,
 		}
 		if err := client.PairVerify(ctx); err != nil {
-			log.Printf("pair-verify with saved creds failed: %v, falling back to transient pairing", err)
-			// Reconnect — the failed pair-verify may have closed the connection
-			client.Close()
-			if err := client.Connect(ctx); err != nil {
-				log.Fatalf("reconnect failed: %v", err)
-			}
-			if _, err := client.GetInfo(); err != nil {
-				log.Fatalf("get info after reconnect failed: %v", err)
-			}
-			if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("transient pairing fallback failed: %v, pairing with a code", err)
-				pinVal := codeOrPrompt(airPlayCode, client)
-				// Reconnect for fresh PIN pairing attempt
-				client.Close()
-				client = airplay.NewAirPlayClient(addr, *port)
-				client.SetPassword(airPlayCode)
-				if err := client.Connect(ctx); err != nil {
-					log.Fatalf("reconnect failed: %v", err)
-				}
-				if _, err := client.GetInfo(); err != nil {
-					log.Fatalf("get info after reconnect failed: %v", err)
-				}
-				if err := client.Pair(ctx, pinVal); err != nil {
-					log.Fatalf("PIN pairing failed: %v", err)
-				}
-				// Save credentials for next time
-				if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
-					log.Printf("warning: failed to save credentials: %v", err)
-				} else {
-					log.Printf("credentials saved (%s)", *credBackend)
-				}
+			log.Printf("pair-verify with saved creds failed: %v", err)
+			reconnect()
+			if info.RequiresPINPairing() {
+				pairWithPIN("")
+			} else if err := client.Pair(ctx, ""); err != nil {
+				log.Printf("transient pairing fallback failed: %v, prompting for PIN", err)
+				// A failed pairing exchange may leave receiver state on this socket.
+				// Start and finish PIN pairing together on a clean connection.
+				reconnect()
+				pairWithPIN("")
 			}
 		}
 	} else {
-		// Transient pairing (no saved creds, no PIN)
-		if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("transient pairing failed: %v, pairing with a code", err)
-			pinVal := codeOrPrompt(airPlayCode, client)
-			// Reconnect for fresh PIN pairing attempt
-			client.Close()
-			client = airplay.NewAirPlayClient(addr, *port)
-			client.SetPassword(airPlayCode)
-			if err := client.Connect(ctx); err != nil {
-				log.Fatalf("reconnect failed: %v", err)
-			}
-			if _, err := client.GetInfo(); err != nil {
-				log.Fatalf("get info after reconnect failed: %v", err)
-			}
-			if err := client.Pair(ctx, pinVal); err != nil {
-				log.Fatalf("PIN pairing failed: %v", err)
-			}
-			// Save credentials for next time
-			if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
-				log.Printf("warning: failed to save credentials: %v", err)
-			} else {
-				log.Printf("credentials saved (%s)", *credBackend)
-			}
+		if info.RequiresPINPairing() {
+			pairWithPIN("")
+		} else if err := client.Pair(ctx, ""); err != nil {
+			log.Printf("transient pairing failed: %v, prompting for PIN", err)
+			reconnect()
+			pairWithPIN("")
 		}
 	}
 	log.Println("pairing complete")
@@ -380,14 +366,17 @@ func promptForPIN(client *airplay.AirPlayClient) string {
 		log.Printf("warning: failed to trigger PIN display: %v", err)
 	}
 	fmt.Print("Enter the code shown on the receiver, or its configured password: ")
-
 	// Read the whole line rather than using fmt.Scanln, which stops at the
 	// first space and would silently truncate a password containing one.
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" {
-		log.Printf("warning: failed to read PIN: %v", err)
+	if err != nil && !errors.Is(err, io.EOF) {
+		log.Fatalf("failed to read PIN: %v", err)
 	}
-	return strings.TrimRight(line, "\r\n")
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		log.Fatal("PIN cannot be empty")
+	}
+	return line
 }
 
 func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {

@@ -249,7 +249,8 @@ const (
 	FeatureAudio            uint64 = 1 << 10
 	FeatureFPSAP25          uint64 = 1 << 14
 	FeatureHomeKitPairing   uint64 = 1 << 17
-	FeatureTransientPairing uint64 = 1 << 19
+	FeatureSystemPairing    uint64 = 1 << 43
+	FeatureTransientPairing uint64 = 1 << 48
 	FeatureUDPMirroring     uint64 = 1 << 49
 )
 
@@ -258,7 +259,15 @@ func (d *AirPlayDevice) SupportsScreen() bool {
 }
 
 func (d *AirPlayDevice) SupportsTransientPairing() bool {
-	return d.Features&FeatureTransientPairing != 0
+	return d != nil && supportsTransientPairing(d.Features)
+}
+
+func (i *ReceiverInfo) SupportsTransientPairing() bool {
+	return i != nil && supportsTransientPairing(i.Features)
+}
+
+func supportsTransientPairing(features uint64) bool {
+	return features&(FeatureTransientPairing|FeatureSystemPairing) != 0
 }
 
 func (d *AirPlayDevice) SupportsFairPlaySAP() bool {

@@ -225,3 +225,22 @@ func TestSupportsFairPlaySAP(t *testing.T) {
 		t.Fatalf("AirPlayDevice with FPSAP bit did not advertise FairPlay SAP")
 	}
 }
+
+func TestSupportsTransientPairingUsesModernFeatureBits(t *testing.T) {
+	for _, bit := range []uint64{FeatureSystemPairing, FeatureTransientPairing} {
+		if !(&ReceiverInfo{Features: bit}).SupportsTransientPairing() {
+			t.Fatalf("ReceiverInfo feature bit 0x%x did not advertise transient pairing", bit)
+		}
+		if !(&AirPlayDevice{Features: bit}).SupportsTransientPairing() {
+			t.Fatalf("AirPlayDevice feature bit 0x%x did not advertise transient pairing", bit)
+		}
+	}
+
+	// Bit 19 was previously (and incorrectly) treated as transient pairing.
+	if (&ReceiverInfo{Features: 1 << 19}).SupportsTransientPairing() {
+		t.Fatal("legacy bit 19 unexpectedly advertises transient pairing")
+	}
+	if (*ReceiverInfo)(nil).SupportsTransientPairing() {
+		t.Fatal("nil ReceiverInfo advertises transient pairing")
+	}
+}
