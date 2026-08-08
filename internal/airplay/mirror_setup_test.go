@@ -45,6 +45,7 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	defer rtspListener.Close()
 
 	requests := make(chan rtspTestRequest, 8)
+	feedbackReceived := make(chan struct{}, 1)
 	serverErr := make(chan error, 1)
 	go func() {
 		conn, err := rtspListener.Accept()
@@ -140,6 +141,16 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 					serverErr <- err
 					return
 				}
+			case "POST":
+				if req.uri != "/feedback" {
+					serverErr <- fmt.Errorf("unexpected POST URI %s", req.uri)
+					return
+				}
+				if err := writeRTSPTestResponse(conn, 200, nil, nil); err != nil {
+					serverErr <- err
+					return
+				}
+				feedbackReceived <- struct{}{}
 			case "TEARDOWN":
 				if err := writeRTSPTestResponse(conn, 200, nil, nil); err != nil {
 					serverErr <- err
@@ -180,6 +191,16 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 		t.Fatal("timed out waiting for video data connection")
 	}
 
+	// /feedback starts as soon as SETUP completes, before Wayland's portal UI has
+	// necessarily delivered a first frame. It is the only RTSP control keepalive;
+	// another serialized request could starve it if the receiver ignores that
+	// request.
+	select {
+	case <-feedbackReceived:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for immediate /feedback")
+	}
+
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -199,7 +220,7 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	if len(got) < 2 {
 		t.Fatalf("expected full setup sequence, got %d requests", len(got))
 	}
-	wantMethods := []string{"SETUP", "SETUP", "RECORD", "SET_PARAMETER", "SET_PARAMETER", "TEARDOWN"}
+	wantMethods := []string{"SETUP", "SETUP", "RECORD", "SET_PARAMETER", "SET_PARAMETER", "POST", "TEARDOWN"}
 	if len(got) != len(wantMethods) {
 		t.Fatalf("got %d RTSP requests, want %d", len(got), len(wantMethods))
 	}
@@ -213,6 +234,9 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	}
 	if got[0].uri != got[2].uri || got[0].uri != got[3].uri || got[0].uri != got[4].uri {
 		t.Fatal("audio SETUP, RECORD, and volume SET_PARAMETER requests should share the audio URI")
+	}
+	if got[5].uri != "/feedback" {
+		t.Fatalf("feedback URI = %s, want /feedback", got[5].uri)
 	}
 	if got[len(got)-1].uri != got[0].uri {
 		t.Fatalf("TEARDOWN URI = %s, want %s", got[len(got)-1].uri, got[0].uri)

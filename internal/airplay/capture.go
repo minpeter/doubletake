@@ -103,7 +103,16 @@ func frameRateStage(fps int) gstStage {
 	return gstStage{fmt.Sprintf("video/x-raw,framerate=%d/1", fps)}
 }
 
+func frameIntervalMillis(fps int) int {
+	if fps <= 0 {
+		fps = 30
+	}
+	return max(1, 1000/fps)
+}
+
 func lowLatencyVideoQueueStage() gstStage {
+	// Drop stale raw frames before encoding. Encoded P-frames may reference
+	// earlier frames, so dropping them downstream would corrupt the H.264 chain.
 	return gstStage{
 		"queue",
 		"max-size-buffers=1",
@@ -155,7 +164,8 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 		return nil, err
 	}
 
-	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor)
+	var streamSize [2]int
+	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &streamSize)
 	if err != nil {
 		return nil, fmt.Errorf("screencast portal: %w", err)
 	}
@@ -176,16 +186,16 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	// Capture from the PipeWire portal and feed the shared H.264 pipeline.
 	//   - vapostproc imports the portal's DMA-BUF via VA-API when available
 	//     Systems without VA-API (such as Asahi Linux) fall back to videoconvert.
-	//   - videorate re-stamps buffers onto a regular fps timeline: the portal can
-	//     deliver pts=0, which confuses encoder/muxer timing. drop-only=true never
-	//     duplicates frames during idle periods (no wasted bandwidth on a static
-	//     screen); skip-to-first avoids buffering before the first frame.
+	//   - Wayland compositors may stop publishing an undamaged screen. A forced-live
+	//     GStreamer compositor repeats its input pad's latest frame at a regular
+	//     rate, because AirPlay requires continuous video even for a static image.
 	// The stream is encoded at the portal's native resolution; we do not rescale
 	// because the captured surface size is whatever the compositor hands us. The
 	// actual encoded dimensions are read back from the H.264 SPS downstream.
 	const pwFdNum = 3
 	source := gstStage{
 		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
+		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
 	}
 
 	var beforeConvert []gstStage
@@ -194,11 +204,19 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	} else {
 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
 	}
-
-	afterFormat := []gstStage{
-		{"videorate", "drop-only=true", "skip-to-first=true"},
-		frameRateStage(fps),
-		lowLatencyVideoQueueStage(),
+	afterFormat := []gstStage{lowLatencyVideoQueueStage()}
+	if streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor") {
+		beforeConvert = append(beforeConvert,
+			gstStage{"compositor", "force-live=true", "ignore-inactive-pads=true", "background=black"},
+			gstStage{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", streamSize[0], streamSize[1], fps)},
+		)
+	} else {
+		log.Printf("[CAPTURE] idle-frame compositor unavailable; using portal frame timing")
+		afterFormat = []gstStage{
+			{"videorate", "drop-only=true", "skip-to-first=true"},
+			frameRateStage(fps),
+			lowLatencyVideoQueueStage(),
+		}
 	}
 	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterFormat, encoderParts)
 
@@ -722,7 +740,7 @@ func vbvBufferKbit(bitrateKbps, fps int) int {
 // permission and returns a PipeWire node ID, an fd for the portal's PipeWire remote,
 // the D-Bus connection (which must stay open to keep the screencast session alive),
 // and a fresh restore token when the portal grants persistence.
-func requestScreencast(ctx context.Context, restoreToken string, showCursor bool) (uint32, *os.File, *dbus.Conn, string, error) {
+func requestScreencast(ctx context.Context, restoreToken string, showCursor bool, dimensions *[2]int) (uint32, *os.File, *dbus.Conn, string, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return 0, nil, nil, "", fmt.Errorf("connect session bus: %w", err)
@@ -841,6 +859,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 	}
 
 	var nodeID uint32
+	var streamProperties map[string]dbus.Variant
 	streamList, ok := streams.Value().([][]interface{})
 	if !ok {
 		// Try alternate format
@@ -851,6 +870,9 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 				} else {
 					conn.Close()
 					return 0, nil, nil, "", fmt.Errorf("unexpected node ID type: %T", tuple[0])
+				}
+				if len(tuple) > 1 {
+					streamProperties, _ = tuple[1].(map[string]dbus.Variant)
 				}
 			} else {
 				conn.Close()
@@ -871,6 +893,18 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 			return 0, nil, nil, "", fmt.Errorf("unexpected node ID type: %T", streamList[0][0])
 		}
 		nodeID = nid
+		if len(streamList[0]) > 1 {
+			streamProperties, _ = streamList[0][1].(map[string]dbus.Variant)
+		}
+	}
+
+	if dimensions != nil {
+		if width, height, ok := portalStreamDimensions(streamProperties); ok {
+			dimensions[0], dimensions[1] = width, height
+			dbg("[CAPTURE] portal stream size: %dx%d", width, height)
+		} else {
+			dbg("[CAPTURE] portal stream properties did not contain a usable size: %#v", streamProperties)
+		}
 	}
 
 	// OpenPipeWireRemote returns a Unix fd for the portal's PipeWire remote.
@@ -889,6 +923,44 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 	}
 
 	return nodeID, os.NewFile(uintptr(pwFD), "pipewire-remote"), conn, newRestoreToken, nil
+}
+
+func portalStreamDimensions(properties map[string]dbus.Variant) (int, int, bool) {
+	variant, ok := properties["size"]
+	if !ok {
+		return 0, 0, false
+	}
+
+	var width, height int
+	switch size := variant.Value().(type) {
+	case []int32:
+		if len(size) == 2 {
+			width, height = int(size[0]), int(size[1])
+		}
+	case []uint32:
+		if len(size) == 2 {
+			width, height = int(size[0]), int(size[1])
+		}
+	case []interface{}:
+		if len(size) == 2 {
+			width, _ = portalDimension(size[0])
+			height, _ = portalDimension(size[1])
+		}
+	}
+	return width, height, width > 0 && height > 0
+}
+
+func portalDimension(value interface{}) (int, bool) {
+	switch value := value.(type) {
+	case int32:
+		return int(value), value > 0
+	case uint32:
+		return int(value), value > 0
+	case int:
+		return value, value > 0
+	default:
+		return 0, false
+	}
 }
 
 func waitForResponseWithResult(ctx context.Context, conn *dbus.Conn, requestHandle dbus.ObjectPath) (map[string]dbus.Variant, error) {

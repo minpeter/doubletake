@@ -606,10 +606,13 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		}()
 	}
 
-	// Start heartbeat in background
-	go session.heartbeatLoop(ctx, controlURI, sessionUUID)
+	// Keep video alive with the data-channel heartbeat and /feedback. Do not
+	// additionally send GET_PARAMETER on this RTSP connection: some receivers
+	// leave it unanswered, and every control request is serialized on the same
+	// connection. A stuck GET_PARAMETER would therefore block /feedback long
+	// enough for the receiver to stop rendering video while audio continues.
 	go session.dataHeartbeatLoop(ctx)
-	go session.feedbackLoop(ctx, controlURI)
+	go session.feedbackLoop(ctx)
 
 	return session, nil
 }
@@ -639,11 +642,8 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 	var codecSent bool              // true if codec frame sent for current keyframe
 	var streamPrimed bool           // true after first SPS/PPS+IDR has been sent
 	var frameCount int
+	var lastProgressLog time.Time
 	var nalLog strings.Builder
-
-	// Congestion controller: EWMA-smoothed send rate vs. bitrate budget.
-	// Graduated response avoids oscillating between "all frames" and "no frames".
-	cc := newCongestionController()
 
 	// flushVCL sends the accumulated VCL data as a single encrypted frame.
 	// This handles multi-slice frames by combining all slices of one access unit.
@@ -661,14 +661,6 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 				nalLog.Reset()
 				return nil
 			}
-		}
-
-		// Graduated P-frame dropping based on congestion level.
-		// Keyframes are never dropped — the decoder needs them.
-		if !pendingKeyframe && cc.shouldDrop(frameCount) {
-			vclBuf = vclBuf[:0]
-			nalLog.Reset()
-			return nil
 		}
 
 		packetTimestamp := s.ntpTimeNow()
@@ -721,15 +713,17 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		}
 		nalLog.Reset()
 
-		sendStart := time.Now()
 		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
 		}
-		cc.recordSend(len(frameData)+128, time.Since(sendStart))
 		vclBuf = vclBuf[:0]
 		pendingKeyframe = false
 		codecSent = false
 		frameCount++
+		if time.Since(lastProgressLog) >= 5*time.Second {
+			dbg("[STREAM] video progress: sent frame %d (%s, %d bytes)", frameCount, keyframeStr, len(frameData))
+			lastProgressLog = time.Now()
+		}
 		return nil
 	}
 
@@ -1308,113 +1302,6 @@ func putFloat32LE(dst []byte, value float32) {
 	binary.LittleEndian.PutUint32(dst, math.Float32bits(value))
 }
 
-// ---------------------------------------------------------------------------
-// congestionController — EWMA-based send-rate tracker with graduated response
-// ---------------------------------------------------------------------------
-
-// congestionLevel represents the graduated congestion state.
-type congestionLevel int
-
-const (
-	congestionNone   congestionLevel = 0 // send every frame
-	congestionLight  congestionLevel = 1 // drop every 3rd P-frame
-	congestionMedium congestionLevel = 2 // drop every 2nd P-frame
-	congestionHeavy  congestionLevel = 3 // drop every P-frame
-)
-
-type congestionController struct {
-	// EWMA of write duration per byte (nanoseconds/byte). A rising value
-	// means the TCP send buffer is filling up, i.e. the link is saturated.
-	ewmaNsPerByte float64
-	samples       int
-	level         congestionLevel
-	skipped       int
-	lastLog       time.Time
-}
-
-func newCongestionController() *congestionController {
-	return &congestionController{}
-}
-
-// recordSend updates the EWMA with one frame's write timing and adjusts the
-// congestion level. Called after every successful sendFrame.
-func (cc *congestionController) recordSend(bytes int, dur time.Duration) {
-	if bytes <= 0 {
-		return
-	}
-	nsPerByte := float64(dur.Nanoseconds()) / float64(bytes)
-
-	const alpha = 0.3 // weight of new sample (reacts in ~3 frames)
-	if cc.samples == 0 {
-		cc.ewmaNsPerByte = nsPerByte
-	} else {
-		cc.ewmaNsPerByte = alpha*nsPerByte + (1-alpha)*cc.ewmaNsPerByte
-	}
-	cc.samples++
-
-	// Thresholds in ns/byte. On Wi-Fi, kernel-buffered writes typically
-	// complete in 10-500 ns/byte even under normal load. Only trigger
-	// congestion when the socket is clearly blocking for extended periods.
-	//   light:  ~50ms per 5KB frame  → 10000 ns/byte
-	//   medium: ~100ms per 5KB frame → 20000 ns/byte
-	//   heavy:  ~250ms per 5KB frame → 50000 ns/byte
-	switch {
-	case cc.ewmaNsPerByte > 50000:
-		cc.setLevel(congestionHeavy)
-	case cc.ewmaNsPerByte > 20000:
-		cc.setLevel(congestionMedium)
-	case cc.ewmaNsPerByte > 10000:
-		cc.setLevel(congestionLight)
-	default:
-		cc.setLevel(congestionNone)
-	}
-}
-
-func (cc *congestionController) setLevel(l congestionLevel) {
-	if l != cc.level {
-		if l > congestionNone {
-			log.Printf("[STREAM] congestion level %d → %d (ewma %.0f ns/byte)", cc.level, l, cc.ewmaNsPerByte)
-		} else if cc.skipped > 0 {
-			log.Printf("[STREAM] congestion cleared after skipping %d frames", cc.skipped)
-			cc.skipped = 0
-		}
-		cc.level = l
-	}
-}
-
-// shouldDrop returns true if the current frame (identified by count) should be
-// dropped based on the congestion level. Keyframes are never passed here.
-func (cc *congestionController) shouldDrop(frameCount int) bool {
-	switch cc.level {
-	case congestionLight:
-		if frameCount%3 == 0 {
-			cc.skipped++
-			cc.logDrop()
-			return true
-		}
-	case congestionMedium:
-		if frameCount%2 == 0 {
-			cc.skipped++
-			cc.logDrop()
-			return true
-		}
-	case congestionHeavy:
-		cc.skipped++
-		cc.logDrop()
-		return true
-	}
-	return false
-}
-
-func (cc *congestionController) logDrop() {
-	now := time.Now()
-	if now.Sub(cc.lastLog) > 500*time.Millisecond {
-		dbg("[STREAM] congestion: dropped %d P-frame(s) (level %d, ewma %.0f ns/byte)",
-			cc.skipped, cc.level, cc.ewmaNsPerByte)
-		cc.lastLog = now
-	}
-}
-
 // deriveVideoKeys derives the AES-128-CTR key/IV for video encryption.
 // Per UxPlay mirror_buffer.c: SHA-512("AirPlayStreamKey<id>" + shk)[:16] and SHA-512("AirPlayStreamIV<id>" + shk)[:16].
 func deriveVideoKeys(shk []byte, streamConnectionID int64) (key, iv []byte) {
@@ -1463,37 +1350,6 @@ func deriveChaChaKey(ikm []byte, streamConnectionID int64) ([]byte, error) {
 	return key, nil
 }
 
-// heartbeatLoop sends periodic GET_PARAMETER requests to keep the session alive.
-// Some receivers (e.g. Apple TV) may return 400 for GET_PARAMETER; in that case
-// we silently stop — the /feedback POST and data-channel heartbeat provide
-// redundant keepalive.
-func (s *MirrorSession) heartbeatLoop(ctx context.Context, uri, sessionID string) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	consecutiveFailures := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_, _, err := s.client.rtspRequest("GET_PARAMETER", uri, "", nil, map[string]string{
-				"Session": sessionID,
-			})
-			if err != nil {
-				consecutiveFailures++
-				dbg("[HEARTBEAT] GET_PARAMETER failed (%d): %v", consecutiveFailures, err)
-				if consecutiveFailures >= 3 {
-					dbg("[HEARTBEAT] disabling GET_PARAMETER after %d failures", consecutiveFailures)
-					return
-				}
-			} else {
-				consecutiveFailures = 0
-			}
-		}
-	}
-}
-
 // dataHeartbeatLoop sends periodic heartbeat frames on the data channel.
 // AirMyPC sends these every ~1s: 128-byte header with byte4=0x02, bytes6-7=0x1e00, no payload.
 // Waits until the first video frame has been sent before starting.
@@ -1531,15 +1387,10 @@ func (s *MirrorSession) dataHeartbeatLoop(ctx context.Context) {
 // feedbackLoop sends periodic POST /feedback requests like AirMyPC (every 2s).
 // Sends an immediate first feedback to prevent UxPlay's 3-second timeout from
 // killing the connection before the first ticker fires.
-func (s *MirrorSession) feedbackLoop(ctx context.Context, uri string) {
-	// Wait for first video frame before sending feedback
-	select {
-	case <-ctx.Done():
-		return
-	case <-s.firstFrameSent:
-	}
-
-	// Send immediate first feedback — iPhone does this within ~1s of streaming
+func (s *MirrorSession) feedbackLoop(ctx context.Context) {
+	// Start immediately after SETUP. Wayland's permission UI can delay the first
+	// captured frame for several seconds, but the receiver's feedback timeout is
+	// already running by then.
 	body, _, err := s.client.rtspRequest("POST", "/feedback", "", nil, nil)
 	if err != nil {
 		dbg("[FEEDBACK] initial error: %v", err)

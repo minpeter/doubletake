@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/godbus/dbus/v5"
 )
 
 func TestValidateHWAccel(t *testing.T) {
@@ -96,6 +98,44 @@ func TestKeyframeIntervalFrames(t *testing.T) {
 	}
 	if got := keyframeIntervalFrames(0); got != 120 {
 		t.Fatalf("keyframeIntervalFrames(0) = %d, want 120", got)
+	}
+}
+
+func TestFrameIntervalMillis(t *testing.T) {
+	for _, tt := range []struct {
+		fps  int
+		want int
+	}{
+		{fps: 30, want: 33},
+		{fps: 60, want: 16},
+		{fps: 0, want: 33},
+		{fps: 2000, want: 1},
+	} {
+		if got := frameIntervalMillis(tt.fps); got != tt.want {
+			t.Errorf("frameIntervalMillis(%d) = %d, want %d", tt.fps, got, tt.want)
+		}
+	}
+}
+
+func TestPortalStreamDimensions(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value interface{}
+		wantW int
+		wantH int
+		want  bool
+	}{
+		{name: "signed tuple", value: []int32{1920, 1080}, wantW: 1920, wantH: 1080, want: true},
+		{name: "unsigned tuple", value: []uint32{2560, 1440}, wantW: 2560, wantH: 1440, want: true},
+		{name: "variant struct", value: []interface{}{int32(3840), int32(2160)}, wantW: 3840, wantH: 2160, want: true},
+		{name: "invalid", value: []int32{1920}, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			width, height, ok := portalStreamDimensions(map[string]dbus.Variant{"size": dbus.MakeVariant(tt.value)})
+			if width != tt.wantW || height != tt.wantH || ok != tt.want {
+				t.Fatalf("portalStreamDimensions() = (%d, %d, %t), want (%d, %d, %t)", width, height, ok, tt.wantW, tt.wantH, tt.want)
+			}
+		})
 	}
 }
 
