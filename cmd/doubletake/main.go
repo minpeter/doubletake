@@ -268,13 +268,11 @@ func main() {
 		PortMin:   portMin,
 		PortMax:   portMax,
 	}
-	session, err := client.SetupMirror(ctx, streamCfg)
-	if err != nil {
-		log.Fatalf("mirror setup failed: %v", err)
-	}
-	defer session.Close()
-	log.Printf("mirror session ready (data port: %d)", session.DataPort)
-
+	// On modern receivers, SetupMirror starts a roughly 30-second deadline for
+	// the first video data. Wayland capture can spend much of that time waiting
+	// for the screencast portal, leaving a stream that starts successfully but is
+	// disconnected shortly afterward. Complete portal selection and start the
+	// capture before creating the receiver session.
 	var capture *airplay.ScreenCapture
 	if *testMode {
 		if *noAudio {
@@ -315,12 +313,20 @@ func main() {
 		}
 	}
 	defer capture.Stop()
+	log.Println("screen capture started")
+
+	session, err := client.SetupMirror(ctx, streamCfg)
+	if err != nil {
+		log.Fatalf("mirror setup failed: %v", err)
+	}
+	defer session.Close()
+	log.Printf("mirror session ready (data port: %d)", session.DataPort)
+
 	go func() {
 		<-ctx.Done()
 		capture.Stop()
 		session.Close()
 	}()
-	log.Println("screen capture started")
 
 	// Start audio capture and streaming unless disabled.
 	if !*noAudio && session.HasAudio() {

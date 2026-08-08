@@ -723,19 +723,22 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		DirectKey: d.cfg.DirectKey,
 		NoAudio:   d.cfg.NoAudio,
 	}
-	session, err := client.SetupMirror(ctx, streamCfg)
+
+	// Start capture before SetupMirror. Modern receivers start a deadline for
+	// the first video data during setup, while the Wayland screencast portal may
+	// wait indefinitely for user selection.
+	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID)
 	if err != nil {
 		client.Close()
-		removeStream(fmt.Sprintf("mirror setup failed: %v", err))
+		removeStream(fmt.Sprintf("capture failed: %v", err))
 		return
 	}
 
-	// Obtain or reuse the shared screen capture + broadcast fan-out.
-	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID)
+	session, err := client.SetupMirror(ctx, streamCfg)
 	if err != nil {
-		session.Close()
+		sink.Close()
 		client.Close()
-		removeStream(fmt.Sprintf("capture failed: %v", err))
+		removeStream(fmt.Sprintf("mirror setup failed: %v", err))
 		return
 	}
 
