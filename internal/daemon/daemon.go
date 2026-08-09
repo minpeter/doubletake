@@ -74,6 +74,8 @@ type Config struct {
 	CredBackend string
 	FPS         int
 	Bitrate     int
+	PortMin     int // inclusive local UDP port bound; zero with PortMax means ephemeral
+	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
 	HWAccel     string
 	Debug       bool
 	TestMode    bool
@@ -81,6 +83,31 @@ type Config struct {
 	DirectKey   bool
 	NoAudio     bool
 	ShowCursor  bool
+}
+
+func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
+	return airplay.StreamConfig{
+		FPS:       d.cfg.FPS,
+		Bitrate:   d.cfg.Bitrate,
+		NoEncrypt: d.cfg.NoEncrypt,
+		DirectKey: d.cfg.DirectKey,
+		NoAudio:   d.cfg.NoAudio,
+		PortMin:   d.cfg.PortMin,
+		PortMax:   d.cfg.PortMax,
+	}
+}
+
+func validatePortRange(portMin, portMax int) error {
+	if portMin == 0 && portMax == 0 {
+		return nil
+	}
+	if portMin < 1 || portMax > 65535 || portMin > portMax {
+		return fmt.Errorf("range %d-%d out of bounds (1-65535, min<=max)", portMin, portMax)
+	}
+	if portMax-portMin+1 < 3 {
+		return fmt.Errorf("range %d-%d too small; need 3 consecutive UDP ports", portMin, portMax)
+	}
+	return nil
 }
 
 // DefaultSocketPath returns the default socket path using XDG_RUNTIME_DIR.
@@ -131,6 +158,9 @@ type Daemon struct {
 func New(cfg Config) (*Daemon, error) {
 	if err := airplay.ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, fmt.Errorf("hwaccel: %w", err)
+	}
+	if err := validatePortRange(cfg.PortMin, cfg.PortMax); err != nil {
+		return nil, fmt.Errorf("port range: %w", err)
 	}
 	if cfg.HWAccel == "" {
 		cfg.HWAccel = "auto"

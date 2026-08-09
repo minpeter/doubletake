@@ -115,6 +115,9 @@ ports):
 doubletake -target 192.168.1.77 -port-range 60000-60010
 ```
 
+Daemon mode uses the same range for every managed stream. Reserve at least
+three available ports per receiver that may stream simultaneously.
+
 Then with UFW:
 
 ```sh
@@ -190,7 +193,7 @@ doubletake -target 192.168.1.77 -hwaccel openh264
 doubletake -target 192.168.1.77 -debug
 
 # Run daemon mode and control from a second shell
-doubletake -daemonize
+doubletake -daemonize -port-range 60000-60010
 doubletake-ctl status
 doubletake-ctl connect 192.168.1.77
 doubletake-ctl connect 192.168.1.133

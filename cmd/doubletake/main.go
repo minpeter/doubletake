@@ -83,13 +83,32 @@ func main() {
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
 	}
+	portMin, portMax, err := parsePortRange(*portRange)
+	if err != nil {
+		log.Fatalf("invalid -port-range: %v", err)
+	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
 	airplay.DebugMode = *debug
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio, *noCursor)
+		runDaemon(daemon.Config{
+			SocketPath:  *socketPath,
+			CredFile:    *credFile,
+			CredBackend: *credBackend,
+			FPS:         *fps,
+			Bitrate:     *bitrate,
+			PortMin:     portMin,
+			PortMax:     portMax,
+			HWAccel:     *hwaccel,
+			Debug:       *debug,
+			TestMode:    *testMode,
+			NoEncrypt:   *noEncrypt,
+			DirectKey:   *directKey,
+			NoAudio:     *noAudio,
+			ShowCursor:  !*noCursor,
+		})
 		return
 	}
 
@@ -255,10 +274,6 @@ func main() {
 		}
 	}
 
-	portMin, portMax, err := parsePortRange(*portRange)
-	if err != nil {
-		log.Fatalf("invalid -port-range: %v", err)
-	}
 	streamCfg := airplay.StreamConfig{
 		FPS:       *fps,
 		Bitrate:   *bitrate,
@@ -448,22 +463,7 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio, noCursor bool) {
-	cfg := daemon.Config{
-		SocketPath:  socketPath,
-		CredFile:    credFile,
-		CredBackend: credBackend,
-		FPS:         fps,
-		Bitrate:     bitrate,
-		HWAccel:     hwaccel,
-		Debug:       debug,
-		TestMode:    testMode,
-		NoEncrypt:   noEncrypt,
-		DirectKey:   directKey,
-		NoAudio:     noAudio,
-		ShowCursor:  !noCursor,
-	}
-
+func runDaemon(cfg daemon.Config) {
 	d, err := daemon.New(cfg)
 	if err != nil {
 		log.Fatalf("[daemon] %v", err)

@@ -42,7 +42,9 @@ environment variable, which keeps the code out of shell history and
 output.
 .TP
 .B \-port-range \fIMIN-MAX\fR
-Confine local timing and audio UDP sockets to a range of at least three ports
+Confine local timing and audio UDP sockets to a range of at least three ports,
+including streams started in daemon mode. Reserve three available ports per
+simultaneous receiver.
 .TP
 .B \-pair
 Force new pairing even if credentials exist
