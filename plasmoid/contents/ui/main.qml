@@ -22,6 +22,8 @@ PlasmoidItem {
     property var pendingCommands: (new Object())
     property bool needsCredential: false
     property string credentialKind: ""
+    property string credentialTarget: ""
+    property string credentialDevice: ""
 
     // Sorted device list: active stream targets pinned to top, rest sorted by IP
     readonly property var sortedDeviceList: {
@@ -164,12 +166,12 @@ PlasmoidItem {
         return /^\d{4}$/.test(value)
     }
 
-    function submitCredential() {
-        if (!root.credentialIsValid(credentialField.text)) {
-            return
+    function submitCredential(target, value) {
+        if (!root.credentialIsValid(value) || target === "") {
+            return false
         }
-        root.runCtl(["pin", credentialField.text], "pin")
-        credentialField.text = ""
+        root.runCtl(["connect", target, value], "pin")
+        return true
     }
 
     function handleResponse(source, resp) {
@@ -180,8 +182,30 @@ PlasmoidItem {
             if (resp.ok) {
                 root.daemonState = resp.state || "idle"
                 root.streamList = resp.streams || []
-                root.credentialKind = resp.credential_kind || (resp.needs_pin ? "pin" : "")
-                root.needsCredential = !!resp.needs_credential || !!resp.needs_pin
+
+                // Credential submissions must name the waiting stream. This is
+                // unambiguous when several receivers connect concurrently and
+                // lets the daemon advance each flow independently. Streams are
+                // sorted by IP in daemon responses, so the prompt is stable.
+                var waiting = null
+                for (var streamIndex = 0; streamIndex < root.streamList.length; streamIndex++) {
+                    var candidate = root.streamList[streamIndex]
+                    if (candidate.state === "pin_required" || !!candidate.credential_kind) {
+                        waiting = candidate
+                        break
+                    }
+                }
+                if (waiting) {
+                    root.needsCredential = true
+                    root.credentialKind = waiting.credential_kind || "pin"
+                    root.credentialTarget = waiting.device_ip || ""
+                    root.credentialDevice = waiting.device || waiting.device_ip || "the device"
+                } else {
+                    root.needsCredential = false
+                    root.credentialKind = ""
+                    root.credentialTarget = ""
+                    root.credentialDevice = ""
+                }
 
                 var primary = null
                 for (var i = 0; i < root.streamList.length; i++) {
@@ -202,7 +226,9 @@ PlasmoidItem {
                     root.hasAudio = !!resp.has_audio
                     root.audioMuted = !!resp.audio_muted
                 }
-                root.errorText = ""
+                if (resp.error) {
+                    root.errorText = resp.error
+                }
             } else {
                 root.daemonState = "idle"
                 root.connectedDevice = ""
@@ -212,6 +238,9 @@ PlasmoidItem {
                 root.streamList = []
                 root.needsCredential = false
                 root.credentialKind = ""
+                root.credentialTarget = ""
+                root.credentialDevice = ""
+                root.errorText = resp.error || "Unable to read daemon status"
             }
         } else if (action === "discover") {
             if (resp.ok && resp.devices) {
@@ -223,6 +252,8 @@ PlasmoidItem {
         } else if (action === "connect" || action === "pin") {
             if (!resp.ok) {
                 root.errorText = resp.error || "Connection failed"
+            } else {
+                root.errorText = ""
             }
             root.runCtl(["status"], "status")
         } else if (action === "disconnect" || action === "mute" || action === "unmute") {
@@ -348,8 +379,8 @@ PlasmoidItem {
                 PlasmaComponents.Label {
                     Layout.fillWidth: true
                     text: root.needsPassword
-                          ? "Enter the configured password for " + (root.connectedDevice || "the device")
-                          : "Enter the PIN shown on " + (root.connectedDevice || "the device")
+                          ? "Enter the configured password for " + (root.credentialDevice || "the device")
+                          : "Enter the PIN shown on " + (root.credentialDevice || "the device")
                     wrapMode: Text.WordWrap
                     horizontalAlignment: Text.AlignHCenter
                 }
@@ -360,6 +391,7 @@ PlasmoidItem {
 
                     Controls.TextField {
                         id: credentialField
+                        readonly property string activeCredentialTarget: root.credentialTarget
                         Layout.fillWidth: true
                         placeholderText: root.needsPassword ? "Password" : "0000"
                         maximumLength: root.needsPassword ? 32767 : 4
@@ -373,27 +405,36 @@ PlasmoidItem {
                                         ? Kirigami.Theme.defaultFont.pointSize
                                         : Kirigami.Theme.defaultFont.pointSize * 1.2
                         onEchoModeChanged: text = ""
+                        onActiveCredentialTargetChanged: text = ""
                         onVisibleChanged: {
                             if (!visible) {
                                 text = ""
                             }
                         }
-                        onAccepted: root.submitCredential()
+                        onAccepted: {
+                            if (root.submitCredential(root.credentialTarget, text)) {
+                                text = ""
+                            }
+                        }
                     }
 
                     Controls.ToolButton {
                         icon.name: "dialog-ok-apply"
-                        enabled: root.credentialIsValid(credentialField.text)
+                        enabled: root.credentialTarget !== "" && root.credentialIsValid(credentialField.text)
                         Controls.ToolTip.text: root.needsPassword ? "Submit password" : "Submit PIN"
                         Controls.ToolTip.visible: hovered
-                        onClicked: root.submitCredential()
+                        onClicked: {
+                            if (root.submitCredential(root.credentialTarget, credentialField.text)) {
+                                credentialField.text = ""
+                            }
+                        }
                     }
 
                     Controls.ToolButton {
                         icon.name: "dialog-cancel"
                         onClicked: {
                             credentialField.text = ""
-                            root.runCtl(["disconnect"], "disconnect")
+                            root.runCtl(["disconnect", root.credentialTarget], "disconnect")
                         }
                     }
                 }
@@ -438,6 +479,7 @@ PlasmoidItem {
 
                         readonly property bool isThisDeviceStreaming: root.isDeviceStreaming(modelData.ip)
                         readonly property bool isThisDeviceConnecting: root.isDeviceConnecting(modelData.ip)
+                        readonly property bool isThisDeviceActive: isThisDeviceStreaming || isThisDeviceConnecting
                         readonly property bool isThisDeviceAudioAvailable: root.deviceHasAudio(modelData.ip)
                         readonly property bool isThisDeviceAudioMuted: root.isDeviceAudioMuted(modelData.ip)
 
@@ -504,13 +546,13 @@ PlasmoidItem {
 
                             // Connect / Disconnect button
                             Controls.ToolButton {
-                                icon.name: deviceDelegate.isThisDeviceStreaming ? "media-playback-stop" : "media-playback-start"
+                                icon.name: deviceDelegate.isThisDeviceActive ? "media-playback-stop" : "media-playback-start"
                                 display: Controls.ToolButton.IconOnly
-                                Controls.ToolTip.text: deviceDelegate.isThisDeviceStreaming ? "Stop mirroring" : "Mirror to " + modelData.name
+                                Controls.ToolTip.text: deviceDelegate.isThisDeviceActive ? "Cancel or stop mirroring" : "Mirror to " + modelData.name
                                 Controls.ToolTip.visible: hovered
                                 enabled: !root.isBusy
                                 onClicked: {
-                                    if (deviceDelegate.isThisDeviceStreaming) {
+                                    if (deviceDelegate.isThisDeviceActive) {
                                         root.runCtl(["disconnect", modelData.ip], "disconnect")
                                     } else {
                                         root.runCtl(["connect", modelData.ip], "connect")
@@ -520,7 +562,7 @@ PlasmoidItem {
                         }
 
                         onClicked: {
-                            if (deviceDelegate.isThisDeviceStreaming) {
+                            if (deviceDelegate.isThisDeviceActive) {
                                 root.runCtl(["disconnect", modelData.ip], "disconnect")
                             } else if (!root.isBusy) {
                                 root.runCtl(["connect", modelData.ip], "connect")

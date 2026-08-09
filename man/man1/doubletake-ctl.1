@@ -22,7 +22,10 @@ is specified, connect to the first available discovered receiver
 .B pin \fIPIN-OR-PASSWORD\fR
 Submit the credential for a receiver waiting for input. The command retains its
 historical name for compatibility: the pending value may be either an on-screen
-PIN or a configured receiver password.
+PIN or a configured receiver password. Exactly one receiver must be waiting;
+when multiple receivers are waiting, use
+.B connect \fITARGET\fR \fIPIN-OR-PASSWORD\fR
+to select one explicitly.
 .TP
 .B disconnect [\fITARGET\fR]
 Disconnect from an Apple TV. If no target is specified, disconnects all active connections
@@ -69,6 +72,11 @@ from
 The legacy
 .B needs_pin
 field remains true only for an actual on-screen PIN.
+.PP
+Each waiting connection is also listed in
+.B streams
+with its own target and credential kind, allowing concurrent prompts to be
+completed independently.
 .SH SEE ALSO
 .B doubletake(1)
 .SH AUTHOR

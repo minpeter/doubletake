@@ -93,8 +93,8 @@ systemctl --user enable --now doubletake.service
 ```
 
 The applet runs `doubletake-ctl` as a subprocess to communicate with the daemon.
-The daemon reports whether the pending credential is an on-screen PIN or a
-configured password. Both are submitted through the compatible
-`doubletake-ctl pin` command; the applet changes only the prompt and input
-handling. The daemon manages the full AirPlay lifecycle (discovery, pairing,
-FairPlay, mirroring).
+The daemon reports whether each pending credential is an on-screen PIN or a
+configured password. The applet submits it to that specific receiver with
+`doubletake-ctl connect TARGET CREDENTIAL`, so concurrent connection flows do
+not consume one another's credentials. The daemon manages the full AirPlay
+lifecycle (discovery, pairing, FairPlay, mirroring).

@@ -128,7 +128,9 @@ Daemon status distinguishes an on-screen PIN from a configured password so UI
 clients can present the appropriate single prompt. Both values remain
 submittable with the compatible
 .B doubletake-ctl pin
-command.
+command when exactly one receiver is waiting. For concurrent prompts, use
+.B doubletake-ctl connect \fITARGET\fR \fIPIN-OR-PASSWORD\fR
+to submit a credential to a specific receiver.
 .SH REQUIREMENTS
 .IP \(bu 2
 Go 1.23 or later

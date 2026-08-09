@@ -157,7 +157,8 @@ mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field,
 while a configured password uses an unrestricted masked field. Doubletake does
 not request or claim that a PIN is visible in password mode. The daemon exposes
 the distinction while retaining `doubletake-ctl pin <PIN-or-password>` for
-command compatibility.
+command compatibility when exactly one receiver is waiting. With concurrent
+prompts, submit each value with `doubletake-ctl connect TARGET PIN-or-password`.
 
 One thing that makes this confusing to diagnose: **"Require Password" is a
 fixed password you set, not a rotating onscreen code.** Nothing appears on the
@@ -306,7 +307,9 @@ doubletake-ctl unmute [target]
 - `disconnect <target>` stops only that receiver.
 - `mute`/`unmute` can operate globally or per target.
 - `pin` retains its historical command name, but submits whichever credential
-  the daemon requests: an on-screen PIN or a configured password.
+  the daemon requests: an on-screen PIN or a configured password. It is
+  targetless and therefore requires exactly one waiting receiver; use
+  `connect <target> <PIN-or-password>` when multiple receivers are waiting.
 
 ## Disclaimer
 

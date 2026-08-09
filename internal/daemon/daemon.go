@@ -159,13 +159,13 @@ type Daemon struct {
 	credStore      *airplay.CredentialStore
 
 	// Multi-stream state
-	streams       map[string]*activeStream  // keyed by target IP
-	broadcast     *airplay.BroadcastCapture // shared video fan-out; nil when no streams active
-	capture       *airplay.ScreenCapture    // underlying screen capture
-	captureCancel context.CancelFunc        // cancellation for shared capture context
-
-	// Credential-waiting state (at most one device prompts at a time).
-	pendingTarget string
+	streams         map[string]*activeStream  // keyed by target IP
+	broadcast       *airplay.BroadcastCapture // shared video fan-out; nil when no streams active
+	capture         *airplay.ScreenCapture    // underlying screen capture
+	captureCancel   context.CancelFunc        // cancellation for starting/running shared capture
+	captureStartMu  sync.Mutex                // serializes creation of the shared capture
+	lastError       string                    // most recent asynchronous stream failure
+	lastErrorTarget string                    // target associated with lastError; empty for capture-wide errors
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
@@ -368,15 +368,12 @@ func (d *Daemon) handleRequest(req Request) Response {
 // overallState returns the aggregate daemon state based on active streams.
 // Must be called with d.mu held.
 func (d *Daemon) overallStateLocked() State {
-	if d.pendingTarget != "" {
-		if pending := d.streams[d.pendingTarget]; pending != nil && pending.state == StatePINRequired {
-			return StatePINRequired
-		}
-	}
 	hasStreaming := false
 	hasConnecting := false
 	for _, s := range d.streams {
 		switch s.state {
+		case StatePINRequired:
+			return StatePINRequired
 		case StateStreaming:
 			hasStreaming = true
 		case StateConnecting:
@@ -399,6 +396,9 @@ func (d *Daemon) handleStatus() Response {
 }
 
 func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
+	if errMsg == "" {
+		errMsg = d.lastError
+	}
 	streams := make([]StreamInfo, 0, len(d.streams))
 	for _, s := range d.streams {
 		streams = append(streams, StreamInfo{
@@ -431,10 +431,16 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			break
 		}
 	}
-	if pending := d.streams[d.pendingTarget]; pending != nil && pending.state == StatePINRequired {
-		device = pending.device
-		deviceIP = pending.deviceIP
-		credentialKind = waitingCredentialKind(pending)
+	// The top-level fields can describe only one prompt. Select the first pending
+	// stream from the already sorted list for deterministic legacy behavior; all
+	// prompts remain available in Streams for multi-target control clients.
+	for _, stream := range streams {
+		if stream.State == StatePINRequired {
+			device = stream.Device
+			deviceIP = stream.DeviceIP
+			credentialKind = stream.CredentialKind
+			break
+		}
 	}
 
 	return Response{
@@ -487,38 +493,44 @@ func (d *Daemon) handleDevices() Response {
 func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
 
-	// If we're waiting for a credential, resume the existing connection rather
-	// than creating a new client and losing its pending authentication session.
-	if d.pendingTarget != "" && req.Pin != "" {
-		target := d.pendingTarget
-		if req.Target != "" && req.Target != target {
-			d.mu.Unlock()
-			return Response{OK: false, State: StatePINRequired, Error: "a different device is waiting for a credential"}
+	// Resume a pending authentication session without replacing its AirPlay
+	// client. A target is required only when more than one receiver is waiting;
+	// targetless submissions remain compatible with older control clients.
+	if req.Pin != "" {
+		target := req.Target
+		if target == "" {
+			pending := d.pendingCredentialTargetsLocked()
+			switch len(pending) {
+			case 0:
+				state := d.overallStateLocked()
+				d.mu.Unlock()
+				return Response{OK: false, State: state, Error: "no device is waiting for a credential"}
+			case 1:
+				target = pending[0]
+			default:
+				state := d.overallStateLocked()
+				d.mu.Unlock()
+				return Response{OK: false, State: state, Error: "multiple devices are waiting for credentials; specify a target"}
+			}
 		}
-		entry, ok := d.streams[target]
-		if !ok || entry.credentialCh == nil {
-			d.pendingTarget = ""
+
+		if entry, ok := d.streams[target]; ok {
+			if entry.state != StatePINRequired || entry.credentialCh == nil {
+				state := d.overallStateLocked()
+				d.mu.Unlock()
+				return Response{OK: false, State: state, Error: "credential prompt is not ready for " + target}
+			}
+			entry.state = StateConnecting
+			entry.credentialKind = ""
+			d.clearLastErrorForTargetLocked(target)
+			// credentialCh is buffered and each pending session can be claimed only once.
+			entry.credentialCh <- req.Pin
 			state := d.overallStateLocked()
 			d.mu.Unlock()
-			return Response{OK: false, State: state, Error: "pending credential session is no longer available"}
+			return Response{OK: true, State: state, Device: target, DeviceIP: target}
 		}
-		if entry.state != StatePINRequired {
-			state := d.overallStateLocked()
-			d.mu.Unlock()
-			return Response{OK: false, State: state, Error: "credential prompt is not ready"}
-		}
-		d.pendingTarget = ""
-		entry.state = StateConnecting
-		entry.credentialKind = ""
-		// credentialCh is buffered and each pending session can be claimed only once.
-		entry.credentialCh <- req.Pin
-		d.mu.Unlock()
-		return Response{OK: true, State: StateConnecting, Device: target}
-	}
-	if req.Pin != "" && req.Target == "" {
-		state := d.overallStateLocked()
-		d.mu.Unlock()
-		return Response{OK: false, State: state, Error: "no device is waiting for a credential"}
+		// No existing entry means this is a new targeted connection with a
+		// credential supplied up front; continue into normal connection setup.
 	}
 
 	// Reject a duplicate connection to the same target.
@@ -564,6 +576,7 @@ func (d *Daemon) handleConnect(req Request) Response {
 		cancelFn:     cancel,
 		credentialCh: make(chan string, 1),
 	}
+	d.clearLastErrorForTargetLocked(target)
 	d.streams[target] = entry
 	d.mu.Unlock()
 
@@ -572,6 +585,30 @@ func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return Response{OK: true, State: d.overallStateLocked(), Device: target}
+}
+
+// pendingCredentialTargetsLocked returns pending target IPs in stable order.
+// Must be called with d.mu held.
+func (d *Daemon) pendingCredentialTargetsLocked() []string {
+	targets := make([]string, 0)
+	for target, stream := range d.streams {
+		if stream.state == StatePINRequired && stream.credentialCh != nil {
+			targets = append(targets, target)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+// clearLastErrorForTargetLocked acknowledges an error only when retrying the
+// receiver that produced it. Starting another target must not hide a concurrent
+// connection failure before a control client has a chance to report it.
+// Must be called with d.mu held.
+func (d *Daemon) clearLastErrorForTargetLocked(target string) {
+	if d.lastErrorTarget == "" || d.lastErrorTarget == target {
+		d.lastError = ""
+		d.lastErrorTarget = ""
+	}
 }
 
 // pickFreeDeviceLocked returns the first discovered device not already in d.streams.
@@ -593,14 +630,23 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// removeStream cleans up this stream's entry and tears down the shared broadcast
 	// if no other streams remain.
 	removeStream := func(msg string) {
-		if msg != "" {
-			log.Printf("[daemon] %s", msg)
+		failure := msg
+		if failure != "" {
+			failure = fmt.Sprintf("%s: %s", target, failure)
 		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		if d.streams[target] == entry {
-			d.removeStreamLocked(target)
+		// A user-requested disconnect removes the entry before closing its client.
+		// Ignore the resulting read/handshake error from that obsolete goroutine.
+		if d.streams[target] != entry {
+			return
 		}
+		if failure != "" {
+			log.Printf("[daemon] %s", failure)
+			d.lastError = failure
+			d.lastErrorTarget = target
+		}
+		d.removeStreamLocked(target)
 	}
 
 	// A receiver-configured password and an on-screen pairing PIN travel through
@@ -695,11 +741,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			d.mu.Unlock()
 			return "", context.Canceled
 		}
-		if d.pendingTarget != "" && d.pendingTarget != target {
-			d.mu.Unlock()
-			return "", fmt.Errorf("another device is already waiting for a credential")
-		}
-		d.pendingTarget = target
 		entry.credentialKind = kind
 		d.mu.Unlock()
 
@@ -708,9 +749,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		if kind == CredentialKindPIN {
 			if err := client.StartPINDisplay(); err != nil {
 				d.mu.Lock()
-				if d.pendingTarget == target {
-					d.pendingTarget = ""
-				}
 				if d.streams[target] == entry {
 					entry.credentialKind = ""
 				}
@@ -720,7 +758,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		}
 
 		d.mu.Lock()
-		if d.streams[target] != entry || d.pendingTarget != target {
+		if d.streams[target] != entry {
 			d.mu.Unlock()
 			return "", context.Canceled
 		}
@@ -733,9 +771,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			return value, nil
 		case <-ctx.Done():
 			d.mu.Lock()
-			if d.pendingTarget == target {
-				d.pendingTarget = ""
-			}
 			if d.streams[target] == entry {
 				entry.credentialKind = ""
 			}
@@ -937,6 +972,11 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 // maxW/maxH clamp the encoded size for the receiver that starts the capture;
 // sinks that join later share it.
 func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, maxH int) (*airplay.BroadcastSink, error) {
+	// Two targets may finish authentication together. Serialize the nil check and
+	// capture startup so Wayland opens only one portal and X11 starts one encoder.
+	d.captureStartMu.Lock()
+	defer d.captureStartMu.Unlock()
+
 	d.mu.Lock()
 	bc := d.broadcast
 	d.mu.Unlock()
@@ -946,6 +986,19 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, 
 		sink := bc.AddSink()
 		return sink, nil
 	}
+
+	// Publish the startup cancellation before entering the display portal or
+	// launching GStreamer. A concurrent disconnect-all can then interrupt a
+	// capture that has not returned from StartCapture yet.
+	captureCtx, captureCancel := context.WithCancel(context.Background())
+	d.mu.Lock()
+	if len(d.streams) == 0 {
+		d.mu.Unlock()
+		captureCancel()
+		return nil, context.Canceled
+	}
+	d.captureCancel = captureCancel
+	d.mu.Unlock()
 
 	// Start a fresh screen capture.
 	capCfg := airplay.CaptureConfig{
@@ -967,7 +1020,6 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, 
 		capture *airplay.ScreenCapture
 		err     error
 	)
-	captureCtx, captureCancel := context.WithCancel(context.Background())
 	if d.cfg.TestMode {
 		capture, err = airplay.StartTestCapture(captureCtx, capCfg)
 	} else {
@@ -975,6 +1027,13 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, 
 	}
 	if err != nil {
 		captureCancel()
+		d.mu.Lock()
+		// captureStartMu prevents another startup from replacing this cancel
+		// function before this attempt has finished.
+		if d.broadcast == nil && d.capture == nil {
+			d.captureCancel = nil
+		}
+		d.mu.Unlock()
 		return nil, err
 	}
 
@@ -982,13 +1041,11 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, 
 	sink := newBC.AddSink()
 
 	d.mu.Lock()
-	// Double-check: another goroutine might have started capture concurrently.
-	if d.broadcast != nil {
+	if len(d.streams) == 0 || d.captureCancel == nil {
 		d.mu.Unlock()
-		// Discard the one we just started and use the existing one.
 		captureCancel()
 		capture.Stop()
-		return d.broadcast.AddSink(), nil
+		return nil, context.Canceled
 	}
 	d.broadcast = newBC
 	d.capture = capture
@@ -996,11 +1053,25 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, 
 	d.mu.Unlock()
 
 	go func() {
-		if runErr := newBC.Run(); runErr != nil && runErr.Error() != "EOF" {
+		runErr := newBC.Run()
+		unexpected := runErr != nil && runErr.Error() != "EOF"
+		d.mu.Lock()
+		// A stopped capture can finish after a replacement connection has already
+		// been queued. Its cleanup must not tear down that newer generation.
+		if d.broadcast != newBC {
+			d.mu.Unlock()
+			return
+		}
+		if unexpected {
 			log.Printf("[daemon] broadcast capture error: %v", runErr)
 		}
-		// When the capture ends, stop all active streams.
-		d.mu.Lock()
+		// When the active capture ends, stop all streams consuming it.
+		// Shutdown also closes the capture and can produce a benign read error.
+		// Only retain failures that ended streams which were still active.
+		if unexpected && len(d.streams) > 0 {
+			d.lastError = "shared capture failed: " + runErr.Error()
+			d.lastErrorTarget = ""
+		}
 		d.stopAllLocked()
 		d.mu.Unlock()
 	}()
@@ -1014,9 +1085,6 @@ func (d *Daemon) removeStreamLocked(target string) {
 	entry, ok := d.streams[target]
 	if !ok {
 		return
-	}
-	if d.pendingTarget == target {
-		d.pendingTarget = ""
 	}
 	if entry.cancelFn != nil {
 		entry.cancelFn()
@@ -1127,7 +1195,6 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 // stopAllLocked stops all active streams and tears down the capture.
 // Must be called with d.mu held.
 func (d *Daemon) stopAllLocked() {
-	d.pendingTarget = ""
 	for target, entry := range d.streams {
 		if entry.cancelFn != nil {
 			entry.cancelFn()

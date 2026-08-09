@@ -29,8 +29,7 @@ func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 		credentialCh: credentialCh,
 	}
 	d := &Daemon{
-		streams:       map[string]*activeStream{target: entry},
-		pendingTarget: target,
+		streams: map[string]*activeStream{target: entry},
 	}
 
 	pairingID := client.PairingID
@@ -44,9 +43,6 @@ func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 	}
 	if resp.Device != target {
 		t.Fatalf("response device = %q, want %q", resp.Device, target)
-	}
-	if d.pendingTarget != "" {
-		t.Fatalf("pending target = %q, want empty after claim", d.pendingTarget)
 	}
 	if got := d.streams[target]; got != entry {
 		t.Fatalf("pending stream was replaced: got %p, want %p", got, entry)
@@ -80,7 +76,7 @@ func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 	}
 }
 
-func TestHandleConnectRejectsPINForDifferentPendingTarget(t *testing.T) {
+func TestHandleConnectRejectsCredentialForNonPendingActiveTarget(t *testing.T) {
 	const (
 		pendingTarget = "192.0.2.10"
 		requestTarget = "192.0.2.20"
@@ -96,24 +92,27 @@ func TestHandleConnectRejectsPINForDifferentPendingTarget(t *testing.T) {
 		cancelFn:     cancel,
 		credentialCh: credentialCh,
 	}
+	other := &activeStream{
+		deviceIP: requestTarget,
+		state:    StateStreaming,
+	}
 	d := &Daemon{
-		streams:       map[string]*activeStream{pendingTarget: entry},
-		pendingTarget: pendingTarget,
+		streams: map[string]*activeStream{
+			pendingTarget: entry,
+			requestTarget: other,
+		},
 	}
 
 	resp := d.handleConnect(Request{Cmd: "connect", Target: requestTarget, Pin: "1234"})
 
 	if resp.OK {
-		t.Fatal("handleConnect() accepted a PIN for a different pending target")
+		t.Fatal("handleConnect() accepted a credential for a non-pending target")
 	}
 	if resp.State != StatePINRequired {
 		t.Fatalf("response state = %q, want %q", resp.State, StatePINRequired)
 	}
-	if !strings.Contains(resp.Error, "different device") {
-		t.Fatalf("response error = %q, want a target-mismatch error", resp.Error)
-	}
-	if d.pendingTarget != pendingTarget {
-		t.Fatalf("pending target = %q, want %q", d.pendingTarget, pendingTarget)
+	if !strings.Contains(resp.Error, "prompt is not ready") {
+		t.Fatalf("response error = %q, want a prompt-not-ready error", resp.Error)
 	}
 	if got := d.streams[pendingTarget]; got != entry {
 		t.Fatalf("pending stream changed: got %p, want %p", got, entry)
@@ -206,8 +205,7 @@ func TestTargetedDisconnectClearsPendingPINSession(t *testing.T) {
 		credentialCh: make(chan string, 1),
 	}
 	d := &Daemon{
-		streams:       map[string]*activeStream{entry.deviceIP: entry},
-		pendingTarget: entry.deviceIP,
+		streams: map[string]*activeStream{entry.deviceIP: entry},
 	}
 
 	resp := d.handleDisconnect(Request{Cmd: "disconnect", Target: entry.deviceIP})
@@ -217,9 +215,6 @@ func TestTargetedDisconnectClearsPendingPINSession(t *testing.T) {
 	}
 	if resp.State != StateIdle {
 		t.Fatalf("response state = %q, want %q", resp.State, StateIdle)
-	}
-	if d.pendingTarget != "" {
-		t.Fatalf("pending target = %q, want empty", d.pendingTarget)
 	}
 	if _, ok := d.streams[entry.deviceIP]; ok {
 		t.Fatalf("pending stream %q remains after disconnect", entry.deviceIP)
@@ -239,5 +234,264 @@ func TestTargetedDisconnectClearsPendingPINSession(t *testing.T) {
 		t.Fatalf("pending AirPlay connection remained open after disconnect (read %d bytes)", n)
 	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		t.Fatal("pending AirPlay connection remained open until the read deadline")
+	}
+}
+
+func TestHandleConnectTargetsOneOfMultiplePendingCredentials(t *testing.T) {
+	const (
+		firstTarget  = "192.0.2.10"
+		secondTarget = "192.0.2.20"
+		password     = "second password"
+	)
+
+	firstCh := make(chan string, 1)
+	secondCh := make(chan string, 1)
+	d := &Daemon{streams: map[string]*activeStream{
+		firstTarget: {
+			deviceIP:       firstTarget,
+			state:          StatePINRequired,
+			credentialKind: CredentialKindPIN,
+			credentialCh:   firstCh,
+		},
+		secondTarget: {
+			deviceIP:       secondTarget,
+			state:          StatePINRequired,
+			credentialKind: CredentialKindPassword,
+			credentialCh:   secondCh,
+		},
+	}}
+
+	resp := d.handleConnect(Request{Cmd: "connect", Target: secondTarget, Pin: password})
+	if !resp.OK {
+		t.Fatalf("targeted credential submission failed: %s", resp.Error)
+	}
+	if resp.State != StatePINRequired {
+		t.Fatalf("aggregate state = %q, want %q while first target still waits", resp.State, StatePINRequired)
+	}
+	if d.streams[firstTarget].state != StatePINRequired {
+		t.Fatalf("first target state = %q, want unchanged", d.streams[firstTarget].state)
+	}
+	if d.streams[secondTarget].state != StateConnecting {
+		t.Fatalf("second target state = %q, want %q", d.streams[secondTarget].state, StateConnecting)
+	}
+	select {
+	case got := <-secondCh:
+		if got != password {
+			t.Fatalf("second target received %q, want %q", got, password)
+		}
+	default:
+		t.Fatal("second target did not receive its credential")
+	}
+	select {
+	case got := <-firstCh:
+		t.Fatalf("first target unexpectedly received %q", got)
+	default:
+	}
+}
+
+func TestHandleConnectRejectsAmbiguousTargetlessCredential(t *testing.T) {
+	const (
+		firstTarget  = "192.0.2.10"
+		secondTarget = "192.0.2.20"
+	)
+
+	firstCh := make(chan string, 1)
+	secondCh := make(chan string, 1)
+	d := &Daemon{streams: map[string]*activeStream{
+		firstTarget: {
+			deviceIP:     firstTarget,
+			state:        StatePINRequired,
+			credentialCh: firstCh,
+		},
+		secondTarget: {
+			deviceIP:     secondTarget,
+			state:        StatePINRequired,
+			credentialCh: secondCh,
+		},
+	}}
+
+	resp := d.handleConnect(Request{Cmd: "connect", Pin: "1234"})
+	if resp.OK {
+		t.Fatal("targetless credential unexpectedly succeeded with two waiters")
+	}
+	if resp.State != StatePINRequired {
+		t.Fatalf("response state = %q, want %q", resp.State, StatePINRequired)
+	}
+	if !strings.Contains(resp.Error, "multiple devices") || !strings.Contains(resp.Error, "specify a target") {
+		t.Fatalf("response error = %q, want an ambiguity error", resp.Error)
+	}
+	for target, ch := range map[string]chan string{firstTarget: firstCh, secondTarget: secondCh} {
+		select {
+		case got := <-ch:
+			t.Fatalf("target %s unexpectedly received %q", target, got)
+		default:
+		}
+	}
+}
+
+func TestStatusSelectsDeterministicPendingCredential(t *testing.T) {
+	d := &Daemon{streams: map[string]*activeStream{
+		"192.0.2.20": {
+			device:         "Password TV",
+			deviceIP:       "192.0.2.20",
+			state:          StatePINRequired,
+			credentialKind: CredentialKindPassword,
+			credentialCh:   make(chan string, 1),
+		},
+		"192.0.2.10": {
+			device:         "PIN TV",
+			deviceIP:       "192.0.2.10",
+			state:          StatePINRequired,
+			credentialKind: CredentialKindPIN,
+			credentialCh:   make(chan string, 1),
+		},
+	}}
+
+	resp := d.handleStatus()
+	if resp.DeviceIP != "192.0.2.10" || resp.Device != "PIN TV" {
+		t.Fatalf("top-level pending target = %q (%q), want deterministic first target", resp.Device, resp.DeviceIP)
+	}
+	if !resp.NeedsCredential || !resp.NeedsPIN || resp.CredentialKind != CredentialKindPIN {
+		t.Fatalf("top-level credential metadata = %+v", resp)
+	}
+	if len(resp.Streams) != 2 || resp.Streams[0].DeviceIP != "192.0.2.10" || resp.Streams[1].DeviceIP != "192.0.2.20" {
+		t.Fatalf("stream metadata is not sorted and complete: %+v", resp.Streams)
+	}
+}
+
+func TestTargetedDisconnectLeavesOtherPendingCredential(t *testing.T) {
+	const (
+		firstTarget  = "192.0.2.10"
+		secondTarget = "192.0.2.20"
+	)
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	d := &Daemon{streams: map[string]*activeStream{
+		firstTarget: {
+			deviceIP:     firstTarget,
+			state:        StatePINRequired,
+			cancelFn:     cancelFirst,
+			credentialCh: make(chan string, 1),
+		},
+		secondTarget: {
+			deviceIP:       secondTarget,
+			state:          StatePINRequired,
+			cancelFn:       cancelSecond,
+			credentialKind: CredentialKindPassword,
+			credentialCh:   make(chan string, 1),
+		},
+	}}
+
+	resp := d.handleDisconnect(Request{Cmd: "disconnect", Target: firstTarget})
+	if !resp.OK || resp.State != StatePINRequired {
+		t.Fatalf("targeted disconnect response = %+v, want other credential prompt preserved", resp)
+	}
+	if _, ok := d.streams[firstTarget]; ok {
+		t.Fatalf("disconnected target %s remains", firstTarget)
+	}
+	if got := d.streams[secondTarget]; got == nil || got.state != StatePINRequired {
+		t.Fatalf("other pending target changed: %+v", got)
+	}
+	select {
+	case <-firstCtx.Done():
+	default:
+		t.Fatal("disconnected target context was not cancelled")
+	}
+	select {
+	case <-secondCtx.Done():
+		t.Fatal("targeted disconnect cancelled the other pending target")
+	default:
+	}
+}
+
+func TestAsyncConnectFailureIsReportedByStatus(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close reserved port: %v", err)
+	}
+
+	d, err := New(Config{
+		CredBackend: "file",
+		CredFile:    t.TempDir() + "/credentials.json",
+		NoAudio:     true,
+	})
+	if err != nil {
+		t.Fatalf("create daemon: %v", err)
+	}
+	resp := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port})
+	if !resp.OK {
+		t.Fatalf("queue connection: %+v", resp)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status := d.handleStatus()
+		if status.State == StateIdle && status.Error != "" {
+			if !strings.Contains(status.Error, "connect to") {
+				t.Fatalf("asynchronous error = %q, want connection context", status.Error)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for asynchronous failure; last status: %+v", status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestAcceptedCredentialClearsPreviousAsyncError(t *testing.T) {
+	const target = "192.0.2.10"
+	credentialCh := make(chan string, 1)
+	d := &Daemon{
+		lastError:       "old asynchronous failure",
+		lastErrorTarget: target,
+		streams: map[string]*activeStream{
+			target: {
+				deviceIP:     target,
+				state:        StatePINRequired,
+				credentialCh: credentialCh,
+			},
+		},
+	}
+
+	resp := d.handleConnect(Request{Cmd: "connect", Target: target, Pin: "1234"})
+	if !resp.OK {
+		t.Fatalf("credential submission failed: %+v", resp)
+	}
+	if status := d.handleStatus(); status.Error != "" {
+		t.Fatalf("status retained stale asynchronous error %q", status.Error)
+	}
+}
+
+func TestCredentialForDifferentTargetPreservesAsyncError(t *testing.T) {
+	const (
+		failedTarget  = "192.0.2.10"
+		pendingTarget = "192.0.2.20"
+		wantError     = failedTarget + ": password pairing failed"
+	)
+	d := &Daemon{
+		lastError:       wantError,
+		lastErrorTarget: failedTarget,
+		streams: map[string]*activeStream{
+			pendingTarget: {
+				deviceIP:     pendingTarget,
+				state:        StatePINRequired,
+				credentialCh: make(chan string, 1),
+			},
+		},
+	}
+
+	resp := d.handleConnect(Request{Cmd: "connect", Target: pendingTarget, Pin: "1234"})
+	if !resp.OK {
+		t.Fatalf("credential submission failed: %+v", resp)
+	}
+	if status := d.handleStatus(); status.Error != wantError {
+		t.Fatalf("other target cleared asynchronous error: got %q, want %q", status.Error, wantError)
 	}
 }
