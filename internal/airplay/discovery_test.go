@@ -244,3 +244,34 @@ func TestSupportsTransientPairingUsesModernFeatureBits(t *testing.T) {
 		t.Fatal("nil ReceiverInfo advertises transient pairing")
 	}
 }
+
+func TestModernPairingClassificationRejectsThirdPartyFeatureMasks(t *testing.T) {
+	const rokuFeatures = uint64(0x38bcf46007f8ad0)
+
+	tests := []struct {
+		name     string
+		features uint64
+		want     bool
+	}{
+		{name: "system pairing", features: FeatureSystemPairing, want: true},
+		{name: "transient pairing", features: FeatureTransientPairing, want: true},
+		{name: "CoreUtils pairing", features: 1 << 38, want: true},
+		{name: "HomeKit access control", features: 1 << 46, want: true},
+		{name: "legacy pairing", features: 1 << 27},
+		{name: "Roku", features: rokuFeatures},
+		{name: "third-party bit 26 with modern bits", features: 1<<26 | FeatureSystemPairing | FeatureTransientPairing},
+		{name: "third-party bit 51 with modern bits", features: 1<<51 | FeatureSystemPairing | FeatureTransientPairing},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (&ReceiverInfo{Features: tt.features}).usesModernPairing(); got != tt.want {
+				t.Fatalf("usesModernPairing() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	if (*ReceiverInfo)(nil).usesModernPairing() {
+		t.Fatal("nil ReceiverInfo uses modern pairing")
+	}
+}

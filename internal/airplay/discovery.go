@@ -252,6 +252,12 @@ const (
 	FeatureSystemPairing    uint64 = 1 << 43
 	FeatureTransientPairing uint64 = 1 << 48
 	FeatureUDPMirroring     uint64 = 1 << 49
+
+	// These masks mirror the receiver classification used by Apple's sender.
+	// Third-party receivers commonly copy broad modern feature masks, so bits
+	// 43/48 alone are not enough to select the CoreUtils/HAP pairing protocol.
+	featureThirdPartyReceiverMask = uint64(1<<26 | 1<<51)
+	featureCoreUtilsPairingMask   = uint64(1<<38 | 1<<43 | 1<<46 | 1<<48)
 )
 
 func (d *AirPlayDevice) SupportsScreen() bool {
@@ -268,6 +274,21 @@ func (i *ReceiverInfo) SupportsTransientPairing() bool {
 
 func supportsTransientPairing(features uint64) bool {
 	return features&(FeatureTransientPairing|FeatureSystemPairing) != 0
+}
+
+// usesModernPairing reports whether the receiver can use the first-party
+// CoreUtils/HAP profile directly. Third-party receivers retain HKP type 3 and
+// legacy session setup even when they copy the modern pairing feature bits.
+func (i *ReceiverInfo) usesModernPairing() bool {
+	return i != nil &&
+		i.Features&featureCoreUtilsPairingMask != 0 &&
+		i.Features&featureThirdPartyReceiverMask == 0
+}
+
+// PrefersLegacyPairing reports whether protocol probing classified the
+// receiver for the original HKP type 3 pairing flow.
+func (i *ReceiverInfo) PrefersLegacyPairing() bool {
+	return i != nil && !i.usesModernPairing()
 }
 
 func (d *AirPlayDevice) SupportsFairPlaySAP() bool {

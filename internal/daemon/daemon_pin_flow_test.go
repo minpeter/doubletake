@@ -3,8 +3,10 @@ package daemon
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -39,7 +41,7 @@ func TestPINRequiredPairingStaysOnOriginalConnection(t *testing.T) {
 		"name":        "PIN TV",
 		"model":       "AppleTV-Test",
 		"deviceID":    "00:11:22:33:44:55",
-		"features":    uint64(airplay.FeatureHomeKitPairing),
+		"features":    uint64(airplay.FeatureSystemPairing),
 		"statusFlags": uint64(0x200),
 	}, plist.BinaryFormat)
 	if err != nil {
@@ -105,6 +107,16 @@ func TestPINRequiredPairingStaysOnOriginalConnection(t *testing.T) {
 	}
 
 	pinFlowWaitForState(t, d, StatePINRequired)
+	status := d.handleStatus()
+	if !status.NeedsCredential || !status.NeedsPIN || status.CredentialKind != CredentialKindPIN {
+		t.Fatalf("PIN status metadata = %+v", status)
+	}
+	if status.Device != "PIN TV" || status.DeviceIP != host {
+		t.Fatalf("PIN status target = %q (%q), want PIN TV (%q)", status.Device, status.DeviceIP, host)
+	}
+	if len(status.Streams) != 1 || status.Streams[0].CredentialKind != CredentialKindPIN {
+		t.Fatalf("PIN stream metadata = %+v", status.Streams)
+	}
 	response = d.handleConnect(Request{Cmd: "connect", Pin: "1234"})
 	if !response.OK {
 		t.Fatalf("PIN submission rejected: %+v", response)
@@ -154,6 +166,184 @@ func TestPINRequiredPairingStaysOnOriginalConnection(t *testing.T) {
 	pinFlowWaitForState(t, d, StateIdle)
 }
 
+func TestPasswordTakesPrecedenceOverPINWithoutStartingDisplay(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	infoBody, err := plist.Marshal(map[string]any{
+		"name":        "Password TV",
+		"model":       "AppleTV-Test",
+		"deviceID":    "00:11:22:33:44:66",
+		"features":    uint64(airplay.FeatureSystemPairing),
+		"statusFlags": uint64(0x280), // configured password and on-screen PIN
+	}, plist.BinaryFormat)
+	if err != nil {
+		t.Fatalf("encode /info response: %v", err)
+	}
+
+	requestSeen := make(chan pinFlowRequest, 3)
+	serverDone := make(chan pinFlowServerResult, 1)
+	go runPasswordPrecedenceReceiver(listener, infoBody, requestSeen, serverDone)
+
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split receiver address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse receiver port: %v", err)
+	}
+
+	d, err := New(Config{
+		CredBackend: "file",
+		CredFile:    filepath.Join(t.TempDir(), "credentials.json"),
+		NoAudio:     true,
+	})
+	if err != nil {
+		t.Fatalf("create daemon: %v", err)
+	}
+	t.Cleanup(func() { d.handleDisconnect(Request{}) })
+
+	response := d.handleConnect(Request{Cmd: "connect", Target: host, Port: port})
+	if !response.OK {
+		t.Fatalf("initial connect rejected: %+v", response)
+	}
+
+	request := pinFlowNextRequest(t, requestSeen)
+	if request.method != "GET" || request.path != "/info" {
+		t.Fatalf("first request = %s %s, want GET /info", request.method, request.path)
+	}
+
+	pinFlowWaitForState(t, d, StatePINRequired)
+	status := d.handleStatus()
+	if !status.NeedsCredential || status.NeedsPIN || status.CredentialKind != CredentialKindPassword {
+		t.Fatalf("password status metadata = %+v", status)
+	}
+	if status.Device != "Password TV" || status.DeviceIP != host {
+		t.Fatalf("password status target = %q (%q), want Password TV (%q)", status.Device, status.DeviceIP, host)
+	}
+	if len(status.Streams) != 1 || status.Streams[0].CredentialKind != CredentialKindPassword {
+		t.Fatalf("password stream metadata = %+v", status.Streams)
+	}
+
+	// A PIN-start request here would mean the daemon selected the wrong prompt.
+	select {
+	case request := <-requestSeen:
+		t.Fatalf("request before password submission = %s %s", request.method, request.path)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	response = d.handleConnect(Request{Cmd: "connect", Pin: "password with spaces"})
+	if !response.OK {
+		t.Fatalf("password submission rejected: %+v", response)
+	}
+	request = pinFlowNextRequest(t, requestSeen)
+	if request.method != "POST" || request.path != "/pair-setup" {
+		t.Fatalf("request after password submission = %s %s, want POST /pair-setup", request.method, request.path)
+	}
+	if got := pinFlowTLVValue(request.body, 0x13); got != nil {
+		t.Fatalf("password pair-setup unexpectedly contains transient flags: %x", got)
+	}
+
+	result := pinFlowServerResultWithin(t, serverDone)
+	if result.err != nil {
+		t.Fatalf("scripted receiver: %v", result.err)
+	}
+	for _, request := range result.requests {
+		if request.path == "/pair-pin-start" {
+			t.Fatalf("password flow called /pair-pin-start: %+v", result.requests)
+		}
+	}
+	pinFlowWaitForState(t, d, StateIdle)
+}
+
+func TestSubmittedPasswordIsReusedForDigestWithoutSecondPrompt(t *testing.T) {
+	const password = "password with spaces"
+	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
+		ListenAddress: "127.0.0.1:0",
+		Profile:       airplay.ReceiverProfileRoku,
+		Auth:          airplay.ReceiverAuthCombined,
+		Code:          password,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("create receiver: %v", err)
+	}
+	receiverCtx, cancelReceiver := context.WithCancel(context.Background())
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- server.Serve(receiverCtx) }()
+	t.Cleanup(func() {
+		cancelReceiver()
+		_ = server.Close()
+		select {
+		case err := <-receiverDone:
+			if err != nil {
+				t.Errorf("receiver Serve: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("receiver did not stop")
+		}
+	})
+
+	addr := server.Addr().(*net.TCPAddr)
+	d, err := New(Config{
+		CredBackend: "file",
+		CredFile:    filepath.Join(t.TempDir(), "credentials.json"),
+		NoAudio:     true,
+		TestMode:    true,
+	})
+	if err != nil {
+		t.Fatalf("create daemon: %v", err)
+	}
+	t.Cleanup(func() { d.handleDisconnect(Request{}) })
+
+	response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port})
+	if !response.OK {
+		t.Fatalf("initial connect rejected: %+v", response)
+	}
+	pinFlowWaitForState(t, d, StatePINRequired)
+	status := d.handleStatus()
+	if !status.NeedsCredential || status.NeedsPIN || status.CredentialKind != CredentialKindPassword {
+		t.Fatalf("password status metadata = %+v", status)
+	}
+	if starts := server.Stats().PINStarts; starts != 0 {
+		t.Fatalf("PIN-start requests before password submission = %d, want 0", starts)
+	}
+
+	response = d.handleConnect(Request{Cmd: "connect", Pin: password})
+	if !response.OK {
+		t.Fatalf("password submission rejected: %+v", response)
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		stats := server.Stats()
+		if stats.SetupRequests >= 2 {
+			if stats.DigestChallenges != 1 {
+				t.Fatalf("Digest challenges = %d, want exactly 1", stats.DigestChallenges)
+			}
+			if stats.PINStarts != 0 {
+				t.Fatalf("password flow sent %d PIN-start requests, want 0", stats.PINStarts)
+			}
+			break
+		}
+		status = d.handleStatus()
+		if status.NeedsCredential {
+			t.Fatalf("daemon prompted a second time after password submission: %+v", status)
+		}
+		if status.State == StateIdle {
+			t.Fatalf("daemon stopped before authenticated SETUP: receiver stats %+v", stats)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for authenticated SETUP: receiver stats %+v, daemon status %+v", stats, status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func runPINFlowReceiver(listener net.Listener, infoBody []byte, requestSeen chan<- pinFlowRequest, done chan<- pinFlowServerResult) {
 	result := pinFlowServerResult{}
 	finish := func(err error) {
@@ -200,6 +390,55 @@ func runPINFlowReceiver(listener net.Listener, infoBody []byte, requestSeen chan
 			finish(fmt.Errorf("write response %d: %w", i+1, err))
 			return
 		}
+	}
+
+	finish(nil)
+}
+
+func runPasswordPrecedenceReceiver(listener net.Listener, infoBody []byte, requestSeen chan<- pinFlowRequest, done chan<- pinFlowServerResult) {
+	result := pinFlowServerResult{}
+	finish := func(err error) {
+		result.err = err
+		done <- result
+	}
+
+	conn, err := listener.Accept()
+	if err != nil {
+		finish(fmt.Errorf("accept connection: %w", err))
+		return
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	request, err := readPINFlowRequest(conn, reader)
+	if err != nil {
+		finish(fmt.Errorf("read /info: %w", err))
+		return
+	}
+	result.requests = append(result.requests, request)
+	requestSeen <- request
+	if request.method != "GET" || request.path != "/info" {
+		finish(fmt.Errorf("first request = %s %s, want GET /info", request.method, request.path))
+		return
+	}
+	if err := writePINFlowResponse(conn, request.headers["cseq"], 200, "application/x-apple-binary-plist", infoBody); err != nil {
+		finish(fmt.Errorf("write /info: %w", err))
+		return
+	}
+
+	request, err = readPINFlowRequest(conn, reader)
+	if err != nil {
+		finish(fmt.Errorf("read password pair-setup: %w", err))
+		return
+	}
+	result.requests = append(result.requests, request)
+	requestSeen <- request
+	if request.method != "POST" || request.path != "/pair-setup" {
+		finish(fmt.Errorf("password request = %s %s, want POST /pair-setup", request.method, request.path))
+		return
+	}
+	if err := writePINFlowResponse(conn, request.headers["cseq"], 500, "", nil); err != nil {
+		finish(fmt.Errorf("write pair-setup response: %w", err))
+		return
 	}
 
 	finish(nil)

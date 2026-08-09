@@ -20,7 +20,9 @@ Connect to an Apple TV, optionally supplying pairing credentials. If no target
 is specified, connect to the first available discovered receiver
 .TP
 .B pin \fIPIN-OR-PASSWORD\fR
-Submit pairing credentials for a receiver waiting for input
+Submit the credential for a receiver waiting for input. The command retains its
+historical name for compatibility: the pending value may be either an on-screen
+PIN or a configured receiver password.
 .TP
 .B disconnect [\fITARGET\fR]
 Disconnect from an Apple TV. If no target is specified, disconnects all active connections
@@ -53,6 +55,20 @@ to manage connections:
 .B doubletake-ctl status
 .B doubletake-ctl connect 192.168.1.77
 .B doubletake-ctl connect 192.168.1.100
+.PP
+The JSON returned by
+.B status
+uses
+.B needs_credential
+to report pending input and
+.B credential_kind
+to distinguish
+.B pin
+from
+.BR password .
+The legacy
+.B needs_pin
+field remains true only for an actual on-screen PIN.
 .SH SEE ALSO
 .B doubletake(1)
 .SH AUTHOR

@@ -20,13 +20,13 @@ func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 	defer cancel()
 
 	client := airplay.NewAirPlayClient(target, 7000)
-	pinCh := make(chan string, 1)
+	credentialCh := make(chan string, 1)
 	entry := &activeStream{
-		deviceIP: target,
-		state:    StatePINRequired,
-		client:   client,
-		cancelFn: cancel,
-		pinCh:    pinCh,
+		deviceIP:     target,
+		state:        StatePINRequired,
+		client:       client,
+		cancelFn:     cancel,
+		credentialCh: credentialCh,
 	}
 	d := &Daemon{
 		streams:       map[string]*activeStream{target: entry},
@@ -60,12 +60,12 @@ func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 	if entry.state != StateConnecting {
 		t.Fatalf("entry state = %q, want %q", entry.state, StateConnecting)
 	}
-	if entry.pinCh != pinCh {
-		t.Fatal("pending PIN channel was replaced")
+	if entry.credentialCh != credentialCh {
+		t.Fatal("pending credential channel was replaced")
 	}
 
 	select {
-	case got := <-pinCh:
+	case got := <-credentialCh:
 		if got != pin {
 			t.Fatalf("submitted PIN = %q, want %q", got, pin)
 		}
@@ -75,7 +75,7 @@ func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 
 	select {
 	case <-ctx.Done():
-		t.Fatal("claiming a pending PIN session cancelled its connection context")
+		t.Fatal("claiming a pending credential session cancelled its connection context")
 	default:
 	}
 }
@@ -88,13 +88,13 @@ func TestHandleConnectRejectsPINForDifferentPendingTarget(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pinCh := make(chan string, 1)
+	credentialCh := make(chan string, 1)
 	entry := &activeStream{
-		deviceIP: pendingTarget,
-		state:    StatePINRequired,
-		client:   airplay.NewAirPlayClient(pendingTarget, 7000),
-		cancelFn: cancel,
-		pinCh:    pinCh,
+		deviceIP:     pendingTarget,
+		state:        StatePINRequired,
+		client:       airplay.NewAirPlayClient(pendingTarget, 7000),
+		cancelFn:     cancel,
+		credentialCh: credentialCh,
 	}
 	d := &Daemon{
 		streams:       map[string]*activeStream{pendingTarget: entry},
@@ -122,7 +122,7 @@ func TestHandleConnectRejectsPINForDifferentPendingTarget(t *testing.T) {
 		t.Fatalf("entry state = %q, want %q", entry.state, StatePINRequired)
 	}
 	select {
-	case got := <-pinCh:
+	case got := <-credentialCh:
 		t.Fatalf("mismatched PIN %q was delivered to pending stream", got)
 	default:
 	}
@@ -152,7 +152,7 @@ func TestHandleConnectRejectsTargetlessPINWithoutPendingSession(t *testing.T) {
 	if resp.State != StateStreaming {
 		t.Fatalf("response state = %q, want existing state %q", resp.State, StateStreaming)
 	}
-	if !strings.Contains(resp.Error, "no device is waiting for a PIN") {
+	if !strings.Contains(resp.Error, "no device is waiting for a credential") {
 		t.Fatalf("response error = %q, want no-pending-session error", resp.Error)
 	}
 	if len(d.streams) != 1 || d.streams[streamingTarget] == nil {
@@ -199,11 +199,11 @@ func TestTargetedDisconnectClearsPendingPINSession(t *testing.T) {
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	entry := &activeStream{
-		deviceIP: addr.IP.String(),
-		state:    StatePINRequired,
-		client:   client,
-		cancelFn: streamCancel,
-		pinCh:    make(chan string, 1),
+		deviceIP:     addr.IP.String(),
+		state:        StatePINRequired,
+		client:       client,
+		cancelFn:     streamCancel,
+		credentialCh: make(chan string, 1),
 	}
 	d := &Daemon{
 		streams:       map[string]*activeStream{entry.deviceIP: entry},

@@ -15,13 +15,15 @@ func TestPairHeadersAdvertiseIdentityAndPairingType(t *testing.T) {
 	wantClientName := pairingClientName()
 
 	for _, tt := range []struct {
-		name     string
-		pairType int
-		wantHKP  string
+		name         string
+		pairType     int
+		wantHKP      string
+		wantIdentity bool
 	}{
-		{name: "zero value defaults to screen capture", wantHKP: "5"},
-		{name: "PIN screen capture", pairType: pairingTypeScreenCapture, wantHKP: "5"},
-		{name: "transient", pairType: pairingTypeTransient, wantHKP: "4"},
+		{name: "zero value defaults to screen capture", wantHKP: "5", wantIdentity: true},
+		{name: "PIN screen capture", pairType: pairingTypeScreenCapture, wantHKP: "5", wantIdentity: true},
+		{name: "transient", pairType: pairingTypeTransient, wantHKP: "4", wantIdentity: true},
+		{name: "legacy", pairType: pairingTypeLegacy, wantHKP: "3"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &AirPlayClient{
@@ -33,11 +35,17 @@ func TestPairHeadersAdvertiseIdentityAndPairingType(t *testing.T) {
 			if got := headers["X-Apple-HKP"]; got != tt.wantHKP {
 				t.Fatalf("X-Apple-HKP = %q, want %q", got, tt.wantHKP)
 			}
-			if got := headers["X-Apple-Client-ID"]; got != pairingID {
-				t.Fatalf("X-Apple-Client-ID = %q, want %q", got, pairingID)
+			wantClientID := ""
+			wantName := ""
+			if tt.wantIdentity {
+				wantClientID = pairingID
+				wantName = wantClientName
 			}
-			if got := headers["X-Apple-Client-Name"]; got != wantClientName {
-				t.Fatalf("X-Apple-Client-Name = %q, want %q", got, wantClientName)
+			if got := headers["X-Apple-Client-ID"]; got != wantClientID {
+				t.Fatalf("X-Apple-Client-ID = %q, want %q", got, wantClientID)
+			}
+			if got := headers["X-Apple-Client-Name"]; got != wantName {
+				t.Fatalf("X-Apple-Client-Name = %q, want %q", got, wantName)
 			}
 		})
 	}
@@ -52,6 +60,67 @@ func TestPairVerifyHeadersAdvertisePairedDevice(t *testing.T) {
 	}
 	if got := headers["X-Apple-HKP"]; got != "5" {
 		t.Fatalf("X-Apple-HKP = %q, want %q", got, "5")
+	}
+}
+
+func TestLegacyPairVerifyHeadersMatchOriginalProtocol(t *testing.T) {
+	client := &AirPlayClient{
+		PairingID: "12345678-1234-4234-8234-123456789abc",
+		pairType:  pairingTypeLegacy,
+	}
+	headers := client.pairVerifyHeaders()
+
+	if len(headers) != 1 || headers["X-Apple-HKP"] != "3" {
+		t.Fatalf("legacy pair-verify headers = %#v, want only X-Apple-HKP: 3", headers)
+	}
+}
+
+func TestPairingTypeFollowsReceiverProfile(t *testing.T) {
+	const rokuFeatures = uint64(0x38bcf46007f8ad0)
+
+	for _, tt := range []struct {
+		name          string
+		info          *ReceiverInfo
+		wantTransient int
+		wantPIN       int
+	}{
+		{
+			name:          "modern Apple",
+			info:          &ReceiverInfo{Features: FeatureSystemPairing | FeatureTransientPairing},
+			wantTransient: pairingTypeTransient,
+			wantPIN:       pairingTypeScreenCapture,
+		},
+		{
+			name:          "Roku",
+			info:          &ReceiverInfo{Features: rokuFeatures},
+			wantTransient: pairingTypeLegacy,
+			wantPIN:       pairingTypeLegacy,
+		},
+		{
+			name:          "legacy or unknown receiver",
+			info:          &ReceiverInfo{},
+			wantTransient: pairingTypeLegacy,
+			wantPIN:       pairingTypeLegacy,
+		},
+		{
+			name:          "missing receiver info",
+			wantTransient: pairingTypeTransient,
+			wantPIN:       pairingTypeScreenCapture,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &AirPlayClient{info: tt.info}
+			if got := client.transientPairingType(); got != tt.wantTransient {
+				t.Fatalf("transientPairingType() = %d, want %d", got, tt.wantTransient)
+			}
+			if got := client.pinPairingType(); got != tt.wantPIN {
+				t.Fatalf("pinPairingType() = %d, want %d", got, tt.wantPIN)
+			}
+			client.pairType = pairingTypeScreenCapture
+			if got := client.effectivePairType(); got != tt.wantPIN {
+				t.Fatalf("effectivePairType() = %d, want %d", got, tt.wantPIN)
+			}
+		})
 	}
 }
 
@@ -201,7 +270,10 @@ func TestStartPINDisplayRejectsOtherHTTPStatuses(t *testing.T) {
 
 func TestPairTransientStopsWhenReceiverRequiresPINPairing(t *testing.T) {
 	client := &AirPlayClient{
-		info: &ReceiverInfo{StatusFlags: statusFlagPINRequiredForPairing},
+		info: &ReceiverInfo{
+			Features:    FeatureSystemPairing,
+			StatusFlags: statusFlagPINRequiredForPairing,
+		},
 	}
 
 	err := client.Pair(context.Background(), "")
@@ -218,12 +290,77 @@ func TestPairTransientStopsWhenReceiverRequiresPINPairing(t *testing.T) {
 	if (&ReceiverInfo{}).RequiresPINPairing() {
 		t.Fatal("receiver without PIN-required status flag reports PIN pairing")
 	}
-	if (&ReceiverInfo{StatusFlags: 1 << 8}).RequiresPINPairing() {
+	if (&ReceiverInfo{StatusFlags: 1 << 3}).RequiresPINPairing() {
 		t.Fatal("per-session PIN status flag reports one-time PIN pairing")
+	}
+	if !(&ReceiverInfo{StatusFlags: statusFlagPasswordRequired}).RequiresPassword() {
+		t.Fatal("configured-password status flag did not report a required password")
+	}
+	if (&ReceiverInfo{StatusFlags: statusFlagPINRequiredForPairing}).RequiresPassword() {
+		t.Fatal("one-time PIN status flag reports a configured password")
+	}
+	if !(&ReceiverInfo{
+		Features:    0x38bcf46007f8ad0,
+		StatusFlags: statusFlagPINRequiredForPairing,
+	}).RequiresPINPairing() {
+		t.Fatal("Roku one-time-pairing status did not request a PIN")
 	}
 	if (*ReceiverInfo)(nil).RequiresPINPairing() {
 		t.Fatal("nil ReceiverInfo reports PIN pairing")
 	}
+	if (*ReceiverInfo)(nil).RequiresPassword() {
+		t.Fatal("nil ReceiverInfo reports a configured password")
+	}
+}
+
+func TestRokuTransientPairingStartsWithRawProtocol(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	if err := clientConn.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &AirPlayClient{
+		conn: clientConn,
+		info: &ReceiverInfo{
+			Features: 0x38bcf46007f8ad0,
+		},
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		defer serverConn.Close()
+		request, err := readRTSPTestRequest(bufio.NewReader(serverConn))
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if request.method != "POST" || request.uri != "/pair-setup" {
+			serverDone <- fmt.Errorf("request = %s %s, want POST /pair-setup", request.method, request.uri)
+			return
+		}
+		if len(request.body) != 32 {
+			serverDone <- fmt.Errorf("first pair-setup body = %d bytes, want 32-byte raw public key", len(request.body))
+			return
+		}
+		if got := request.headers["x-apple-hkp"]; got != "" {
+			serverDone <- fmt.Errorf("raw pair-setup X-Apple-HKP = %q, want empty", got)
+			return
+		}
+		serverDone <- writeRTSPTestResponse(serverConn, 500, nil, nil)
+	}()
+
+	if err := client.Pair(context.Background(), ""); err == nil {
+		t.Fatal("Pair succeeded after the scripted receiver rejected raw setup")
+	} else if errors.Is(err, ErrPINRequired) {
+		t.Fatalf("Roku pairing returned ErrPINRequired instead of probing raw setup: %v", err)
+	}
+	waitPairingTestServer(t, serverDone)
 }
 
 func waitPairingTestServer(t *testing.T, done <-chan error) {

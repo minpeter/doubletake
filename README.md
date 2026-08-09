@@ -12,6 +12,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 - ChaCha20-Poly1305 stream encryption
 - mDNS device discovery
 - Daemon mode with multi-target streaming control (`doubletake-ctl`)
+- In-process test receiver for hardware-free pairing and media-flow tests
 - Configurable latency target (`-target-latency-ms`, default 100ms)
 - KDE Plasma widget for quick access (see [plasmoid/](plasmoid/))
 
@@ -68,10 +69,11 @@ These are devices that have been tested with doubletake. If there are devices no
 make
 ```
 
-This builds both binaries into `bin/`:
+This builds the three binaries into `bin/`:
 
 - `bin/doubletake`
 - `bin/doubletake-ctl`
+- `bin/doubletake-test-receiver`
 
 ## Install
 
@@ -144,16 +146,75 @@ during `-pair`, or the fixed password when "Require Password" is enabled.
 other users via `ps` and lands in shell history. The environment variable takes
 precedence when both are set.
 
-Note that this is separate from pairing. Pairing (`-pair`) authenticates the
-client identity via SRP and saves credentials; the password authenticates
-individual RTSP requests. A receiver may require either, both, or neither.
+Pairing and Digest authentication remain separate wire protocols, but
+doubletake deliberately uses one credential flow for both: a PIN/password
+entered during pairing is retained for later Digest challenges and reconnects.
+A receiver may consume that value during pairing, Digest auth, both, or neither.
 Supplying `-code` does not by itself trigger re-pairing.
+
+The CLI and Plasma applet prompt once after inspecting the receiver's security
+mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field,
+while a configured password uses an unrestricted masked field. Doubletake does
+not request or claim that a PIN is visible in password mode. The daemon exposes
+the distinction while retaining `doubletake-ctl pin <PIN-or-password>` for
+command compatibility.
 
 One thing that makes this confusing to diagnose: **"Require Password" is a
 fixed password you set, not a rotating onscreen code.** Nothing appears on the
 TV during `-pair`, and the prompt is asking for that configured password.
 
 Run with `-debug` to see the challenge and whether the retry was accepted.
+
+## Hardware-free test receiver
+
+`doubletake-test-receiver` is an in-repository AirPlay receiver for exercising
+pairing, encrypted RTSP, SETUP ordering, timing, event channels, and sustained
+audio/video traffic without an Apple TV or third-party receiver. It is a
+diagnostic sink, not a media player or a receiver-compatibility substitute.
+
+The `modern` profile advertises and exercises FairPlay SAP (FPSAP). The `roku`
+profile deliberately omits FPSAP, matching that hardware protocol personality.
+The receiver parses the outer AirPlay video framing and counts video and audio
+traffic, but encrypted video and audio payloads are not authenticated,
+decrypted, or decoded. Nothing is played or displayed; the counters demonstrate
+transport flow rather than decoded media correctness.
+
+Start a Roku-compatible receiver whose configured fixed password is required by
+both SRP and Digest authentication. This mode does not display a PIN:
+
+```sh
+DOUBLETAKE_RECEIVER_CODE='aaaaaaaa' \
+  bin/doubletake-test-receiver -profile roku -auth combined -debug
+```
+
+Then run the real sender against it from another terminal:
+
+```sh
+DOUBLETAKE_CODE='aaaaaaaa' \
+  bin/doubletake -target 127.0.0.1 -port 7000 -pair -test
+```
+
+The receiver profiles are coherent protocol personalities:
+
+| Profile | Pairing/control | FairPlay | Session setup | Timing |
+|---------|-----------------|----------|---------------|--------|
+| `roku` | HKP3; raw transient or code-authenticated HAP | deliberately omitted | legacy combined fields | NTP probes |
+| `modern` | transient or code-authenticated HAP | FPSAP | control, audio, then video | PTP metadata |
+
+Authentication modes all use the single `-code` value (or
+`$DOUBLETAKE_RECEIVER_CODE`):
+
+| Mode | Pair setup | RTSP Digest |
+|------|------------|-------------|
+| `none` | transient | no |
+| `pin` | code required; advertises an on-screen PIN | no |
+| `password` | fixed code required | no |
+| `digest` | transient | code required |
+| `combined` | fixed password required; no on-screen PIN | same password required |
+
+Use `-listen 127.0.0.1:0` to choose an ephemeral port, and
+`-stats-interval 1s` to print live counters. See
+`doubletake-test-receiver(1)` for all options.
 
 ## Usage
 
@@ -244,6 +305,8 @@ doubletake-ctl unmute [target]
 - `disconnect` without a target stops all active streams.
 - `disconnect <target>` stops only that receiver.
 - `mute`/`unmute` can operate globally or per target.
+- `pin` retains its historical command name, but submits whichever credential
+  the daemon requests: an on-screen PIN or a configured password.
 
 ## Disclaimer
 

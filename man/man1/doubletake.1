@@ -40,6 +40,14 @@ Pairing PIN shown on the receiver, or its configured password when
 environment variable, which keeps the code out of shell history and
 .BR ps (1)
 output.
+.PP
+The entered value is retained across reconnects and is used for both SRP
+pairing and a later HTTP Digest challenge when the receiver requires both.
+.PP
+Interactive mode prompts only once after identifying the receiver's security
+mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field and
+a configured receiver password uses an unrestricted masked field. Doubletake
+does not request an on-screen PIN in password mode.
 .TP
 .B \-port-range \fIMIN-MAX\fR
 Confine local timing and audio UDP sockets to a range of at least three ports,
@@ -115,6 +123,12 @@ When run with \fB\-daemonize\fR, doubletake runs as a background service that ca
 multiple simultaneous connections. Use
 .B doubletake-ctl
 to manage the daemon.
+.PP
+Daemon status distinguishes an on-screen PIN from a configured password so UI
+clients can present the appropriate single prompt. Both values remain
+submittable with the compatible
+.B doubletake-ctl pin
+command.
 .SH REQUIREMENTS
 .IP \(bu 2
 Go 1.23 or later
@@ -129,7 +143,8 @@ PipeWire (Wayland) or X11 for screen capture
 .I ~/.config/doubletake/credentials.json
 Default location for saved AirPlay credentials
 .SH SEE ALSO
-.B doubletake-ctl(1)
+.BR doubletake-ctl (1),
+.BR doubletake-test-receiver (1)
 .SH AUTHOR
 Written by Omar Roth.
 .SH LICENSE

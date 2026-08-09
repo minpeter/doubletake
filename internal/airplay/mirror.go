@@ -141,18 +141,22 @@ func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
 	return audioSecurityLegacyAES
 }
 
-func sourceVersionForSession(encrypted bool) string {
-	if encrypted {
+func sourceVersionForSession(modern bool) string {
+	if modern {
 		return modernAirPlaySourceVersion
 	}
 	return legacyAirPlaySourceVersion
 }
 
-func timingProtocolForSession(encrypted bool) string {
-	if encrypted {
+func timingProtocolForSession(modern bool) string {
+	if modern {
 		return timingProtocolPTP
 	}
 	return timingProtocolNTP
+}
+
+func (c *AirPlayClient) usesModernSessionSetup() bool {
+	return c.encrypted && c.info != nil && c.info.usesModernPairing()
 }
 
 type mirrorSetupRequest struct {
@@ -234,8 +238,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	sessionUUID := generateUUID()
 	clientDeviceID := uuidToMAC(c.sessionID)
 	senderName := pairingClientName()
-	sourceVersion := sourceVersionForSession(c.encrypted)
-	timingProtocol := timingProtocolForSession(c.encrypted)
+	modernSession := c.usesModernSessionSetup()
+	sourceVersion := sourceVersionForSession(modernSession)
+	timingProtocol := timingProtocolForSession(modernSession)
 	var clock *mediaClock
 	if timingProtocol == timingProtocolPTP {
 		clock = &mediaClock{}
@@ -311,8 +316,8 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	setupRequest.timingPort = timingPort
 	dbg("[SETUP] consecutive UDP ports: base=%d ctrl=%d data=%d", timingPort, timingPort+1, timingPort+2)
 
-	// Legacy receivers establish an NTP mapping by probing this port during
-	// SETUP. Pair-verified AirPlay sessions use the receiver's PTP clock instead.
+	// Legacy and third-party receivers establish an NTP mapping by probing this
+	// port during SETUP. Modern Apple sessions use the receiver's PTP clock.
 	if timingProtocol == timingProtocolNTP {
 		go ntpTimingResponder(sessionCtx, timingConn)
 	}
@@ -330,7 +335,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// AirPlay prepares the receiver with a control-only SETUP before creating
 	// media streams. This ordering matters: the receiver starts an audio packet
 	// processor only when type 96 is created after the session is prepared.
-	modernControlSetup := c.encrypted
+	modernControlSetup := modernSession
 
 	audioStreamConnectionID := int64(time.Now().UnixNano() & 0x7FFFFFFFFFFFFFFF)
 	selectedAudioCodec := AudioCodecALAC

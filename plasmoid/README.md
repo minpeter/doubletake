@@ -49,6 +49,9 @@ kpackagetool6 -t Plasma/Applet -r org.doubletake.plasmoid
    - **Connect** to one or more devices from the list
    - **Disconnect** a specific device from its row button
    - **Mute/Unmute** mirrored audio for all active streams
+   - Enter the receiver credential once when requested. An on-screen PIN uses a
+     visible four-digit field; a configured receiver password uses an
+     unrestricted masked field and does not display a PIN on the receiver.
 
 5. Middle-click the icon for quick toggle (connect/disconnect).
 
@@ -90,4 +93,8 @@ systemctl --user enable --now doubletake.service
 ```
 
 The applet runs `doubletake-ctl` as a subprocess to communicate with the daemon.
-The daemon manages the full AirPlay lifecycle (discovery, pairing, FairPlay, mirroring).
+The daemon reports whether the pending credential is an on-screen PIN or a
+configured password. Both are submitted through the compatible
+`doubletake-ctl pin` command; the applet changes only the prompt and input
+handling. The daemon manages the full AirPlay lifecycle (discovery, pairing,
+FairPlay, mirroring).

@@ -44,12 +44,26 @@ type ReceiverInfo struct {
 	Displays          []DisplayInfo `plist:"displays"`
 }
 
-// AirPlay receiver status flag used to choose the pairing flow.
-const statusFlagPINRequiredForPairing uint64 = 1 << 9
+// AirPlay receiver status flags used to choose one authentication prompt.
+// Apple's receiver publishes a configured playback password as bit 7 and
+// one-time on-screen PIN pairing as bit 9. Password takes precedence when both
+// are present, matching the sender framework's AirPlay security selection.
+const (
+	statusFlagPasswordRequired      uint64 = 1 << 7
+	statusFlagPINRequiredForPairing uint64 = 1 << 9
+)
+
+// RequiresPassword reports whether the receiver has a configured password.
+// The value should be requested once and retained for Digest authentication;
+// third-party receivers such as Roku may also use it for SRP pair-setup.
+func (i *ReceiverInfo) RequiresPassword() bool {
+	return i != nil && i.StatusFlags&statusFlagPasswordRequired != 0
+}
 
 // RequiresPINPairing reports whether the receiver requires one-time pairing
 // with an onscreen code. This is distinct from the receiver's per-session PIN
-// and fixed-password status bits.
+// and fixed-password status bits. The pairing implementation chooses the
+// receiver's modern or legacy wire format separately.
 func (i *ReceiverInfo) RequiresPINPairing() bool {
 	return i != nil && i.StatusFlags&statusFlagPINRequiredForPairing != 0
 }
@@ -125,9 +139,9 @@ type AirPlayClient struct {
 	streamIV  []byte
 
 	// HTTP Digest credentials, used only when the receiver has "Require
-	// Password" enabled and challenges a request with 401. Separate from
-	// pairing: pair-setup authenticates the client identity, this
-	// authenticates individual requests.
+	// Password" enabled and challenges a request with 401. Pair-setup and
+	// Digest are separate protocols, but a non-empty Pair code is retained here
+	// because receivers may use the same user-facing value for both.
 	authPassword string
 	// Most recent Digest challenge seen on this connection. Cached so later
 	// requests can authenticate up front instead of relying on a retry.
@@ -146,7 +160,8 @@ func NewAirPlayClient(host string, port int) *AirPlayClient {
 
 // SetPassword configures the password used to answer HTTP Digest challenges
 // from receivers with "Require Password" enabled. An empty password leaves
-// authentication disabled and 401s surface to the caller unchanged.
+// authentication disabled and 401s surface to the caller unchanged. Pair also
+// calls this automatically when given a non-empty PIN/password.
 func (c *AirPlayClient) SetPassword(password string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -283,6 +298,7 @@ func (c *AirPlayClient) GetInfo() (*ReceiverInfo, error) {
 
 func (c *AirPlayClient) Pair(ctx context.Context, pin string) error {
 	if pin != "" {
+		c.SetPassword(pin)
 		return c.pairWithPIN(ctx, pin)
 	}
 	return c.pairTransient(ctx)

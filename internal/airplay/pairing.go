@@ -61,6 +61,7 @@ const (
 // X-Apple-HKP pairing types used by current Apple senders. Screen capture has
 // its own system-pairing type and ACL; transient pairing is a separate type.
 const (
+	pairingTypeLegacy        = 3
 	pairingTypeTransient     = 4
 	pairingTypeScreenCapture = 5
 )
@@ -93,6 +94,10 @@ func sanitizePairingClientName(name string) string {
 
 // pairHeaders identifies this sender on Apple pairing requests.
 func (c *AirPlayClient) pairHeaders() map[string]string {
+	if c.effectivePairType() == pairingTypeLegacy {
+		return map[string]string{"X-Apple-HKP": strconv.Itoa(pairingTypeLegacy)}
+	}
+
 	headers := map[string]string{
 		"X-Apple-Client-Name": pairingClientName(),
 		"X-Apple-HKP":         strconv.Itoa(c.effectivePairType()),
@@ -106,11 +111,16 @@ func (c *AirPlayClient) pairHeaders() map[string]string {
 // pairVerifyHeaders identifies a paired-device verification exchange.
 func (c *AirPlayClient) pairVerifyHeaders() map[string]string {
 	headers := c.pairHeaders()
-	headers["X-Apple-PD"] = "1"
+	if c.effectivePairType() != pairingTypeLegacy {
+		headers["X-Apple-PD"] = "1"
+	}
 	return headers
 }
 
 func (c *AirPlayClient) effectivePairType() int {
+	if c.info.PrefersLegacyPairing() {
+		return pairingTypeLegacy
+	}
 	if c.pairType == 0 {
 		return pairingTypeScreenCapture
 	}
@@ -119,9 +129,25 @@ func (c *AirPlayClient) effectivePairType() int {
 
 func (c *AirPlayClient) pinStartHeaders() map[string]string {
 	headers := c.pairHeaders()
-	// Keep the generated code compatible with the four-digit plasmoid input.
-	headers["X-Apple-SupportedPINLengths"] = "4"
+	if c.effectivePairType() != pairingTypeLegacy {
+		// Keep the generated code compatible with the four-digit plasmoid input.
+		headers["X-Apple-SupportedPINLengths"] = "4"
+	}
 	return headers
+}
+
+func (c *AirPlayClient) transientPairingType() int {
+	if c.info.PrefersLegacyPairing() {
+		return pairingTypeLegacy
+	}
+	return pairingTypeTransient
+}
+
+func (c *AirPlayClient) pinPairingType() int {
+	if c.info.PrefersLegacyPairing() {
+		return pairingTypeLegacy
+	}
+	return pairingTypeScreenCapture
 }
 
 // SRP-6a parameters (3072-bit group from RFC 5054).
@@ -151,7 +177,7 @@ func (c *AirPlayClient) pairTransient(ctx context.Context) error {
 	if c.info != nil && c.info.RequiresPINPairing() {
 		return ErrPINRequired
 	}
-	c.pairType = pairingTypeTransient
+	c.pairType = c.transientPairingType()
 
 	// Generate Ed25519 key pair for this session
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -170,7 +196,7 @@ func (c *AirPlayClient) pairTransient(ctx context.Context) error {
 // performTransientSetupAndVerify does transient (PIN-less) pair-setup + pair-verify.
 func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) error {
 	dbg("[PAIR] starting transient pair-setup")
-	if c.info != nil && c.info.SupportsTransientPairing() {
+	if c.info != nil && c.info.usesModernPairing() && c.info.SupportsTransientPairing() {
 		dbg("[PAIR] receiver advertises modern transient pairing; using TLV8 directly")
 		if err := c.pairSetupTransient(ctx); err != nil {
 			return fmt.Errorf("pair-setup: %w", err)
@@ -264,7 +290,7 @@ func (c *AirPlayClient) pairSetupTransient(ctx context.Context) error {
 // StartPINDisplay triggers the PIN display on the Apple TV.
 // Call this before prompting the user so the PIN is visible when they're asked.
 func (c *AirPlayClient) StartPINDisplay() error {
-	c.pairType = pairingTypeScreenCapture
+	c.pairType = c.pinPairingType()
 	if _, err := c.httpRequest("POST", "/pair-pin-start", "", nil, c.pinStartHeaders()); err != nil {
 		var statusErr *HTTPStatusError
 		if errors.As(err, &statusErr) && statusErr.StatusCode == 453 {
@@ -278,7 +304,7 @@ func (c *AirPlayClient) StartPINDisplay() error {
 
 // pairWithPIN performs PIN-based pairing.
 func (c *AirPlayClient) pairWithPIN(ctx context.Context, pin string) error {
-	c.pairType = pairingTypeScreenCapture
+	c.pairType = c.pinPairingType()
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

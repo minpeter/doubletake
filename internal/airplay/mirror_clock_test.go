@@ -211,9 +211,37 @@ func TestPlistUint64RejectsFloatingPointClockIdentity(t *testing.T) {
 
 func TestTimingProtocolForSession(t *testing.T) {
 	if got := timingProtocolForSession(false); got != timingProtocolNTP {
-		t.Fatalf("plaintext timing protocol = %q, want %q", got, timingProtocolNTP)
+		t.Fatalf("legacy timing protocol = %q, want %q", got, timingProtocolNTP)
 	}
 	if got := timingProtocolForSession(true); got != timingProtocolPTP {
-		t.Fatalf("encrypted timing protocol = %q, want %q", got, timingProtocolPTP)
+		t.Fatalf("modern timing protocol = %q, want %q", got, timingProtocolPTP)
+	}
+}
+
+func TestModernSessionSetupRequiresFirstPartyProfile(t *testing.T) {
+	const rokuFeatures = uint64(0x38bcf46007f8ad0)
+
+	tests := []struct {
+		name      string
+		encrypted bool
+		features  uint64
+		want      bool
+	}{
+		{name: "modern Apple", encrypted: true, features: FeatureSystemPairing, want: true},
+		{name: "modern Apple plaintext", features: FeatureSystemPairing},
+		{name: "encrypted Roku", encrypted: true, features: rokuFeatures},
+		{name: "encrypted legacy receiver", encrypted: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &AirPlayClient{
+				encrypted: tt.encrypted,
+				info:      &ReceiverInfo{Features: tt.features},
+			}
+			if got := client.usesModernSessionSetup(); got != tt.want {
+				t.Fatalf("usesModernSessionSetup() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

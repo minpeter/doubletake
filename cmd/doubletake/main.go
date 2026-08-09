@@ -87,6 +87,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid -port-range: %v", err)
 	}
+	// The environment wins over the flag: it keeps the code out of shell history
+	// and out of `ps`, where a command line is readable by other users.
+	credential := *code
+	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
+		credential = env
+	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
@@ -108,6 +114,7 @@ func main() {
 			DirectKey:   *directKey,
 			NoAudio:     *noAudio,
 			ShowCursor:  !*noCursor,
+			Code:        credential,
 		})
 		return
 	}
@@ -151,15 +158,8 @@ func main() {
 		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
 	}
 
-	// The environment wins over the flag: it keeps the code out of shell history
-	// and out of `ps`, where a command line is readable by other users.
-	airPlayCode := *code
-	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
-		airPlayCode = env
-	}
-
 	client := airplay.NewAirPlayClient(addr, *port)
-	client.SetPassword(airPlayCode)
+	client.SetPassword(credential)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
 	}
@@ -170,12 +170,20 @@ func main() {
 		log.Fatalf("get info failed: %v", err)
 	}
 	log.Printf("connected to: %s (model: %s, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
+	if credential == "" && info.RequiresPassword() {
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured password: ")
+		if credential == "" {
+			log.Fatal("password cannot be empty")
+		}
+		client.SetPassword(credential)
+	}
 
 	// Pairing flow:
 	// 1. If --pair is forced, do full pair-setup and save credentials.
 	// 2. If saved credentials exist, load them and do pair-verify only.
-	// 3. If the receiver advertises one-time PIN pairing, request the PIN directly.
-	// 4. Otherwise, try transient pairing and use a fresh connection for PIN fallback.
+	// 3. Pair directly when a legacy receiver requires its configured password,
+	//    or when the receiver advertises one-time PIN pairing.
+	// 4. Otherwise, try transient pairing and use a fresh connection for fallback.
 	//
 	// -code alone does not force pairing. A receiver with "Require Password"
 	// needs the code on every session, so treating its presence as "pair again"
@@ -196,7 +204,7 @@ func main() {
 	reconnect := func() {
 		_ = client.Close()
 		client = airplay.NewAirPlayClient(addr, *port)
-		client.SetPassword(airPlayCode)
+		client.SetPassword(credential)
 		if err := client.Connect(ctx); err != nil {
 			log.Fatalf("reconnect failed: %v", err)
 		}
@@ -207,12 +215,16 @@ func main() {
 		}
 	}
 
-	pairWithPIN := func(pinVal string) {
-		if pinVal == "" {
-			pinVal = codeOrPrompt(airPlayCode, client)
+	pairWithCredential := func(value string, expectPIN bool) {
+		if value == "" {
+			value = credentialOrPrompt(credential, client, expectPIN)
 		}
-		if err := client.Pair(ctx, pinVal); err != nil {
-			log.Fatalf("PIN pairing failed: %v", err)
+		// AirPlay uses the same user-entered value for pair-setup and, on
+		// password-protected receivers, the later HTTP Digest challenge.
+		// Keep it for reconnects as well as the current connection.
+		credential = value
+		if err := client.Pair(ctx, value); err != nil {
+			log.Fatalf("pairing failed: %v", err)
 		}
 		if client.PairKeys == nil {
 			return
@@ -223,10 +235,9 @@ func main() {
 			log.Printf("credentials saved (%s)", *credBackend)
 		}
 	}
-
 	if needFullPair {
 		// Full pair-setup with a supplied PIN/password, or request an onscreen PIN.
-		pairWithPIN(airPlayCode)
+		pairWithCredential(credential, !info.RequiresPassword())
 	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		// Use saved credentials — pair-verify
 		log.Printf("using saved credentials (%s)", *credBackend)
@@ -239,23 +250,27 @@ func main() {
 		if err := client.PairVerify(ctx); err != nil {
 			log.Printf("pair-verify with saved creds failed: %v", err)
 			reconnect()
-			if info.RequiresPINPairing() {
-				pairWithPIN("")
+			if passwordRequiresPairing(info) {
+				pairWithCredential("", false)
+			} else if info.RequiresPINPairing() {
+				pairWithCredential("", true)
 			} else if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("transient pairing fallback failed: %v, prompting for PIN", err)
+				log.Printf("transient pairing fallback failed: %v, requesting pairing credentials", err)
 				// A failed pairing exchange may leave receiver state on this socket.
-				// Start and finish PIN pairing together on a clean connection.
+				// Start and finish credential pairing together on a clean connection.
 				reconnect()
-				pairWithPIN("")
+				pairWithCredential("", false)
 			}
 		}
 	} else {
-		if info.RequiresPINPairing() {
-			pairWithPIN("")
+		if passwordRequiresPairing(info) {
+			pairWithCredential("", false)
+		} else if info.RequiresPINPairing() {
+			pairWithCredential("", true)
 		} else if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("transient pairing failed: %v, prompting for PIN", err)
+			log.Printf("transient pairing failed: %v, requesting pairing credentials", err)
 			reconnect()
-			pairWithPIN("")
+			pairWithCredential("", false)
 		}
 	}
 	log.Println("pairing complete")
@@ -367,36 +382,50 @@ func main() {
 	log.Println("stream ended")
 }
 
-// codeOrPrompt uses the code supplied on the command line if there is one, and
-// otherwise asks for it interactively. The same value serves as the pairing PIN
-// and as the password for Digest auth, so a user who supplied one is never
-// asked for it again mid-run.
-func codeOrPrompt(code string, client *airplay.AirPlayClient) string {
-	if code != "" {
-		return code
+// credentialOrPrompt returns a supplied credential or makes one pairing-display
+// request and prompts once. expectPIN is true only when the receiver advertised
+// an on-screen PIN (or the user explicitly requested fresh pairing). A successful
+// /pair-pin-start response alone cannot distinguish a PIN from a fixed password,
+// so an unadvertised fallback keeps its prompt deliberately generic.
+func credentialOrPrompt(value string, client *airplay.AirPlayClient, expectPIN bool) string {
+	if value != "" {
+		return value
 	}
-	return promptForPIN(client)
+
+	reader := bufio.NewReader(os.Stdin)
+	displayErr := client.StartPINDisplay()
+	if displayErr != nil {
+		log.Printf("warning: failed to trigger PIN display: %v", displayErr)
+	}
+	credential := readCredential(reader, pairingCredentialPrompt(expectPIN, displayErr))
+	if credential == "" {
+		log.Fatal("pairing credential cannot be empty")
+	}
+	return credential
 }
 
-// promptForPIN asks the receiver to display a pairing code and reads the user's
-// answer. Receivers configured with a fixed password rather than an onscreen
-// code show nothing at all -- that is not an error, the user simply types the
-// password they set, so a failed pair-pin-start is only a warning.
-func promptForPIN(client *airplay.AirPlayClient) string {
-	if err := client.StartPINDisplay(); err != nil {
-		log.Printf("warning: failed to trigger PIN display: %v", err)
+func pairingCredentialPrompt(expectPIN bool, displayErr error) string {
+	if expectPIN && displayErr == nil {
+		return "Enter the PIN shown on the receiver: "
 	}
-	fmt.Print("Enter the code shown on the receiver, or its configured password: ")
+	return "Enter the receiver's configured password or pairing PIN: "
+}
+
+func passwordRequiresPairing(info *airplay.ReceiverInfo) bool {
+	// A failed transient exchange puts Roku's password pairer into an error
+	// state, so legacy password receivers must start with authenticated SRP.
+	return info.RequiresPassword() && (info.RequiresPINPairing() || info.PrefersLegacyPairing())
+}
+
+func readCredential(reader *bufio.Reader, prompt string) string {
+	fmt.Print(prompt)
 	// Read the whole line rather than using fmt.Scanln, which stops at the
 	// first space and would silently truncate a password containing one.
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		log.Fatalf("failed to read PIN: %v", err)
+		log.Fatalf("failed to read credential: %v", err)
 	}
 	line = strings.TrimRight(line, "\r\n")
-	if line == "" {
-		log.Fatal("PIN cannot be empty")
-	}
 	return line
 }
 

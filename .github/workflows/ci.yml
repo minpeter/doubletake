@@ -32,6 +32,9 @@ jobs:
       - name: Build doubletake-ctl
         run: make doubletake-ctl-release
 
+      - name: Build doubletake-test-receiver
+        run: make doubletake-test-receiver-release
+
       - name: Bundle manpages
         run: make manpages-release
 
@@ -41,6 +44,7 @@ jobs:
           path: |
             doubletake
             doubletake-ctl
+            doubletake-test-receiver
             doubletake-manpages.tar.gz
 
   release:
@@ -81,4 +85,5 @@ jobs:
           files: |
             doubletake
             doubletake-ctl
+            doubletake-test-receiver
             doubletake-manpages.tar.gz

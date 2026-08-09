@@ -27,6 +27,16 @@ const (
 	StatePINRequired State = "pin_required"
 )
 
+// CredentialKind tells a control client which single authentication value the
+// receiver is waiting for. StatePINRequired is retained as the wire-compatible
+// waiting state; new clients should use CredentialKind to choose their prompt.
+type CredentialKind string
+
+const (
+	CredentialKindPIN      CredentialKind = "pin"
+	CredentialKindPassword CredentialKind = "password"
+)
+
 // Request is a command sent to the daemon over the control socket.
 type Request struct {
 	Cmd    string `json:"cmd"`
@@ -37,25 +47,30 @@ type Request struct {
 
 // StreamInfo describes one active (or connecting) mirror stream.
 type StreamInfo struct {
-	Device     string `json:"device"`
-	DeviceIP   string `json:"device_ip"`
-	State      State  `json:"state"`
-	HasAudio   bool   `json:"has_audio"`
-	AudioMuted bool   `json:"audio_muted"`
+	Device         string         `json:"device"`
+	DeviceIP       string         `json:"device_ip"`
+	State          State          `json:"state"`
+	HasAudio       bool           `json:"has_audio"`
+	AudioMuted     bool           `json:"audio_muted"`
+	CredentialKind CredentialKind `json:"credential_kind,omitempty"`
 }
 
 // Response is returned to the caller for every request.
 type Response struct {
-	OK         bool         `json:"ok"`
-	State      State        `json:"state"`
-	Device     string       `json:"device,omitempty"`
-	DeviceIP   string       `json:"device_ip,omitempty"`
-	HasAudio   bool         `json:"has_audio"`
-	AudioMuted bool         `json:"audio_muted"`
-	NeedsPIN   bool         `json:"needs_pin,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Devices    []DeviceInfo `json:"devices,omitempty"`
-	Streams    []StreamInfo `json:"streams,omitempty"`
+	OK         bool   `json:"ok"`
+	State      State  `json:"state"`
+	Device     string `json:"device,omitempty"`
+	DeviceIP   string `json:"device_ip,omitempty"`
+	HasAudio   bool   `json:"has_audio"`
+	AudioMuted bool   `json:"audio_muted"`
+	// NeedsPIN is retained for older clients and is true only for an on-screen
+	// PIN. NeedsCredential and CredentialKind distinguish configured passwords.
+	NeedsPIN        bool           `json:"needs_pin,omitempty"`
+	NeedsCredential bool           `json:"needs_credential,omitempty"`
+	CredentialKind  CredentialKind `json:"credential_kind,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	Devices         []DeviceInfo   `json:"devices,omitempty"`
+	Streams         []StreamInfo   `json:"streams,omitempty"`
 }
 
 // DeviceInfo is a simplified view of a discovered AirPlay device.
@@ -83,6 +98,7 @@ type Config struct {
 	DirectKey   bool
 	NoAudio     bool
 	ShowCursor  bool
+	Code        string // default pairing/Digest credential; request Pin overrides it
 }
 
 func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
@@ -121,16 +137,17 @@ func DefaultSocketPath() string {
 
 // activeStream tracks the state of a single mirroring session to one receiver.
 type activeStream struct {
-	device     string // friendly name
-	deviceIP   string
-	deviceID   string
-	state      State
-	audioMuted bool
-	session    *airplay.MirrorSession
-	client     *airplay.AirPlayClient
-	sink       *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
-	cancelFn   context.CancelFunc
-	pinCh      chan string
+	device         string // friendly name
+	deviceIP       string
+	deviceID       string
+	state          State
+	audioMuted     bool
+	session        *airplay.MirrorSession
+	client         *airplay.AirPlayClient
+	sink           *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
+	cancelFn       context.CancelFunc
+	credentialCh   chan string
+	credentialKind CredentialKind
 }
 
 // Daemon manages a long-running doubletake service.
@@ -147,7 +164,7 @@ type Daemon struct {
 	capture       *airplay.ScreenCapture    // underlying screen capture
 	captureCancel context.CancelFunc        // cancellation for shared capture context
 
-	// PIN-waiting state (at most one device waits for a PIN at a time)
+	// Credential-waiting state (at most one device prompts at a time).
 	pendingTarget string
 
 	discoverCancel context.CancelFunc
@@ -352,7 +369,9 @@ func (d *Daemon) handleRequest(req Request) Response {
 // Must be called with d.mu held.
 func (d *Daemon) overallStateLocked() State {
 	if d.pendingTarget != "" {
-		return StatePINRequired
+		if pending := d.streams[d.pendingTarget]; pending != nil && pending.state == StatePINRequired {
+			return StatePINRequired
+		}
 	}
 	hasStreaming := false
 	hasConnecting := false
@@ -383,11 +402,12 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	streams := make([]StreamInfo, 0, len(d.streams))
 	for _, s := range d.streams {
 		streams = append(streams, StreamInfo{
-			Device:     s.device,
-			DeviceIP:   s.deviceIP,
-			State:      s.state,
-			HasAudio:   s.session != nil && s.session.HasAudio(),
-			AudioMuted: s.audioMuted,
+			Device:         s.device,
+			DeviceIP:       s.deviceIP,
+			State:          s.state,
+			HasAudio:       s.session != nil && s.session.HasAudio(),
+			AudioMuted:     s.audioMuted,
+			CredentialKind: waitingCredentialKind(s),
 		})
 	}
 	// Sort for deterministic output
@@ -401,6 +421,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	// backwards-compatibility with existing clients.
 	var device, deviceIP string
 	var hasAudio, audioMuted bool
+	var credentialKind CredentialKind
 	for _, s := range streams {
 		if s.State == StateStreaming {
 			device = s.Device
@@ -410,18 +431,37 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			break
 		}
 	}
+	if pending := d.streams[d.pendingTarget]; pending != nil && pending.state == StatePINRequired {
+		device = pending.device
+		deviceIP = pending.deviceIP
+		credentialKind = waitingCredentialKind(pending)
+	}
 
 	return Response{
-		OK:         ok,
-		State:      overall,
-		Device:     device,
-		DeviceIP:   deviceIP,
-		HasAudio:   hasAudio,
-		AudioMuted: audioMuted,
-		NeedsPIN:   overall == StatePINRequired,
-		Error:      errMsg,
-		Streams:    streams,
+		OK:              ok,
+		State:           overall,
+		Device:          device,
+		DeviceIP:        deviceIP,
+		HasAudio:        hasAudio,
+		AudioMuted:      audioMuted,
+		NeedsPIN:        credentialKind == CredentialKindPIN,
+		NeedsCredential: credentialKind != "",
+		CredentialKind:  credentialKind,
+		Error:           errMsg,
+		Streams:         streams,
 	}
+}
+
+func waitingCredentialKind(stream *activeStream) CredentialKind {
+	if stream == nil || stream.state != StatePINRequired {
+		return ""
+	}
+	if stream.credentialKind != "" {
+		return stream.credentialKind
+	}
+	// Entries created by older clients/tests predate CredentialKind and used the
+	// waiting state exclusively for an on-screen PIN.
+	return CredentialKindPIN
 }
 
 func (d *Daemon) handleDiscover() Response {
@@ -447,32 +487,38 @@ func (d *Daemon) handleDevices() Response {
 func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
 
-	// If we're waiting for a PIN, resume the existing connection rather than
-	// creating a new client and losing the receiver's pending pairing session.
+	// If we're waiting for a credential, resume the existing connection rather
+	// than creating a new client and losing its pending authentication session.
 	if d.pendingTarget != "" && req.Pin != "" {
 		target := d.pendingTarget
 		if req.Target != "" && req.Target != target {
 			d.mu.Unlock()
-			return Response{OK: false, State: StatePINRequired, Error: "a different device is waiting for a PIN"}
+			return Response{OK: false, State: StatePINRequired, Error: "a different device is waiting for a credential"}
 		}
 		entry, ok := d.streams[target]
-		if !ok || entry.state != StatePINRequired || entry.pinCh == nil {
+		if !ok || entry.credentialCh == nil {
 			d.pendingTarget = ""
 			state := d.overallStateLocked()
 			d.mu.Unlock()
-			return Response{OK: false, State: state, Error: "pending PIN session is no longer available"}
+			return Response{OK: false, State: state, Error: "pending credential session is no longer available"}
+		}
+		if entry.state != StatePINRequired {
+			state := d.overallStateLocked()
+			d.mu.Unlock()
+			return Response{OK: false, State: state, Error: "credential prompt is not ready"}
 		}
 		d.pendingTarget = ""
 		entry.state = StateConnecting
-		// pinCh is buffered and each pending session can be claimed only once.
-		entry.pinCh <- req.Pin
+		entry.credentialKind = ""
+		// credentialCh is buffered and each pending session can be claimed only once.
+		entry.credentialCh <- req.Pin
 		d.mu.Unlock()
 		return Response{OK: true, State: StateConnecting, Device: target}
 	}
 	if req.Pin != "" && req.Target == "" {
 		state := d.overallStateLocked()
 		d.mu.Unlock()
-		return Response{OK: false, State: state, Error: "no device is waiting for a PIN"}
+		return Response{OK: false, State: state, Error: "no device is waiting for a credential"}
 	}
 
 	// Reject a duplicate connection to the same target.
@@ -513,10 +559,10 @@ func (d *Daemon) handleConnect(req Request) Response {
 	// can always cancel the connection goroutine.
 	connCtx, cancel := context.WithCancel(context.Background())
 	entry := &activeStream{
-		deviceIP: target,
-		state:    StateConnecting,
-		cancelFn: cancel,
-		pinCh:    make(chan string, 1),
+		deviceIP:     target,
+		state:        StateConnecting,
+		cancelFn:     cancel,
+		credentialCh: make(chan string, 1),
 	}
 	d.streams[target] = entry
 	d.mu.Unlock()
@@ -543,7 +589,7 @@ func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
 	return "", 0
 }
 
-func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, pin string) {
+func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, suppliedCredential string) {
 	// removeStream cleans up this stream's entry and tears down the shared broadcast
 	// if no other streams remain.
 	removeStream := func(msg string) {
@@ -557,14 +603,22 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		}
 	}
 
+	// A receiver-configured password and an on-screen pairing PIN travel through
+	// the same user-facing field. Pair-setup consumes it first; HTTP Digest may
+	// then require the same value during SETUP. Retain it across reconnects.
+	credential := d.cfg.Code
+	if suppliedCredential != "" {
+		credential = suppliedCredential
+	}
 	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
 		next := airplay.NewAirPlayClient(target, port)
+		next.SetPassword(credential)
 		if err := next.Connect(ctx); err != nil {
 			return nil, nil, err
 		}
 
 		// Publish the connected client immediately so disconnect/shutdown can
-		// interrupt GetInfo, pairing, or a pending PIN wait.
+		// interrupt GetInfo, pairing, or a pending credential wait.
 		d.mu.Lock()
 		if d.streams[target] != entry {
 			d.mu.Unlock()
@@ -619,8 +673,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	log.Printf("[daemon] connected to %s (model: %s, deviceID: %s)", info.Name, info.Model, deviceID)
 
-	pairWithPIN := func(pinValue string) error {
-		if err := client.Pair(ctx, pinValue); err != nil {
+	pairWithCredentialValue := func(value string) error {
+		credential = value
+		if err := client.Pair(ctx, value); err != nil {
 			return err
 		}
 		if client.PairKeys != nil {
@@ -634,7 +689,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		return nil
 	}
 
-	waitForPIN := func() (string, error) {
+	waitForCredential := func(kind CredentialKind) (string, error) {
 		d.mu.Lock()
 		if d.streams[target] != entry {
 			d.mu.Unlock()
@@ -642,26 +697,47 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		}
 		if d.pendingTarget != "" && d.pendingTarget != target {
 			d.mu.Unlock()
-			return "", fmt.Errorf("another device is already waiting for a PIN")
+			return "", fmt.Errorf("another device is already waiting for a credential")
 		}
-		entry.state = StatePINRequired
 		d.pendingTarget = target
+		entry.credentialKind = kind
 		d.mu.Unlock()
 
-		if err := client.StartPINDisplay(); err != nil {
-			// Fixed-password receivers may reject this request but still accept the
-			// password through pair-setup.
-			log.Printf("[daemon] start PIN display failed: %v", err)
+		// Do not expose the PIN prompt until the receiver has accepted the request
+		// to display one. Password mode deliberately never touches this endpoint.
+		if kind == CredentialKindPIN {
+			if err := client.StartPINDisplay(); err != nil {
+				d.mu.Lock()
+				if d.pendingTarget == target {
+					d.pendingTarget = ""
+				}
+				if d.streams[target] == entry {
+					entry.credentialKind = ""
+				}
+				d.mu.Unlock()
+				return "", fmt.Errorf("start PIN display: %w", err)
+			}
 		}
 
-		log.Printf("[daemon] PIN required for %s — waiting for user input", info.Name)
+		d.mu.Lock()
+		if d.streams[target] != entry || d.pendingTarget != target {
+			d.mu.Unlock()
+			return "", context.Canceled
+		}
+		entry.state = StatePINRequired
+		d.mu.Unlock()
+
+		log.Printf("[daemon] %s required for %s — waiting for user input", kind, info.Name)
 		select {
-		case pinValue := <-entry.pinCh:
-			return pinValue, nil
+		case value := <-entry.credentialCh:
+			return value, nil
 		case <-ctx.Done():
 			d.mu.Lock()
 			if d.pendingTarget == target {
 				d.pendingTarget = ""
+			}
+			if d.streams[target] == entry {
+				entry.credentialKind = ""
 			}
 			d.mu.Unlock()
 			return "", ctx.Err()
@@ -670,16 +746,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	// Pairing
 	paired := false
-	if pin != "" {
-		if err := pairWithPIN(pin); err != nil {
-			_ = client.Close()
-			removeStream(fmt.Sprintf("pairing failed: %v", err))
-			return
-		}
-		paired = true
-	}
-
-	if !paired && savedCreds != nil && savedCreds.HasPairingCredentials() {
+	if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		pub, priv := savedCreds.Ed25519Keys()
 		client.PairingID = savedCreds.PairingID
 		client.PairKeys = &airplay.PairKeys{
@@ -696,24 +763,40 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			paired = true
 			log.Printf("[daemon] pair-verify succeeded for %s", info.Name)
 		}
-	} else if !paired && savedCreds != nil {
+	} else if savedCreds != nil {
 		log.Printf("[daemon] saved credentials have no usable pair-verify keys, skipping")
 	}
 
 	if !paired {
-		pairInteractively := func() error {
-			pinValue, err := waitForPIN()
-			if err != nil {
-				return fmt.Errorf("wait for PIN: %w", err)
+		pairWithCredential := func(kind CredentialKind) error {
+			if credential == "" {
+				value, err := waitForCredential(kind)
+				if err != nil {
+					return fmt.Errorf("wait for %s: %w", kind, err)
+				}
+				credential = value
+				client.SetPassword(credential)
 			}
-			if err := pairWithPIN(pinValue); err != nil {
-				return fmt.Errorf("PIN pairing: %w", err)
+			if err := pairWithCredentialValue(credential); err != nil {
+				return fmt.Errorf("%s pairing: %w", kind, err)
 			}
 			return nil
 		}
 
-		if info.RequiresPINPairing() {
-			if err := pairInteractively(); err != nil {
+		// Legacy third-party password receivers require full SRP pairing. Trying a
+		// transient exchange first can leave the receiver rejecting the immediate
+		// password retry. A PIN bit also requires full pairing; password still wins
+		// when both modes are advertised.
+		passwordNeedsPairing := info.RequiresPassword() &&
+			(info.RequiresPINPairing() || info.PrefersLegacyPairing())
+		if passwordNeedsPairing {
+			if err := pairWithCredential(CredentialKindPassword); err != nil {
+				_ = client.Close()
+				removeStream(err.Error())
+				return
+			}
+		} else if info.RequiresPINPairing() {
+			if err := pairWithCredential(CredentialKindPIN); err != nil {
 				_ = client.Close()
 				removeStream(err.Error())
 				return
@@ -721,12 +804,16 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		} else if err := client.Pair(ctx, ""); err != nil {
 			log.Printf("[daemon] transient pairing failed: %v", err)
 			// A failed setup may leave pairing state attached to this socket. Start
-			// and finish the PIN exchange together on a fresh connection.
+			// and finish the credential exchange together on a fresh connection.
 			if err := reconnect(); err != nil {
-				removeStream(fmt.Sprintf("reconnect for PIN pairing failed: %v", err))
+				removeStream(fmt.Sprintf("reconnect for credential pairing failed: %v", err))
 				return
 			}
-			if err := pairInteractively(); err != nil {
+			kind := CredentialKindPIN
+			if info.RequiresPassword() {
+				kind = CredentialKindPassword
+			}
+			if err := pairWithCredential(kind); err != nil {
 				_ = client.Close()
 				removeStream(err.Error())
 				return
@@ -734,6 +821,20 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		} else {
 			log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
 		}
+	}
+
+	// A configured playback password is independent from pair-verify. A saved or
+	// transient pairing may succeed without it, but SETUP will later issue a
+	// Digest challenge. Obtain the password once now and retain it for that retry.
+	if info.RequiresPassword() && credential == "" {
+		value, err := waitForCredential(CredentialKindPassword)
+		if err != nil {
+			_ = client.Close()
+			removeStream(fmt.Sprintf("wait for password: %v", err))
+			return
+		}
+		credential = value
+		client.SetPassword(credential)
 	}
 
 	// FairPlay setup

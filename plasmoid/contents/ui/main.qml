@@ -20,6 +20,8 @@ PlasmoidItem {
     property var streamList: []
     property string errorText: ""
     property var pendingCommands: (new Object())
+    property bool needsCredential: false
+    property string credentialKind: ""
 
     // Sorted device list: active stream targets pinned to top, rest sorted by IP
     readonly property var sortedDeviceList: {
@@ -38,7 +40,8 @@ PlasmoidItem {
     readonly property string ctlBinary: "doubletake-ctl"
     readonly property bool isStreaming: root.daemonState === "streaming"
     readonly property bool isConnecting: root.daemonState === "connecting"
-    readonly property bool needsPIN: root.daemonState === "pin_required"
+    readonly property bool needsPIN: root.needsCredential && root.credentialKind === "pin"
+    readonly property bool needsPassword: root.needsCredential && root.credentialKind === "password"
     readonly property bool isBusy: root.daemonState === "discovering"
     readonly property bool hasAnyStreamingTarget: {
         var streams = root.streamList || []
@@ -80,7 +83,11 @@ PlasmoidItem {
                      : PlasmaCore.Types.PassiveStatus
 
     toolTipMainText: root.isStreaming ? "Mirroring to " + root.connectedDevice : "AirPlay Mirroring"
-    toolTipSubText: root.isStreaming ? "Click to manage" : "No active session"
+    toolTipSubText: root.needsPassword
+                     ? "Configured password required"
+                     : root.needsPIN
+                       ? "On-screen PIN required"
+                       : root.isStreaming ? "Click to manage" : "No active session"
 
     function streamForIP(ip) {
         var streams = root.streamList || []
@@ -99,7 +106,7 @@ PlasmoidItem {
 
     function isDeviceConnecting(ip) {
         var s = root.streamForIP(ip)
-        return !!s && s.state === "connecting"
+        return !!s && (s.state === "connecting" || s.state === "pin_required" || !!s.credential_kind)
     }
 
     function deviceHasAudio(ip) {
@@ -136,10 +143,33 @@ PlasmoidItem {
     }
 
     function runCtl(args, action) {
-        var cmd = root.ctlBinary + " " + args.join(" ")
+        var quotedArgs = []
+        for (var i = 0; i < args.length; i++) {
+            quotedArgs.push(root.shellQuote(args[i]))
+        }
+        var cmd = root.ctlBinary + " " + quotedArgs.join(" ")
         if (!root.pendingCommands) root.pendingCommands = new Object()
         root.pendingCommands[cmd] = action
         executable.connectSource(cmd)
+    }
+
+    function shellQuote(value) {
+        return "'" + String(value).replace(/'/g, "'\"'\"'") + "'"
+    }
+
+    function credentialIsValid(value) {
+        if (root.needsPassword) {
+            return value.length > 0
+        }
+        return /^\d{4}$/.test(value)
+    }
+
+    function submitCredential() {
+        if (!root.credentialIsValid(credentialField.text)) {
+            return
+        }
+        root.runCtl(["pin", credentialField.text], "pin")
+        credentialField.text = ""
     }
 
     function handleResponse(source, resp) {
@@ -150,6 +180,8 @@ PlasmoidItem {
             if (resp.ok) {
                 root.daemonState = resp.state || "idle"
                 root.streamList = resp.streams || []
+                root.credentialKind = resp.credential_kind || (resp.needs_pin ? "pin" : "")
+                root.needsCredential = !!resp.needs_credential || !!resp.needs_pin
 
                 var primary = null
                 for (var i = 0; i < root.streamList.length; i++) {
@@ -178,6 +210,8 @@ PlasmoidItem {
                 root.hasAudio = false
                 root.audioMuted = false
                 root.streamList = []
+                root.needsCredential = false
+                root.credentialKind = ""
             }
         } else if (action === "discover") {
             if (resp.ok && resp.devices) {
@@ -304,16 +338,18 @@ PlasmoidItem {
                 Layout.fillWidth: true
             }
 
-            // PIN input section (shown when device requires pairing)
+            // One credential form, adapted to the receiver's advertised mode.
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.margins: Kirigami.Units.smallSpacing
-                visible: root.needsPIN
+                visible: root.needsCredential
                 spacing: Kirigami.Units.smallSpacing
 
                 PlasmaComponents.Label {
                     Layout.fillWidth: true
-                    text: "Enter the PIN shown on " + (root.connectedDevice || "the device")
+                    text: root.needsPassword
+                          ? "Enter the configured password for " + (root.connectedDevice || "the device")
+                          : "Enter the PIN shown on " + (root.connectedDevice || "the device")
                     wrapMode: Text.WordWrap
                     horizontalAlignment: Text.AlignHCenter
                 }
@@ -323,34 +359,40 @@ PlasmoidItem {
                     spacing: Kirigami.Units.smallSpacing
 
                     Controls.TextField {
-                        id: pinField
+                        id: credentialField
                         Layout.fillWidth: true
-                        placeholderText: "0000"
-                        maximumLength: 4
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        horizontalAlignment: Text.AlignHCenter
-                        font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.2
-                        onAccepted: {
-                            if (pinField.text.length === 4) {
-                                root.runCtl(["pin", pinField.text], "pin")
-                                pinField.text = ""
+                        placeholderText: root.needsPassword ? "Password" : "0000"
+                        maximumLength: root.needsPassword ? 32767 : 4
+                        inputMethodHints: root.needsPassword
+                                          ? Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
+                                          : Qt.ImhDigitsOnly
+                        echoMode: root.needsPassword ? TextInput.Password : TextInput.Normal
+                        passwordMaskDelay: 0
+                        horizontalAlignment: root.needsPassword ? Text.AlignLeft : Text.AlignHCenter
+                        font.pointSize: root.needsPassword
+                                        ? Kirigami.Theme.defaultFont.pointSize
+                                        : Kirigami.Theme.defaultFont.pointSize * 1.2
+                        onEchoModeChanged: text = ""
+                        onVisibleChanged: {
+                            if (!visible) {
+                                text = ""
                             }
                         }
+                        onAccepted: root.submitCredential()
                     }
 
                     Controls.ToolButton {
                         icon.name: "dialog-ok-apply"
-                        enabled: pinField.text.length === 4
-                        onClicked: {
-                            root.runCtl(["pin", pinField.text], "pin")
-                            pinField.text = ""
-                        }
+                        enabled: root.credentialIsValid(credentialField.text)
+                        Controls.ToolTip.text: root.needsPassword ? "Submit password" : "Submit PIN"
+                        Controls.ToolTip.visible: hovered
+                        onClicked: root.submitCredential()
                     }
 
                     Controls.ToolButton {
                         icon.name: "dialog-cancel"
                         onClicked: {
-                            pinField.text = ""
+                            credentialField.text = ""
                             root.runCtl(["disconnect"], "disconnect")
                         }
                     }
