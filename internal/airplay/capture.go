@@ -8,8 +8,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -92,6 +94,35 @@ func hasGstElement(name string) bool {
 	return exec.Command("gst-inspect-1.0", name).Run() == nil
 }
 
+// startGStreamerCommand starts a capture child whose lifetime cannot outlive
+// doubletake. Linux delivers Pdeathsig when the creating OS thread exits, not
+// strictly when the whole process exits, so the supervising goroutine keeps
+// that thread locked until Wait completes.
+func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
+	started := make(chan error, 1)
+	waitResult := make(chan error, 1)
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+		err := cmd.Start()
+		started <- err
+		if err != nil {
+			close(waitResult)
+			return
+		}
+		waitResult <- cmd.Wait()
+		close(waitResult)
+	}()
+
+	if err := <-started; err != nil {
+		return nil, err
+	}
+	return waitResult, nil
+}
+
 // gstStage is one GStreamer element (or caps filter) followed by its arguments.
 // Keeping separators out of stages makes it difficult for source-specific
 // pipelines to accidentally diverge in the shared encoding path.
@@ -113,6 +144,21 @@ func frameIntervalMillis(fps int) int {
 		fps = 30
 	}
 	return max(1, 1000/fps)
+}
+
+func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int) gstStage {
+	return gstStage{
+		"pipewiresrc",
+		fmt.Sprintf("fd=%d", fd),
+		fmt.Sprintf("path=%d", nodeID),
+		"do-timestamp=true",
+		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
+		// The compositor and pipewiresrc's keepalive path both retain the latest
+		// GstBuffer. With a small portal pool that can keep every PipeWire buffer
+		// checked out and freeze screencopy. Copying here returns the portal buffer
+		// as soon as pipewiresrc pulls it while downstream retains only the copy.
+		"always-copy=true",
+	}
 }
 
 func lowLatencyVideoQueueStage() gstStage {
@@ -197,10 +243,7 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	// The encoded dimensions are capped to the receiver's advertised display size
 	// when available. The actual result is read back from the H.264 SPS downstream.
 	const pwFdNum = 3
-	source := gstStage{
-		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
-		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
-	}
+	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
 
 	// Receivers advertise the largest frame their decoder accepts; an oversized
 	// stream makes some of them stop consuming after the first IDR. add-borders
@@ -264,7 +307,8 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	}
 	stderr, _ := cmd.StderrPipe()
 
-	if err := cmd.Start(); err != nil {
+	waitResult, err := startGStreamerCommand(cmd)
+	if err != nil {
 		cancel()
 		pwFd.Close()
 		dbusConn.Close()
@@ -283,7 +327,7 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 		waitCh:   make(chan struct{}),
 	}
 	go func() {
-		capture.waitErr = cmd.Wait()
+		capture.waitErr = <-waitResult
 		close(capture.waitCh)
 	}()
 
@@ -351,7 +395,8 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	}
 	stderr, _ := cmd.StderrPipe()
 
-	if err := cmd.Start(); err != nil {
+	waitResult, err := startGStreamerCommand(cmd)
+	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start gst-launch: %w", err)
 	}
@@ -365,7 +410,7 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 		waitCh: make(chan struct{}),
 	}
 	go func() {
-		capture.waitErr = cmd.Wait()
+		capture.waitErr = <-waitResult
 		close(capture.waitCh)
 	}()
 
@@ -675,7 +720,8 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		return nil, fmt.Errorf("gst stderr pipe: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	waitResult, err := startGStreamerCommand(cmd)
+	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start gst-launch-1.0: %w", err)
 	}
@@ -689,7 +735,7 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		waitCh: make(chan struct{}),
 	}
 	go func() {
-		capture.waitErr = cmd.Wait()
+		capture.waitErr = <-waitResult
 		close(capture.waitCh)
 	}()
 

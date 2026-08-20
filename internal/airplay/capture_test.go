@@ -2,12 +2,28 @@ package airplay
 
 import (
 	"context"
+	"os/exec"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/godbus/dbus/v5"
 )
+
+func TestStartGStreamerCommandSetsParentDeathSignal(t *testing.T) {
+	cmd := exec.Command("true")
+	waitResult, err := startGStreamerCommand(cmd)
+	if err != nil {
+		t.Fatalf("startGStreamerCommand: %v", err)
+	}
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Pdeathsig != syscall.SIGKILL {
+		t.Fatalf("Pdeathsig = %v, want SIGKILL", cmd.SysProcAttr)
+	}
+	if err := <-waitResult; err != nil {
+		t.Fatalf("wait for supervised command: %v", err)
+	}
+}
 
 func TestValidateHWAccel(t *testing.T) {
 	for _, method := range []string{"", "auto", "nvenc", "vaapi", "openh264", "none"} {
@@ -114,6 +130,21 @@ func TestFrameIntervalMillis(t *testing.T) {
 		if got := frameIntervalMillis(tt.fps); got != tt.want {
 			t.Errorf("frameIntervalMillis(%d) = %d, want %d", tt.fps, got, tt.want)
 		}
+	}
+}
+
+func TestPipeWireVideoSourceCopiesPortalBuffers(t *testing.T) {
+	got := pipeWireVideoSourceStage(3, 42, 30)
+	want := gstStage{
+		"pipewiresrc",
+		"fd=3",
+		"path=42",
+		"do-timestamp=true",
+		"keepalive-time=33",
+		"always-copy=true",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PipeWire source stage = %v, want %v", got, want)
 	}
 }
 

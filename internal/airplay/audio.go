@@ -144,7 +144,8 @@ func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error
 	}
 	gstStderr, _ := gstCmd.StderrPipe()
 
-	if err := gstCmd.Start(); err != nil {
+	waitResult, err := startGStreamerCommand(gstCmd)
+	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start ALAC gst pipeline: %w", err)
 	}
@@ -153,7 +154,7 @@ func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error
 	ac.gstCmd = gstCmd
 	ac.pcmPipe = gstStdout
 	go func() {
-		ac.waitErr = gstCmd.Wait()
+		ac.waitErr = <-waitResult
 		close(ac.waitCh)
 	}()
 
