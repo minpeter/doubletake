@@ -1,6 +1,9 @@
 package airplay
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestParseDigestChallenge(t *testing.T) {
 	tests := []struct {
@@ -175,9 +178,24 @@ func TestDigestRetryHeader(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &AirPlayClient{authPassword: tt.password}
-			hdr, ok := c.digestRetryHeader("SETUP", "rtsp://host/1", tt.headers, tt.err)
+			hdr, ok, gotErr := c.digestRetryHeader("SETUP", "rtsp://host/1", tt.headers, tt.err)
 			if ok != tt.wantOK {
 				t.Fatalf("digestRetryHeader ok = %v, want %v", ok, tt.wantOK)
+			}
+			if tt.name == "401 with challenge but no password" {
+				if !errors.Is(gotErr, ErrCredentialsRequired) {
+					t.Fatalf("error = %v, want ErrCredentialsRequired", gotErr)
+				}
+				var credentialsErr *CredentialsRequiredError
+				if !errors.As(gotErr, &credentialsErr) || credentialsErr.Realm != "airplay" {
+					t.Fatalf("error = %#v, want Digest realm airplay", gotErr)
+				}
+				var statusErr *HTTPStatusError
+				if !errors.As(gotErr, &statusErr) {
+					t.Fatalf("error %T does not preserve HTTPStatusError", gotErr)
+				}
+			} else if !errors.Is(gotErr, tt.err) {
+				t.Fatalf("error = %v, want %v", gotErr, tt.err)
 			}
 			if !ok {
 				return

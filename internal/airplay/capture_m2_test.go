@@ -18,7 +18,9 @@ import (
 func TestCaptureM2(t *testing.T) {
 	host := requireAppleTV(t)
 
-	DebugMode = true
+	debugWasEnabled := DebugMode()
+	SetDebugMode(true)
+	t.Cleanup(func() { SetDebugMode(debugWasEnabled) })
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -45,15 +47,12 @@ func TestCaptureM2(t *testing.T) {
 		t.Fatal("no saved credentials for this device. Run doubletake with --pair first")
 	}
 
-	// Set up pair keys from saved credentials
-	pub, priv := savedCreds.Ed25519Keys()
-	client.PairingID = savedCreds.PairingID
-	client.PairKeys = &PairKeys{
-		Ed25519Public:  pub,
-		Ed25519Private: priv,
+	if err := client.RestorePairingCredentials(savedCreds); err != nil {
+		t.Fatalf("restore pairing credentials: %v", err)
 	}
 
-	// Pair-verify (uses raw/non-HAP to keep connection plaintext)
+	// Pair-verify with the protocol recorded (or capability-inferred for an old
+	// credential entry) when the identity was created.
 	if err := client.PairVerify(ctx); err != nil {
 		t.Fatalf("pair-verify: %v", err)
 	}

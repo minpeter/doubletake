@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"howett.net/plist"
 )
 
 const (
@@ -65,7 +66,7 @@ func newEventChannel(conn net.Conn, encrypted bool, sharedSecret []byte) (*event
 	return channel, nil
 }
 
-func (c *AirPlayClient) connectEventChannel(ctx context.Context, port int) (net.Conn, error) {
+func (c *AirPlayClient) connectEventChannel(ctx context.Context, port int, clock *mediaClock) (net.Conn, error) {
 	if port <= 0 {
 		return nil, nil
 	}
@@ -87,7 +88,7 @@ func (c *AirPlayClient) connectEventChannel(ctx context.Context, port int) (net.
 
 	dbg("[EVENT] connected to receiver event port %s (encrypted=%t)", address, c.encrypted)
 	go func() {
-		if err := serveEventChannel(ctx, channel); err != nil {
+		if err := serveEventChannel(ctx, channel, clock); err != nil {
 			dbg("[EVENT] channel failed: %v", err)
 			_ = conn.Close()
 		}
@@ -169,10 +170,12 @@ func (c *eventChannel) Write(plain []byte) (int, error) {
 }
 
 type eventRequest struct {
-	method     string
-	path       string
-	cseq       uint64
-	bodyLength int
+	method      string
+	path        string
+	cseq        uint64
+	contentType string
+	bodyLength  int
+	body        []byte
 }
 
 func readEventRequest(reader *bufio.Reader) (eventRequest, error) {
@@ -218,6 +221,8 @@ func readEventRequest(reader *bufio.Reader) (eventRequest, error) {
 				return eventRequest{}, fmt.Errorf("invalid event CSeq %q", value)
 			}
 			hasCSeq = true
+		case "content-type":
+			request.contentType = value
 		}
 	}
 	if !hasCSeq {
@@ -225,8 +230,11 @@ func readEventRequest(reader *bufio.Reader) (eventRequest, error) {
 	}
 
 	request.bodyLength = contentLength
-	if _, err := io.CopyN(io.Discard, reader, int64(contentLength)); err != nil {
-		return eventRequest{}, fmt.Errorf("read event body: %w", err)
+	if contentLength > 0 {
+		request.body = make([]byte, contentLength)
+		if _, err := io.ReadFull(reader, request.body); err != nil {
+			return eventRequest{}, fmt.Errorf("read event body: %w", err)
+		}
 	}
 	return request, nil
 }
@@ -257,9 +265,38 @@ func readEventLine(reader *bufio.Reader, limit int) (string, int, error) {
 	return string(data[:len(data)-2]), len(data), nil
 }
 
+// handleEventRequest applies the only receiver command that affects the media
+// clock. AirPlayReceiver sends this as a binary plist containing
+// {type: "updateTimingPeerInfo", value: <timingPeerInfo>} after asynchronous
+// PTP setup or a timing-peer change.
+func handleEventRequest(request eventRequest, clock *mediaClock, receivedAt time.Time) error {
+	if clock == nil || request.method != "POST" || request.path != "/command" || len(request.body) == 0 {
+		return nil
+	}
+	mediaType, _, _ := strings.Cut(request.contentType, ";")
+	if mediaType != "" && !strings.EqualFold(strings.TrimSpace(mediaType), "application/x-apple-binary-plist") {
+		return nil
+	}
+
+	var command map[string]interface{}
+	if _, err := plist.Unmarshal(request.body, &command); err != nil {
+		return fmt.Errorf("decode event command: %w", err)
+	}
+	commandType, _ := command["type"].(string)
+	if commandType != "updateTimingPeerInfo" {
+		return nil
+	}
+	peer, ok := command["value"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("updateTimingPeerInfo omitted value dictionary")
+	}
+	return clock.updateTimingPeerInfo(peer, receivedAt)
+}
+
 // serveEventChannel acknowledges receiver-to-sender commands until teardown.
-// No command response body is required.
-func serveEventChannel(ctx context.Context, channel *eventChannel) error {
+// Command decoding is deliberately best-effort: Apple receivers expect a 200
+// acknowledgement even when a command is irrelevant to this sender.
+func serveEventChannel(ctx context.Context, channel *eventChannel, clock *mediaClock) error {
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -279,8 +316,12 @@ func serveEventChannel(ctx context.Context, channel *eventChannel) error {
 			}
 			return err
 		}
+		receivedAt := time.Now()
 
 		dbg("[EVENT] <- %s %s CSeq=%d body=%d", request.method, request.path, request.cseq, request.bodyLength)
+		if err := handleEventRequest(request, clock, receivedAt); err != nil {
+			dbg("[EVENT] command ignored: %v", err)
+		}
 
 		response := fmt.Sprintf("RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n", request.cseq)
 		if _, err := channel.Write([]byte(response)); err != nil {

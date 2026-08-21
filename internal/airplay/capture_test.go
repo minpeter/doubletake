@@ -2,6 +2,8 @@ package airplay
 
 import (
 	"context"
+	"errors"
+	"os"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -10,6 +12,58 @@ import (
 
 	"github.com/godbus/dbus/v5"
 )
+
+func TestCapturePreparationCloseReleasesUnstartedResources(t *testing.T) {
+	portalFD, peerFD, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create portal pipe: %v", err)
+	}
+	defer peerFD.Close()
+
+	preparation := &CapturePreparation{
+		kind: capturePreparationWayland,
+		pwFd: portalFD,
+	}
+	preparation.Close()
+	preparation.Close() // cleanup must remain idempotent
+
+	if _, err := portalFD.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("portal FD after Close: %v, want os.ErrClosed", err)
+	}
+	if preparation.pwFd != nil {
+		t.Fatal("closed preparation retained its portal FD")
+	}
+	if _, err := preparation.Start(1920, 1080); err == nil || !strings.Contains(err.Error(), "already been used") {
+		t.Fatalf("Start after Close error = %v, want single-use rejection", err)
+	}
+}
+
+func TestCapturePreparationFailedStartReleasesTransferredResources(t *testing.T) {
+	portalFD, peerFD, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create portal pipe: %v", err)
+	}
+	defer peerFD.Close()
+
+	preparation := &CapturePreparation{
+		cfg:  CaptureConfig{HWAccel: "invalid-for-test"},
+		kind: capturePreparationWayland,
+		pwFd: portalFD,
+	}
+	if _, err := preparation.Start(1920, 1080); err == nil || !strings.Contains(err.Error(), "unknown H.264 encoder") {
+		t.Fatalf("failed Start error = %v, want deterministic encoder validation error", err)
+	}
+	if _, err := portalFD.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("transferred portal FD after failed Start: %v, want os.ErrClosed", err)
+	}
+	if preparation.pwFd != nil {
+		t.Fatal("failed Start retained its transferred portal FD")
+	}
+	preparation.Close() // Start owns cleanup after the ownership transfer.
+	if _, err := preparation.Start(1280, 720); err == nil || !strings.Contains(err.Error(), "already been used") {
+		t.Fatalf("second Start error = %v, want single-use rejection", err)
+	}
+}
 
 func TestStartGStreamerCommandSetsParentDeathSignal(t *testing.T) {
 	cmd := exec.Command("true")
@@ -108,6 +162,21 @@ func TestRecommendedBitrateKbps(t *testing.T) {
 	}
 }
 
+func TestCaptureBitrateUsesReceiverSize(t *testing.T) {
+	if got := captureBitrateKbps(CaptureConfig{FPS: 30, MaxWidth: 1280, MaxHeight: 720}); got != 1843 {
+		t.Fatalf("720p receiver auto bitrate = %d, want 1843", got)
+	}
+	if got := captureBitrateKbps(CaptureConfig{FPS: 30, MaxWidth: 1280}); got != 4147 {
+		t.Fatalf("partial receiver size auto bitrate = %d, want 1080p fallback 4147", got)
+	}
+	if got := captureBitrateKbps(CaptureConfig{FPS: 30, Bitrate: 3000, MaxWidth: 1280, MaxHeight: 720}); got != 3000 {
+		t.Fatalf("explicit bitrate = %d, want 3000", got)
+	}
+	if got := captureBitrateKbps(CaptureConfig{FPS: 30, MaxWidth: 3840, MaxHeight: 2160}); got != 4147 {
+		t.Fatalf("4K receiver ceiling auto bitrate = %d, want 1080p budget 4147", got)
+	}
+}
+
 func TestKeyframeIntervalFrames(t *testing.T) {
 	if got := keyframeIntervalFrames(30); got != 120 {
 		t.Fatalf("keyframeIntervalFrames(30) = %d, want 120", got)
@@ -201,6 +270,8 @@ func TestBuildGstVideoPipeline(t *testing.T) {
 		[]gstStage{{"sourcefilter", "mode=test"}},
 		[]gstStage{{"videorate", "drop-only=true"}, frameRateStage(30), lowLatencyVideoQueueStage()},
 		encoder,
+		0,
+		0,
 	)
 	want := []string{
 		"--quiet", "testsrc", "is-live=true",
@@ -231,12 +302,16 @@ func TestBuildGstVideoPipelineSharesEncodingSuffix(t *testing.T) {
 		[]gstStage{{"vapostproc"}},
 		[]gstStage{{"videorate"}, frameRateStage(30), lowLatencyVideoQueueStage()},
 		encoder,
+		0,
+		0,
 	)
 	x11 := buildGstVideoPipeline(
 		gstStage{"ximagesrc", "display-name=:0"},
 		[]gstStage{frameRateStage(30), lowLatencyVideoQueueStage()},
 		nil,
 		encoder,
+		0,
+		0,
 	)
 	wantSuffix := []string{
 		"!", "vulkanupload",
@@ -251,6 +326,86 @@ func TestBuildGstVideoPipelineSharesEncodingSuffix(t *testing.T) {
 			t.Errorf("%s encoding suffix = %v, want %v", name, got, wantSuffix)
 		}
 	}
+}
+
+func TestBuildGstVideoPipelineSharesReceiverScaling(t *testing.T) {
+	encoder := encoderResult{
+		parts:     gstStage{"testh264enc"},
+		rawFormat: "NV12",
+	}
+	pipelines := map[string][]string{
+		"Wayland": buildGstVideoPipeline(
+			gstStage{"pipewiresrc", "path=42"},
+			[]gstStage{{"vapostproc"}, {"compositor", "force-live=true"}},
+			[]gstStage{lowLatencyVideoQueueStage()},
+			encoder,
+			1280,
+			720,
+		),
+		"X11": buildGstVideoPipeline(
+			gstStage{"ximagesrc", "display-name=:0"},
+			[]gstStage{frameRateStage(30), lowLatencyVideoQueueStage()},
+			nil,
+			encoder,
+			1280,
+			720,
+		),
+		"test": buildGstVideoPipeline(
+			gstStage{"videotestsrc", "is-live=true"},
+			[]gstStage{{"video/x-raw,width=1920,height=1080"}},
+			nil,
+			encoder,
+			1280,
+			720,
+		),
+	}
+
+	want := []string{
+		"!", "video/x-raw,format=NV12",
+		"!", "videoscale", "add-borders=true",
+		"!", "video/x-raw,width=1280,height=720,pixel-aspect-ratio=1/1",
+	}
+	for name, pipeline := range pipelines {
+		if !containsPipelineSequence(pipeline, want) {
+			t.Errorf("%s pipeline lacks shared receiver scaling sequence:\n%v", name, pipeline)
+		}
+		scalers := 0
+		for _, arg := range pipeline {
+			if arg == "videoscale" {
+				scalers++
+			}
+		}
+		if scalers != 1 {
+			t.Errorf("%s pipeline has %d videoscale elements, want exactly one:\n%v", name, scalers, pipeline)
+		}
+	}
+}
+
+func TestReceiverScaleStagesRequiresCompleteSize(t *testing.T) {
+	if stages := receiverScaleStages(0, 720); stages != nil {
+		t.Fatalf("partial receiver size produced stages: %v", stages)
+	}
+	if stages := receiverScaleStages(1280, 0); stages != nil {
+		t.Fatalf("partial receiver size produced stages: %v", stages)
+	}
+	if stages := receiverScaleStages(1, 1); stages != nil {
+		t.Fatalf("subsampled receiver size produced stages: %v", stages)
+	}
+
+	stages := receiverScaleStages(1279, 719)
+	wantCaps := "video/x-raw,width=1278,height=718,pixel-aspect-ratio=1/1"
+	if len(stages) != 2 || len(stages[1]) != 1 || stages[1][0] != wantCaps {
+		t.Fatalf("odd receiver size stages = %v, want even caps %q", stages, wantCaps)
+	}
+}
+
+func containsPipelineSequence(pipeline, sequence []string) bool {
+	for start := 0; start+len(sequence) <= len(pipeline); start++ {
+		if reflect.DeepEqual(pipeline[start:start+len(sequence)], sequence) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDetectGstEncoderSelectsExplicitOpenH264(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -206,9 +207,93 @@ type activeStream struct {
 	session        *airplay.MirrorSession
 	client         *airplay.AirPlayClient
 	sink           *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
+	captureGroup   *videoCaptureGroup     // encoder group selected from the resolved nominal canvas
 	cancelFn       context.CancelFunc
 	credentialCh   chan string
 	credentialKind CredentialKind
+}
+
+// videoCaptureKey identifies captures which can safely share one encoded H.264
+// stream. Capture settings are daemon-wide, so only the receiver's nominal
+// canvas varies between concurrent targets.
+type videoCaptureKey struct {
+	maxWidth  int
+	maxHeight int
+}
+
+// videoCaptureGroup owns one capture/encoder and its byte-stream fan-out. A
+// receiver can join only the group matching its resolved nominal canvas, so a
+// lower-resolution receiver never inherits a larger first target's encoding.
+type videoCaptureGroup struct {
+	key       videoCaptureKey
+	broadcast *airplay.BroadcastCapture
+	capture   *airplay.ScreenCapture
+	cancel    context.CancelFunc
+}
+
+// daemonCleanup owns resources detached from the daemon's state maps. Building
+// a cleanup plan while holding d.mu makes the state change atomic; running it
+// afterwards keeps cancellation, pipe closure, RTSP teardown, socket closure,
+// and process shutdown from blocking unrelated daemon requests.
+type daemonCleanup struct {
+	cancels  []context.CancelFunc
+	sinks    []*airplay.BroadcastSink
+	sessions []*airplay.MirrorSession
+	clients  []*airplay.AirPlayClient
+	captures []*airplay.ScreenCapture
+}
+
+func (cleanup *daemonCleanup) addStream(entry *activeStream) {
+	if entry.cancelFn != nil {
+		cleanup.cancels = append(cleanup.cancels, entry.cancelFn)
+		entry.cancelFn = nil
+	}
+	if entry.sink != nil {
+		cleanup.sinks = append(cleanup.sinks, entry.sink)
+		entry.sink = nil
+	}
+	if entry.session != nil {
+		cleanup.sessions = append(cleanup.sessions, entry.session)
+		entry.session = nil
+	}
+	if entry.client != nil {
+		cleanup.clients = append(cleanup.clients, entry.client)
+		entry.client = nil
+	}
+	entry.captureGroup = nil
+}
+
+func (cleanup *daemonCleanup) addCaptureGroup(group *videoCaptureGroup) {
+	if group.cancel != nil {
+		cleanup.cancels = append(cleanup.cancels, group.cancel)
+		group.cancel = nil
+	}
+	if group.capture != nil {
+		cleanup.captures = append(cleanup.captures, group.capture)
+		group.capture = nil
+	}
+	group.broadcast = nil
+}
+
+// run may block and therefore must never be called with d.mu held. Cancel all
+// producers and close all fan-out pipes before waiting for protocol or capture
+// teardown, so independent stream workers can start unwinding promptly.
+func (cleanup *daemonCleanup) run() {
+	for _, cancel := range cleanup.cancels {
+		cancel()
+	}
+	for _, sink := range cleanup.sinks {
+		sink.Close()
+	}
+	for _, session := range cleanup.sessions {
+		_ = session.Close()
+	}
+	for _, client := range cleanup.clients {
+		_ = client.Close()
+	}
+	for _, capture := range cleanup.captures {
+		capture.Stop()
+	}
 }
 
 // Daemon manages a long-running doubletake service.
@@ -220,16 +305,17 @@ type Daemon struct {
 	credStore      *airplay.CredentialStore
 
 	// Multi-stream state
-	streams         map[string]*activeStream  // keyed by target IP
-	broadcast       *airplay.BroadcastCapture // shared video fan-out; nil when no streams active
-	capture         *airplay.ScreenCapture    // underlying screen capture
-	captureCancel   context.CancelFunc        // cancellation for starting/running shared capture
-	captureStartMu  sync.Mutex                // serializes creation of the shared capture
-	lastError       string                    // most recent asynchronous stream failure
-	lastErrorTarget string                    // target associated with lastError; empty for capture-wide errors
+	streams         map[string]*activeStream               // keyed by target IP
+	captureGroups   map[videoCaptureKey]*videoCaptureGroup // one encoder/fan-out per advertised canvas
+	capturePortalMu sync.Mutex                             // serializes interactive Wayland portal access
+	captureStartMu  sync.Mutex                             // serializes exact-size group publication/encoder startup
+	lastError       string                                 // most recent asynchronous stream failure
+	lastErrorTarget string                                 // target associated with lastError; empty for capture-wide errors
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
+	streamWorkers  sync.WaitGroup // stream, capture, and externally detached cleanup workers
+	shuttingDown   bool
 }
 
 // New creates a new Daemon with the given configuration.
@@ -267,13 +353,14 @@ func New(cfg Config) (*Daemon, error) {
 		cfg:            cfg,
 		deviceLastSeen: make(map[string]time.Time),
 		streams:        make(map[string]*activeStream),
+		captureGroups:  make(map[videoCaptureKey]*videoCaptureGroup),
 		credStore:      cs,
 	}, nil
 }
 
 // Run starts the daemon control socket and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
-	airplay.DebugMode = d.cfg.Debug
+	airplay.SetDebugMode(d.cfg.Debug)
 
 	// Acquire an advisory lock before removing a stale socket. Without this, a
 	// second daemon can unlink the first daemon's live listener and bind a new
@@ -292,18 +379,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", d.cfg.SocketPath, err)
 	}
-	d.listener = ln
 	// Owner-only permissions
 	if err := os.Chmod(d.cfg.SocketPath, 0700); err != nil {
 		ln.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
-	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
-
 	// Start continuous mDNS discovery in the background
 	discoverCtx, discoverCancel := context.WithCancel(ctx)
+	d.mu.Lock()
+	if d.shuttingDown {
+		d.mu.Unlock()
+		discoverCancel()
+		_ = ln.Close()
+		return nil
+	}
+	d.listener = ln
 	d.discoverCancel = discoverCancel
+	d.mu.Unlock()
+
+	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
 	go d.backgroundDiscover(discoverCtx)
 
 	go func() {
@@ -317,6 +412,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			d.mu.Lock()
+			shuttingDown := d.shuttingDown
+			d.mu.Unlock()
+			if shuttingDown {
+				return nil
+			}
 			log.Printf("[daemon] accept error: %v", err)
 			continue
 		}
@@ -327,15 +428,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 // Shutdown stops any active sessions and cleans up the socket.
 func (d *Daemon) Shutdown() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.discoverCancel != nil {
-		d.discoverCancel()
-		d.discoverCancel = nil
+	d.shuttingDown = true
+	discoverCancel := d.discoverCancel
+	d.discoverCancel = nil
+	listener := d.listener
+	d.listener = nil
+	cleanup := d.detachAllLocked()
+	d.mu.Unlock()
+
+	if discoverCancel != nil {
+		discoverCancel()
 	}
-	d.stopAllLocked()
-	if d.listener != nil {
-		d.listener.Close()
+	if listener != nil {
+		_ = listener.Close()
 	}
+	cleanup.run()
+
+	// Network handshakes, capture callbacks, and a concurrent control request's
+	// detached cleanup may still be unwinding. Do not let them run into the next
+	// test or process lifecycle.
+	d.streamWorkers.Wait()
 	os.Remove(d.cfg.SocketPath)
 }
 
@@ -384,10 +496,11 @@ func (d *Daemon) backgroundDiscover(ctx context.Context) {
 			sort.Slice(d.devices, func(i, j int) bool {
 				return d.devices[i].IP < d.devices[j].IP
 			})
-		} else {
-			log.Printf("[daemon] mDNS browse error: %v", err)
 		}
 		d.mu.Unlock()
+		if err != nil {
+			log.Printf("[daemon] mDNS browse error: %v", err)
+		}
 
 		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
 		if ctx.Err() != nil {
@@ -539,6 +652,21 @@ func waitingCredentialKind(stream *activeStream) CredentialKind {
 	return CredentialKindPIN
 }
 
+func requiredPairingCredentialKind(info *airplay.ReceiverInfo) CredentialKind {
+	switch info.RequiredPairingCredential() {
+	case airplay.PairingCredentialPIN:
+		return CredentialKindPIN
+	case airplay.PairingCredentialPassword:
+		return CredentialKindPassword
+	default:
+		return ""
+	}
+}
+
+func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCredentials) error {
+	return client.RestorePairingCredentials(saved)
+}
+
 func (d *Daemon) handleDiscover() Response {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -561,6 +689,10 @@ func (d *Daemon) handleDevices() Response {
 
 func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
+	if d.shuttingDown {
+		d.mu.Unlock()
+		return Response{OK: false, State: StateIdle, Error: "daemon is shutting down"}
+	}
 
 	// Resume a pending authentication session without replacing its AirPlay
 	// client. A target is required only when more than one receiver is waiting;
@@ -647,9 +779,15 @@ func (d *Daemon) handleConnect(req Request) Response {
 	}
 	d.clearLastErrorForTargetLocked(target)
 	d.streams[target] = entry
+	// Add while holding d.mu, before Shutdown can mark the daemon closed and
+	// begin waiting. This is the WaitGroup's required Add-before-Wait ordering.
+	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
-	go d.connectAndStream(connCtx, entry, target, port, req.Pin)
+	go func() {
+		defer d.streamWorkers.Done()
+		d.connectAndStream(connCtx, entry, target, port, req.Pin)
+	}()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -696,26 +834,31 @@ func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
 }
 
 func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, suppliedCredential string) {
-	// removeStream cleans up this stream's entry and tears down the shared broadcast
-	// if no other streams remain.
+	// removeStream cleans up this stream's entry and tears down its capture group
+	// if no other streams use that group.
 	removeStream := func(msg string) {
 		failure := msg
 		if failure != "" {
 			failure = fmt.Sprintf("%s: %s", target, failure)
 		}
 		d.mu.Lock()
-		defer d.mu.Unlock()
 		// A user-requested disconnect removes the entry before closing its client.
 		// Ignore the resulting read/handshake error from that obsolete goroutine.
 		if d.streams[target] != entry {
+			d.mu.Unlock()
 			return
 		}
 		if failure != "" {
-			log.Printf("[daemon] %s", failure)
 			d.lastError = failure
 			d.lastErrorTarget = target
 		}
-		d.removeStreamLocked(target)
+		cleanup := d.detachStreamLocked(target)
+		d.mu.Unlock()
+
+		if failure != "" {
+			log.Printf("[daemon] %s", failure)
+		}
+		cleanup.run()
 	}
 
 	// A receiver-configured password and an on-screen pairing PIN travel through
@@ -726,7 +869,19 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		credential = suppliedCredential
 	}
 	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
-		next := airplay.NewAirPlayClient(target, port)
+		var next *airplay.AirPlayClient
+		d.mu.Lock()
+		for _, device := range d.devices {
+			if device.IP == target {
+				device.Port = port
+				next = airplay.NewAirPlayClientForDevice(device)
+				break
+			}
+		}
+		d.mu.Unlock()
+		if next == nil {
+			next = airplay.NewAirPlayClient(target, port)
+		}
 		next.SetPassword(credential)
 		if err := next.Connect(ctx); err != nil {
 			return nil, nil, err
@@ -745,14 +900,12 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 		nextInfo, err := next.GetInfo()
 		if err != nil {
-			_ = next.Close()
 			return nil, nil, err
 		}
 
 		d.mu.Lock()
 		if d.streams[target] != entry {
 			d.mu.Unlock()
-			_ = next.Close()
 			return nil, nil, context.Canceled
 		}
 		entry.device = nextInfo.Name
@@ -794,8 +947,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			return err
 		}
 		if client.PairKeys != nil {
-			if err := d.credStore.Save(deviceID, client.PairingID,
-				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
+			if err := d.credStore.SavePairing(deviceID, client.PairingID,
+				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
+				client.PairingProtocol()); err != nil {
 				log.Printf("[daemon] warning: failed to save credentials: %v", err)
 			} else {
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
@@ -851,14 +1005,12 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// Pairing
 	paired := false
 	if savedCreds != nil && savedCreds.HasPairingCredentials() {
-		pub, priv := savedCreds.Ed25519Keys()
-		client.PairingID = savedCreds.PairingID
-		client.PairKeys = &airplay.PairKeys{
-			Ed25519Public:  pub,
-			Ed25519Private: priv,
+		verifyErr := restoreSavedPairing(client, savedCreds)
+		if verifyErr == nil {
+			verifyErr = client.PairVerify(ctx)
 		}
-		if err := client.PairVerify(ctx); err != nil {
-			log.Printf("[daemon] pair-verify with saved creds failed: %v", err)
+		if verifyErr != nil {
+			log.Printf("[daemon] pair-verify with saved creds failed: %v", verifyErr)
 			if err := reconnect(); err != nil {
 				removeStream(fmt.Sprintf("reconnect failed: %v", err))
 				return
@@ -887,43 +1039,43 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			return nil
 		}
 
-		// Legacy third-party password receivers require full SRP pairing. Trying a
-		// transient exchange first can leave the receiver rejecting the immediate
-		// password retry. A PIN bit also requires full pairing; password still wins
-		// when both modes are advertised.
-		passwordNeedsPairing := info.RequiresPassword() &&
-			(info.RequiresPINPairing() || info.PrefersLegacyPairing())
-		if passwordNeedsPairing {
+		// Resolve the password/PIN status bits against the pairing generation.
+		// Legacy password receivers consume the password in SRP. Modern receivers
+		// keep it solely for Digest and still perform transient HAP pairing, even
+		// when the receiver also publishes the on-screen PIN bit.
+		switch requiredPairingCredentialKind(info) {
+		case CredentialKindPassword:
 			if err := pairWithCredential(CredentialKindPassword); err != nil {
-				_ = client.Close()
 				removeStream(err.Error())
 				return
 			}
-		} else if info.RequiresPINPairing() {
+		case CredentialKindPIN:
 			if err := pairWithCredential(CredentialKindPIN); err != nil {
-				_ = client.Close()
 				removeStream(err.Error())
 				return
 			}
-		} else if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("[daemon] transient pairing failed: %v", err)
-			// A failed setup may leave pairing state attached to this socket. Start
-			// and finish the credential exchange together on a fresh connection.
-			if err := reconnect(); err != nil {
-				removeStream(fmt.Sprintf("reconnect for credential pairing failed: %v", err))
-				return
+		default:
+			if err := client.Pair(ctx, ""); err != nil {
+				log.Printf("[daemon] transient pairing failed: %v", err)
+				// A modern fixed password is an HTTP Digest credential, not an SRP
+				// secret. Do not turn a transient failure into an invalid full setup.
+				if info.RequiresPassword() {
+					removeStream(fmt.Sprintf("transient pairing failed for password-protected receiver: %v", err))
+					return
+				}
+				// A failed setup may leave pairing state attached to this socket. Start
+				// and finish the explicit PIN exchange on a fresh connection.
+				if err := reconnect(); err != nil {
+					removeStream(fmt.Sprintf("reconnect for credential pairing failed: %v", err))
+					return
+				}
+				if err := pairWithCredential(CredentialKindPIN); err != nil {
+					removeStream(err.Error())
+					return
+				}
+			} else {
+				log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
 			}
-			kind := CredentialKindPIN
-			if info.RequiresPassword() {
-				kind = CredentialKindPassword
-			}
-			if err := pairWithCredential(kind); err != nil {
-				_ = client.Close()
-				removeStream(err.Error())
-				return
-			}
-		} else {
-			log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
 		}
 	}
 
@@ -933,7 +1085,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	if info.RequiresPassword() && credential == "" {
 		value, err := waitForCredential(CredentialKindPassword)
 		if err != nil {
-			_ = client.Close()
 			removeStream(fmt.Sprintf("wait for password: %v", err))
 			return
 		}
@@ -944,37 +1095,65 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// FairPlay setup
 	if err := client.FairPlaySetup(ctx); err != nil {
 		if !errors.Is(err, airplay.ErrFairPlayUnsupported) {
-			client.Close()
 			removeStream(fmt.Sprintf("FairPlay setup failed: %v", err))
 			return
 		}
 		log.Printf("[daemon] FairPlay SAP unsupported (%v); continuing with pair-verify DataStream setup", err)
 	}
 
-	streamCfg := airplay.StreamConfig{
-		FPS:       d.cfg.FPS,
-		Bitrate:   d.cfg.Bitrate,
-		NoEncrypt: d.cfg.NoEncrypt,
-		DirectKey: d.cfg.DirectKey,
-		NoAudio:   d.cfg.NoAudio,
-	}
+	streamCfg := d.mirrorStreamConfig()
 
-	// Start capture before SetupMirror. Modern receivers start a deadline for
-	// the first video data during setup, while the Wayland screencast portal may
-	// wait indefinitely for user selection.
-	capMaxW, capMaxH := info.DisplaySize()
-	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID, capMaxW, capMaxH)
+	// Complete the potentially interactive portal request before SETUP, but do
+	// not start an encoder until control SETUP exposes session-time display info.
+	// This preserves the receiver deadline while avoiding the provisional 720p
+	// fallback used by receivers whose public /info omits displays.
+	capturePreparation, err := d.prepareVideoCapture(ctx, screenCastRestoreToken, deviceID)
 	if err != nil {
-		client.Close()
-		removeStream(fmt.Sprintf("capture failed: %v", err))
+		removeStream(fmt.Sprintf("prepare capture failed: %v", err))
 		return
 	}
+	defer capturePreparation.Close()
+	var broadcast *airplay.BroadcastCapture
+	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
+	prepareVideo := func(width, height int) error {
+		key := normalizedVideoCaptureKey(width, height)
+		if broadcast != nil {
+			if key == selectedCaptureKey {
+				return nil
+			}
+			return fmt.Errorf("receiver changed video canvas from %dx%d to %dx%d during setup",
+				selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight, key.maxWidth, key.maxHeight)
+		}
+		resolved, startErr := d.getOrStartPreparedCaptureGroup(entry, capturePreparation, width, height)
+		if startErr != nil {
+			return startErr
+		}
+		broadcast = resolved
+		selectedCaptureKey = key
+		return nil
+	}
 
-	session, err := client.SetupMirror(ctx, streamCfg)
+	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	err = retryMirrorSetupAfterDigestChallenge(
+		err,
+		func() (string, error) { return waitForCredential(CredentialKindPassword) },
+		func(value string) {
+			credential = value
+			client.SetPassword(value)
+		},
+		func() error {
+			var setupErr error
+			session, setupErr = client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+			return setupErr
+		},
+	)
 	if err != nil {
-		sink.Close()
-		client.Close()
 		removeStream(fmt.Sprintf("mirror setup failed: %v", err))
+		return
+	}
+	if broadcast == nil {
+		_ = session.Close()
+		removeStream("mirror setup completed without preparing video capture")
 		return
 	}
 
@@ -983,14 +1162,16 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	if !ok || current != entry {
 		// Stream was cancelled while we were setting up
 		d.mu.Unlock()
-		sink.Close()
-		session.Close()
-		client.Close()
+		_ = session.Close()
 		d.mu.Lock()
-		d.maybeStopBroadcastLocked()
+		cleanup := d.detachCaptureGroupIfUnusedLocked(entry.captureGroup)
 		d.mu.Unlock()
+		cleanup.run()
 		return
 	}
+	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
+	// receiver which is still pairing, prompting, or negotiating its media ports.
+	sink := broadcast.AddSink()
 	current.state = StateStreaming
 	current.session = session
 	current.client = client
@@ -999,83 +1180,232 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	d.mu.Unlock()
 
 	log.Printf("[daemon] streaming to %s (%s)", info.Name, target)
+	videoDone := make(chan error, 1)
+	go func() {
+		videoDone <- session.StreamFrames(ctx, sink.AsCapture(), 0)
+	}()
 
-	// Start audio for this stream independently.
+	// Start audio for this stream independently, but retain a completion channel
+	// so the stream worker does not outlive daemon shutdown.
+	var audioCapture *airplay.AudioCapture
+	var audioDone chan error
 	if !d.cfg.NoAudio && session.HasAudio() {
-		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode)
+		var audioErr error
+		audioCapture, audioErr = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
 		} else {
-			defer audioCapture.Stop()
+			audioDone = make(chan error, 1)
 			go func() {
-				if aerr := session.StreamAudio(ctx, audioCapture, session.AudioStream()); aerr != nil && ctx.Err() == nil {
+				aerr := session.StreamAudio(ctx, audioCapture, session.AudioStream())
+				if aerr != nil && ctx.Err() == nil {
 					log.Printf("[daemon] audio streaming error: %v", aerr)
 				}
+				audioDone <- aerr
 			}()
 			log.Printf("[daemon] audio capture started for %s", target)
 		}
 	}
 
-	streamErr := session.StreamFrames(ctx, sink.AsCapture(), 0)
+	streamErr := <-videoDone
 	if streamErr != nil && ctx.Err() == nil {
 		log.Printf("[daemon] stream error for %s: %v", target, streamErr)
 	}
 
-	// Cleanup this stream.
-	sink.Close()
-	session.Close()
-	client.Close()
-
+	// Atomically remove the stream before any potentially blocking teardown.
+	// A concurrent disconnect or shutdown which won the detach race owns those
+	// resources instead, and the idempotent local audio cleanup can still finish.
 	d.mu.Lock()
+	cleanup := daemonCleanup{}
 	if d.streams[target] == entry {
-		d.removeStreamLocked(target)
+		cleanup = d.detachStreamLocked(target)
 	}
 	d.mu.Unlock()
+	cleanup.run()
+
+	if audioCapture != nil {
+		audioCapture.Stop()
+	}
+	if audioDone != nil {
+		<-audioDone
+	}
 
 	log.Printf("[daemon] stream ended for %s", target)
 }
 
-// getOrStartBroadcastLocked ensures a shared BroadcastCapture is running and
-// returns a new sink registered with it. If no capture is running, it starts one.
+// retryMirrorSetupAfterDigestChallenge handles receivers which reveal a
+// configured playback password only when SETUP is attempted. It deliberately
+// retries once on the existing paired/FairPlay connection: a rejected Digest
+// request has not created receiver-side media state, and reconnecting would
+// discard both the cached challenge and the completed handshakes.
+func retryMirrorSetupAfterDigestChallenge(
+	setupErr error,
+	waitForPassword func() (string, error),
+	setPassword func(string),
+	retrySetup func() error,
+) error {
+	if !errors.Is(setupErr, airplay.ErrCredentialsRequired) {
+		return setupErr
+	}
+
+	password, err := waitForPassword()
+	if err != nil {
+		return fmt.Errorf("wait for password: %w", err)
+	}
+	setPassword(password)
+
+	return retrySetup()
+}
+
+// normalizedVideoCaptureKey matches the even canvas which the capture pipeline
+// will actually encode. Invalid or incomplete dimensions share the unconstrained
+// group instead of accidentally constraining one axis only.
+func normalizedVideoCaptureKey(maxW, maxH int) videoCaptureKey {
+	if maxW <= 0 || maxH <= 0 {
+		return videoCaptureKey{}
+	}
+	return videoCaptureKey{maxWidth: maxW &^ 1, maxHeight: maxH &^ 1}
+}
+
+// prepareVideoCapture completes interactive capture authorization before the
+// receiver session begins, but leaves GStreamer unstarted until control SETUP
+// reveals the session-time display canvas. Portal serialization is deliberately
+// separate from captureStartMu: a different user prompt must not block an
+// already-negotiated receiver from starting its encoder before its deadline.
+func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID string) (*airplay.CapturePreparation, error) {
+	d.capturePortalMu.Lock()
+	defer d.capturePortalMu.Unlock()
+
+	cfg := airplay.CaptureConfig{
+		FPS:          d.cfg.FPS,
+		Bitrate:      d.cfg.Bitrate,
+		HWAccel:      d.cfg.HWAccel,
+		ShowCursor:   d.cfg.ShowCursor,
+		RestoreToken: restoreToken,
+	}
+	if deviceID != "" {
+		cfg.SaveRestoreToken = func(token string) error {
+			return d.credStore.SaveRestoreToken(deviceID, token)
+		}
+	}
+	if d.cfg.TestMode {
+		return airplay.PrepareTestCapture(ctx, cfg)
+	}
+	return airplay.PrepareCapture(ctx, cfg)
+}
+
+// getOrStartPreparedCaptureGroup consumes an already-authorized capture source
+// only when no encoder exists for the resolved nominal canvas. Otherwise the
+// stream joins the existing group and the unused preparation is released.
 // Must NOT be called with d.mu held.
-// maxW/maxH clamp the encoded size for the receiver that starts the capture;
-// sinks that join later share it.
-func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, maxH int) (*airplay.BroadcastSink, error) {
-	// Two targets may finish authentication together. Serialize the nil check and
-	// capture startup so Wayland opens only one portal and X11 starts one encoder.
+func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation *airplay.CapturePreparation, width, height int) (*airplay.BroadcastCapture, error) {
 	d.captureStartMu.Lock()
 	defer d.captureStartMu.Unlock()
 
+	key := normalizedVideoCaptureKey(width, height)
 	d.mu.Lock()
-	bc := d.broadcast
-	d.mu.Unlock()
-
-	if bc != nil {
-		// Capture already running — add a new sink.
-		sink := bc.AddSink()
-		return sink, nil
-	}
-
-	// Publish the startup cancellation before entering the display portal or
-	// launching GStreamer. A concurrent disconnect-all can then interrupt a
-	// capture that has not returned from StartCapture yet.
-	captureCtx, captureCancel := context.WithCancel(context.Background())
-	d.mu.Lock()
-	if len(d.streams) == 0 {
+	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
-		captureCancel()
 		return nil, context.Canceled
 	}
-	d.captureCancel = captureCancel
+	if d.captureGroups == nil {
+		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
+	}
+	if group := d.captureGroups[key]; group != nil {
+		entry.captureGroup = group
+		broadcast := group.broadcast
+		d.mu.Unlock()
+		preparation.Close()
+		if broadcast == nil {
+			return nil, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+		}
+		return broadcast, nil
+	}
+
+	captureCtx, captureCancel := context.WithCancel(context.Background())
+	group := &videoCaptureGroup{key: key, cancel: captureCancel}
+	d.captureGroups[key] = group
+	entry.captureGroup = group
 	d.mu.Unlock()
 
-	// Start a fresh screen capture.
+	capture, err := preparation.StartWithContext(captureCtx, key.maxWidth, key.maxHeight)
+	if err != nil {
+		captureCancel()
+		d.mu.Lock()
+		if d.captureGroups[key] == group {
+			delete(d.captureGroups, key)
+		}
+		if entry.captureGroup == group {
+			entry.captureGroup = nil
+		}
+		d.mu.Unlock()
+		return nil, err
+	}
+
+	broadcast := airplay.NewBroadcastCapture(capture)
+	d.mu.Lock()
+	if d.captureGroups[key] != group || d.streams[entry.deviceIP] != entry || entry.captureGroup != group {
+		d.mu.Unlock()
+		captureCancel()
+		capture.Stop()
+		return nil, context.Canceled
+	}
+	group.broadcast = broadcast
+	group.capture = capture
+	d.streamWorkers.Add(1)
+	d.mu.Unlock()
+
+	go func() {
+		defer d.streamWorkers.Done()
+		d.finishCaptureGroup(group, broadcast, broadcast.Run())
+	}()
+	return broadcast, nil
+}
+
+// getOrStartCaptureGroup returns the capture group matching this stream's
+// requested encoded canvas. It deliberately does not add a sink: callers
+// attach only after SETUP succeeds, when they can immediately consume it without
+// stalling established streams. Must NOT be called with d.mu held.
+func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, deviceID string, maxW, maxH int) (*airplay.BroadcastCapture, error) {
+	// Serialize capture startup so two targets cannot race the group map and so
+	// Wayland portal requests are presented one at a time.
+	d.captureStartMu.Lock()
+	defer d.captureStartMu.Unlock()
+
+	key := normalizedVideoCaptureKey(maxW, maxH)
+	d.mu.Lock()
+	if d.streams[entry.deviceIP] != entry {
+		d.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if d.captureGroups == nil {
+		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
+	}
+	if group := d.captureGroups[key]; group != nil {
+		entry.captureGroup = group
+		broadcast := group.broadcast
+		d.mu.Unlock()
+		if broadcast == nil {
+			return nil, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+		}
+		return broadcast, nil
+	}
+
+	// Publish the group and cancellation hook before entering the display portal
+	// or launching GStreamer. A targeted disconnect can then cancel an orphaned
+	// startup without affecting captures used by other canvas groups.
+	captureCtx, captureCancel := context.WithCancel(context.Background())
+	group := &videoCaptureGroup{key: key, cancel: captureCancel}
+	d.captureGroups[key] = group
+	entry.captureGroup = group
+	d.mu.Unlock()
+
 	capCfg := airplay.CaptureConfig{
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
-		MaxWidth:     maxW,
-		MaxHeight:    maxH,
+		MaxWidth:     key.maxWidth,
+		MaxHeight:    key.maxHeight,
 		ShowCursor:   d.cfg.ShowCursor,
 		RestoreToken: restoreToken,
 	}
@@ -1097,113 +1427,188 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxW, 
 	if err != nil {
 		captureCancel()
 		d.mu.Lock()
-		// captureStartMu prevents another startup from replacing this cancel
-		// function before this attempt has finished.
-		if d.broadcast == nil && d.capture == nil {
-			d.captureCancel = nil
+		if d.captureGroups[key] == group {
+			delete(d.captureGroups, key)
+		}
+		if entry.captureGroup == group {
+			entry.captureGroup = nil
 		}
 		d.mu.Unlock()
 		return nil, err
 	}
 
 	newBC := airplay.NewBroadcastCapture(capture)
-	sink := newBC.AddSink()
-
 	d.mu.Lock()
-	if len(d.streams) == 0 || d.captureCancel == nil {
+	if d.captureGroups[key] != group || d.streams[entry.deviceIP] != entry || entry.captureGroup != group {
 		d.mu.Unlock()
 		captureCancel()
 		capture.Stop()
 		return nil, context.Canceled
 	}
-	d.broadcast = newBC
-	d.capture = capture
-	d.captureCancel = captureCancel
+	group.broadcast = newBC
+	group.capture = capture
+	// Add while holding d.mu so Shutdown cannot begin waiting between publishing
+	// the capture and registering its completion worker.
+	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
 	go func() {
-		runErr := newBC.Run()
-		unexpected := runErr != nil && runErr.Error() != "EOF"
-		d.mu.Lock()
-		// A stopped capture can finish after a replacement connection has already
-		// been queued. Its cleanup must not tear down that newer generation.
-		if d.broadcast != newBC {
-			d.mu.Unlock()
-			return
-		}
-		if unexpected {
-			log.Printf("[daemon] broadcast capture error: %v", runErr)
-		}
-		// When the active capture ends, stop all streams consuming it.
-		// Shutdown also closes the capture and can produce a benign read error.
-		// Only retain failures that ended streams which were still active.
-		if unexpected && len(d.streams) > 0 {
-			d.lastError = "shared capture failed: " + runErr.Error()
-			d.lastErrorTarget = ""
-		}
-		d.stopAllLocked()
-		d.mu.Unlock()
+		defer d.streamWorkers.Done()
+		d.finishCaptureGroup(group, newBC, newBC.Run())
 	}()
 
-	return sink, nil
+	return newBC, nil
 }
 
-// removeStreamLocked removes a single stream entry and tears down the shared
-// capture if no other streams are left. Must be called with d.mu held.
-func (d *Daemon) removeStreamLocked(target string) {
+// detachStreamLocked removes a single stream and transfers ownership of its
+// resources, plus an unused final capture group, to a cleanup plan. The caller
+// must unlock d.mu before running the plan.
+func (d *Daemon) detachStreamLocked(target string) daemonCleanup {
+	cleanup := daemonCleanup{}
 	entry, ok := d.streams[target]
 	if !ok {
-		return
+		return cleanup
 	}
-	if entry.cancelFn != nil {
-		entry.cancelFn()
-	}
+	group := entry.captureGroup
 	delete(d.streams, target)
-	d.maybeStopBroadcastLocked()
+	cleanup.addStream(entry)
+	cleanup.merge(d.detachCaptureGroupIfUnusedLocked(group))
+	return cleanup
 }
 
-// maybeStopBroadcastLocked stops the shared capture if no active streams remain.
-// Must be called with d.mu held.
-func (d *Daemon) maybeStopBroadcastLocked() {
-	if len(d.streams) > 0 {
+// captureGroupInUseLocked reports whether a connecting or streaming receiver
+// still owns a reference to group. Must be called with d.mu held.
+func (d *Daemon) captureGroupInUseLocked(group *videoCaptureGroup) bool {
+	if group == nil {
+		return false
+	}
+	for _, entry := range d.streams {
+		if entry.captureGroup == group {
+			return true
+		}
+	}
+	return false
+}
+
+func (cleanup *daemonCleanup) merge(other daemonCleanup) {
+	cleanup.cancels = append(cleanup.cancels, other.cancels...)
+	cleanup.sinks = append(cleanup.sinks, other.sinks...)
+	cleanup.sessions = append(cleanup.sessions, other.sessions...)
+	cleanup.clients = append(cleanup.clients, other.clients...)
+	cleanup.captures = append(cleanup.captures, other.captures...)
+}
+
+func (cleanup *daemonCleanup) empty() bool {
+	return len(cleanup.cancels) == 0 && len(cleanup.sinks) == 0 &&
+		len(cleanup.sessions) == 0 && len(cleanup.clients) == 0 &&
+		len(cleanup.captures) == 0
+}
+
+// detachCaptureGroupIfUnusedLocked transfers an encoder group to a cleanup plan
+// when its final receiver leaves. The caller must run the plan after unlocking.
+func (d *Daemon) detachCaptureGroupIfUnusedLocked(group *videoCaptureGroup) daemonCleanup {
+	if group == nil || d.captureGroupInUseLocked(group) {
+		return daemonCleanup{}
+	}
+	return d.detachCaptureGroupLocked(group)
+}
+
+// detachCaptureGroupLocked removes one capture generation before transferring
+// its resources. Deleting first makes the BroadcastCapture completion callback
+// recognize an intentional stop and leave any replacement generation alone.
+func (d *Daemon) detachCaptureGroupLocked(group *videoCaptureGroup) daemonCleanup {
+	cleanup := daemonCleanup{}
+	if group == nil {
+		return cleanup
+	}
+	if d.captureGroups[group.key] != group {
+		return cleanup
+	}
+	delete(d.captureGroups, group.key)
+	cleanup.addCaptureGroup(group)
+	return cleanup
+}
+
+// detachCaptureGroupStreamsLocked removes only streams backed by group and
+// transfers all associated resources. The caller must run cleanup after unlock.
+func (d *Daemon) detachCaptureGroupStreamsLocked(group *videoCaptureGroup) daemonCleanup {
+	cleanup := daemonCleanup{}
+	for target, entry := range d.streams {
+		if entry.captureGroup != group {
+			continue
+		}
+		delete(d.streams, target)
+		cleanup.addStream(entry)
+	}
+	cleanup.merge(d.detachCaptureGroupLocked(group))
+	return cleanup
+}
+
+// finishCaptureGroup handles both EOF and failures from BroadcastCapture.Run.
+// State is detached under d.mu and all cancellation and I/O happens afterwards.
+func (d *Daemon) finishCaptureGroup(group *videoCaptureGroup, broadcast *airplay.BroadcastCapture, runErr error) {
+	unexpected := runErr != nil && !errors.Is(runErr, io.EOF)
+	d.mu.Lock()
+	// An intentionally stopped group can finish after another capture with the
+	// same dimensions has already started. Never tear down that replacement.
+	if d.captureGroups[group.key] != group || group.broadcast != broadcast {
+		d.mu.Unlock()
 		return
 	}
-	if d.captureCancel != nil {
-		d.captureCancel()
-		d.captureCancel = nil
+	inUse := d.captureGroupInUseLocked(group)
+	if unexpected && inUse {
+		d.lastError = fmt.Sprintf("%dx%d capture failed: %v", group.key.maxWidth, group.key.maxHeight, runErr)
+		d.lastErrorTarget = ""
 	}
-	if d.capture != nil {
-		d.capture.Stop()
-		d.capture = nil
+	// A capture failure affects only receivers consuming this encoded canvas;
+	// other resolution groups continue streaming.
+	cleanup := d.detachCaptureGroupStreamsLocked(group)
+	d.mu.Unlock()
+
+	if unexpected {
+		log.Printf("[daemon] %dx%d capture error: %v", group.key.maxWidth, group.key.maxHeight, runErr)
 	}
-	d.broadcast = nil
+	cleanup.run()
 }
 
 func (d *Daemon) handleDisconnect(req Request) Response {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	// If a target is specified, disconnect only that stream.
 	if req.Target != "" {
-		entry, ok := d.streams[req.Target]
+		_, ok := d.streams[req.Target]
 		if !ok {
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			response := Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			d.mu.Unlock()
+			return response
 		}
-		if entry.sink != nil {
-			entry.sink.Close()
+		cleanup := d.detachStreamLocked(req.Target)
+		response := Response{OK: true, State: d.overallStateLocked()}
+		// Shutdown waits for every cleanup which was detached before it marked the
+		// daemon closed. Register while holding d.mu to preserve Add-before-Wait.
+		tracked := !cleanup.empty()
+		if tracked {
+			d.streamWorkers.Add(1)
 		}
-		if entry.session != nil {
-			entry.session.Close()
+		d.mu.Unlock()
+		cleanup.run()
+		if tracked {
+			d.streamWorkers.Done()
 		}
-		if entry.client != nil {
-			entry.client.Close()
-		}
-		d.removeStreamLocked(req.Target)
-		return Response{OK: true, State: d.overallStateLocked()}
+		return response
 	}
 
 	// Disconnect all.
-	d.stopAllLocked()
+	cleanup := d.detachAllLocked()
+	tracked := !cleanup.empty()
+	if tracked {
+		d.streamWorkers.Add(1)
+	}
+	d.mu.Unlock()
+	cleanup.run()
+	if tracked {
+		d.streamWorkers.Done()
+	}
 	return Response{OK: true, State: StateIdle}
 }
 
@@ -1261,33 +1666,21 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	return d.statusResponseLocked(true, "")
 }
 
-// stopAllLocked stops all active streams and tears down the capture.
-// Must be called with d.mu held.
-func (d *Daemon) stopAllLocked() {
+// detachAllLocked removes every active stream and capture group atomically and
+// returns their resources for cleanup after d.mu is released.
+func (d *Daemon) detachAllLocked() daemonCleanup {
+	cleanup := daemonCleanup{}
 	for target, entry := range d.streams {
-		if entry.cancelFn != nil {
-			entry.cancelFn()
-		}
-		if entry.sink != nil {
-			entry.sink.Close()
-		}
-		if entry.session != nil {
-			entry.session.Close()
-		}
-		if entry.client != nil {
-			entry.client.Close()
-		}
 		delete(d.streams, target)
+		cleanup.addStream(entry)
 	}
-	if d.capture != nil {
-		d.capture.Stop()
-		d.capture = nil
+	// Entries no longer reference their groups, so every published group can be
+	// detached without repeatedly scanning d.streams.
+	for _, group := range d.captureGroups {
+		cleanup.addCaptureGroup(group)
 	}
-	if d.captureCancel != nil {
-		d.captureCancel()
-		d.captureCancel = nil
-	}
-	d.broadcast = nil
+	clear(d.captureGroups)
+	return cleanup
 }
 
 func toDeviceInfos(devices []airplay.AirPlayDevice) []DeviceInfo {

@@ -52,7 +52,7 @@ You can also install from the AUR:
 
 These are devices that have been tested with doubletake. If there are devices not listed here that you have confirmed working or non-functional, please open an issue.
 
-- AppleTV3,2 (2013 3rd generation) (currently non-functional, see [#17](https://github.com/omarroth/doubletake/issues/17))
+- AppleTV3,2 (2013 3rd generation)
 - AppleTV11,1 (4K, 2021 2nd gen)
 - AppleTV14,1 (4K, 2022 3rd gen) + Homepod (1st gen)
 - AppleTV14,1 (4K, 2022 3rd gen)
@@ -101,13 +101,34 @@ Run tests:
 make test
 ```
 
+### Optional AAC-ELD support
+
+Doubletake selects screen audio from the receiver's advertised
+`supportedFormats.screenStream` mask, preferring its built-in ALAC encoder when
+available. AAC-ELD is enabled explicitly because it depends on the system
+`libfdk-aac` development files and cgo:
+
+```sh
+CGO_ENABLED=1 go build -tags fdk_aac -o bin/doubletake ./cmd/doubletake
+```
+
+Install the package that provides the `fdk-aac` pkg-config file and headers for
+your distribution before running that command. A default build reports a clear
+error if advertised capabilities select AAC-ELD. A nonzero screen-audio mask
+which advertises neither ALAC nor AAC-ELD is also rejected instead of silently
+sending an unadvertised format. Use `-no-audio` to keep testing pairing, timing,
+and video when the advertised audio format is unavailable.
+
 ## Firewall
 
 doubletake reserves three consecutive UDP ports for timing and audio traffic.
-Legacy NTP receivers probe the timing port during SETUP; modern PTP sessions do
-not advertise it. The event and video data channels are outbound TCP connections
-from doubletake to ports returned by the receiver, so they do not require inbound
-firewall rules.
+Receiver-initiated NTP sessions probe the timing port during SETUP; PTP and
+sender-initiated NTP sessions do not require that inbound timing traffic. The
+event and video data channels are outbound TCP connections from doubletake to
+ports returned by the receiver, so they do not require inbound firewall rules.
+The NTP timing path uses a 500 ms minimum playout lead to absorb its
+request/response and userspace scheduling jitter; PTP retains the configured
+`-target-latency-ms` value.
 
 By default the OS assigns ephemeral ports. Use `-port-range MIN-MAX` to confine
 the UDP ports to a small window you can open in your firewall (needs at least 3
@@ -127,7 +148,7 @@ sudo ufw allow from any proto udp to any port 60000:60010
 ```
 
 For nftables/firewalld, add an equivalent rule allowing inbound UDP from the
-Apple TV's address on the chosen range.
+receiver's address on the chosen range.
 
 ## Password-protected receivers
 
@@ -152,6 +173,12 @@ entered during pairing is retained for later Digest challenges and reconnects.
 A receiver may consume that value during pairing, Digest auth, both, or neither.
 Supplying `-code` does not by itself trigger re-pairing.
 
+When the capability policy selects first-party CoreUtils/HAP pairing, a
+configured fixed password is reserved for Digest authentication and is never
+reused as an SRP pairing PIN, including with `-pair`. A legacy/HKP pairing flow
+may consume the same entered value during both SRP and Digest when its protocol
+requires it.
+
 The CLI and Plasma applet prompt once after inspecting the receiver's security
 mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field,
 while a configured password uses an unrestricted masked field. Doubletake does
@@ -173,12 +200,53 @@ pairing, encrypted RTSP, SETUP ordering, timing, event channels, and sustained
 audio/video traffic without an Apple TV or third-party receiver. It is a
 diagnostic sink, not a media player or a receiver-compatibility substitute.
 
-The `modern` profile advertises and exercises FairPlay SAP (FPSAP). The `roku`
-profile deliberately omits FPSAP, matching that hardware protocol personality.
+Runtime selection is capability-driven. The selected device's mDNS `features`,
+`fex`, `srcvers`, `protovers`, and `flags` remain available after discovery;
+explicit `/info` fields take precedence and the advertisement fills omissions.
+Pairing probes and the encryption state that actually negotiates then determine
+the wire format. See [Receiver compatibility](docs/compatibility.md) for the
+artifact cross-checks, explicitly labeled empirical exceptions, and end-to-end
+flow.
+
+Display sizing is resolved after the receiver creates its media session rather
+than being frozen from the initial `/info`, which can omit `displays`. Doubletake
+preflights the capture source first; on Wayland this completes the interactive
+portal request and retains the authorized PipeWire source without starting the
+encoder. Control SETUP then requests ordinary receiver info with
+`combinedGetInfoWithControlSetup` (without a `qualifier`), and a returned `info`
+dictionary takes precedence over the pre-session snapshot. If it is omitted,
+doubletake makes one bounded `/info` refresh after the accepted control SETUP,
+or after the accepted audio SETUP on a negotiated media-first path.
+
+The encoder uses the resolved nominal `widthPixels`/`heightPixels` mirroring
+canvas. `widthPixelsMax`/`heightPixelsMax` describe the receiver's upper decoding
+ceiling; they do not select the ordinary mirroring resolution. If display
+metadata remains unavailable, screen endpoints use the artifact-backed feature
+28 default of 1920x1080, or 1280x720 when feature 28 is absent.
+
+SETUP ordering is negotiated independently of the advertisement: every session
+starts with Apple's control-only form and makes one media-first transition only
+if that control shape is explicitly rejected. Feature 59 selects only the
+initial audio descriptor (`streamConnections` versus `controlPort`), with one
+alternate-shape retry after an explicit rejection. Encrypted HAP sessions keep
+FairPlay material in stream descriptors; plaintext/raw sessions use available
+legacy FairPlay roots on control and media SETUP.
+
+The named profiles are receiver-side validation presets covering combinations
+observed on modern Apple, Roku, LG webOS, legacy Apple TV/UxPlay, and
+AirServer/Airtame implementations. They deliberately keep pairing, SETUP order,
+timing, FairPlay, and audio layout as separate compatibility axes. Profile name,
+advertised receiver name, model, and manufacturer do not select sender behavior;
+the sender uses advertised capabilities and the protocol that actually
+negotiates.
+The profile table describes fixtures; the Tested Devices list above remains the
+record of hardware validation.
+
 The receiver parses the outer AirPlay video framing and counts video and audio
-traffic, but encrypted video and audio payloads are not authenticated,
-decrypted, or decoded. Nothing is played or displayed; the counters demonstrate
-transport flow rather than decoded media correctness.
+traffic. Its AppleTV3 and UxPlay profiles also authenticate the FairPlay key,
+decrypt legacy AES-CTR video, and validate the resulting AVCC/NAL structure.
+It does not decode or display video or play audio; other encrypted media paths
+remain transport-only checks.
 
 Start a Roku-compatible receiver whose configured fixed password is required by
 both SRP and Digest authentication. This mode does not display a PIN:
@@ -195,12 +263,16 @@ DOUBLETAKE_CODE='aaaaaaaa' \
   bin/doubletake -target 127.0.0.1 -port 7000 -pair -test
 ```
 
-The receiver profiles are coherent protocol personalities:
+The receiver profiles are coherent validation combinations:
 
-| Profile | Pairing/control | FairPlay | Session setup | Timing |
-|---------|-----------------|----------|---------------|--------|
-| `roku` | HKP3; raw transient or code-authenticated HAP | deliberately omitted | legacy combined fields | NTP probes |
-| `modern` | transient or code-authenticated HAP | FPSAP | control, audio, then video | PTP metadata |
+| Profile | Capability/protocol combination exercised |
+|---------|-------------------------------------------|
+| `modern` | Omits pre-session display metadata and returns a 1920x1080 nominal canvas with a 3840x2160 ceiling through combined control SETUP info; also exercises CoreUtils HAP, encrypted control, features 41/59, PTP, `streamConnections`, ALAC, and descriptor-only FairPlay keys |
+| `roku` | Rejects the initial control SETUP and exercises the one media-first fallback; third-party/HKP pairing, the `377.40.x` NTP exception, ALAC, and one alternate audio-descriptor retry under authenticated HAP |
+| `lg` | Rejects the initial control SETUP and exercises the one media-first fallback; third-party/HKP HAP, feature-41 PTP with a local clock anchor, feature-59-absent `controlPort` + `shk`, and ALAC |
+| `appletv3` | Rejects the initial control SETUP and exercises the one media-first fallback; raw pairing with feature 27, receiver-initiated NTP, original raw FairPlay derivation, ALAC, and plaintext root FairPlay keys |
+| `uxplay` | Rejects the initial control SETUP and exercises the one media-first fallback; raw pairing without feature 27, `X-Apple-PD` FairPlay-secret mixing, NTP, ALAC, plaintext FairPlay roots, and omitted optional `eventPort` |
+| `airserver` (`airtame` alias) | Accepts the initial control SETUP; a rejected HAP probe followed by raw fallback, plaintext NTP, feature-59 `streamConnections` followed by one accepted `controlPort` retry, advertised AAC-ELD, and plaintext root FairPlay keys |
 
 Authentication modes all use the single `-code` value (or
 `$DOUBLETAKE_RECEIVER_CODE`):
@@ -310,6 +382,15 @@ doubletake-ctl unmute [target]
   the daemon requests: an on-screen PIN or a configured password. It is
   targetless and therefore requires exactly one waiting receiver; use
   `connect <target> <PIN-or-password>` when multiple receivers are waiting.
+
+Daemon streams are grouped by the normalized even-sized nominal canvas resolved
+during each receiver's SETUP. Targets with the same canvas share one capture and
+H.264 encoder; targets with different nominal canvases use independent encoders,
+so connection order does not determine another receiver's size. For example, a
+receiver reporting a 1920x1080 canvas and a 3840x2160 maximum joins the
+1920x1080 group. Fan-out uses a bounded queue per target within each group. A
+stalled target is detached when its queue fills, without blocking peers that
+share the encoder. Other canvas groups continue independently as well.
 
 ## Disclaimer
 

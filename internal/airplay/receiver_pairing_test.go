@@ -151,6 +151,56 @@ func TestReceiverPairingStateRawSetupAndVerify(t *testing.T) {
 	}
 }
 
+func TestReceiverPairingStateSavedRawVerify(t *testing.T) {
+	state := newReceiverPairingTestState(t, "", newReceiverControllerStore())
+	client := newReceiverPairingTestClient(t)
+	client.info = &ReceiverInfo{}
+	clientConn, firstDone, closeFirst := runReceiverPairingServer(t, state, 1, 2)
+	client.conn = clientConn
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverPublic, err := client.rawPairSetup(ctx)
+	if err != nil {
+		closeFirst()
+		t.Fatalf("raw pair setup: %v", err)
+	}
+	client.info.PK = serverPublic
+	if err := client.rawPairVerify(ctx); err != nil {
+		closeFirst()
+		t.Fatalf("initial raw pair verify: %v", err)
+	}
+	if err := <-firstDone; err != nil {
+		closeFirst()
+		t.Fatalf("initial receiver: %v", err)
+	}
+	closeFirst()
+
+	saved := &SavedCredentials{
+		PairingID:       client.PairingID,
+		Ed25519Public:   append([]byte(nil), client.PairKeys.Ed25519Public...),
+		Ed25519Seed:     append([]byte(nil), client.PairKeys.Ed25519Private.Seed()...),
+		PairingProtocol: client.PairingProtocol(),
+	}
+	savedClient := NewAirPlayClient("127.0.0.1", 7000)
+	savedClient.info = &ReceiverInfo{PK: append(plistData(nil), serverPublic...)}
+	if err := savedClient.RestorePairingCredentials(saved); err != nil {
+		t.Fatalf("restore raw credentials: %v", err)
+	}
+	secondConn, secondDone, closeSecond := runReceiverPairingServer(t, state, 0, 2)
+	defer closeSecond()
+	savedClient.conn = secondConn
+	if err := savedClient.PairVerify(ctx); err != nil {
+		t.Fatalf("saved raw pair verify: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("saved raw receiver: %v", err)
+	}
+	if keys, ok := state.sessionKeys(); !ok || keys.encrypted {
+		t.Fatal("saved raw verification did not establish a plaintext session")
+	}
+}
+
 func TestReceiverPairingStatePINRejectsUnauthenticatedModes(t *testing.T) {
 	state := newReceiverPairingTestState(t, "4827", newReceiverControllerStore())
 	if _, err := state.pairSetup(bytes.Repeat([]byte{1}, ed25519.PublicKeySize)); !errors.Is(err, errReceiverPairingAuthentication) {

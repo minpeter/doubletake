@@ -18,6 +18,11 @@ func TestParseReceiverProfile(t *testing.T) {
 		{input: " RoKu\t", want: airplay.ReceiverProfileRoku},
 		{input: "modern", want: airplay.ReceiverProfileModern},
 		{input: " MODERN ", want: airplay.ReceiverProfileModern},
+		{input: "lg", want: airplay.ReceiverProfileLG},
+		{input: "appletv3", want: airplay.ReceiverProfileAppleTV3},
+		{input: " UxPlay ", want: airplay.ReceiverProfileUxPlay},
+		{input: "airserver", want: airplay.ReceiverProfileAirServer},
+		{input: " AirTame ", want: airplay.ReceiverProfileAirServer},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {

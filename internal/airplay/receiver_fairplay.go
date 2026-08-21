@@ -2,7 +2,11 @@ package airplay
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
 	"io"
 )
@@ -88,4 +92,48 @@ func (s *receiverFPSAPState) exchangeM4(m3 []byte) ([]byte, error) {
 
 func (s *receiverFPSAPState) complete() bool {
 	return s != nil && s.phase == 2
+}
+
+// unwrapKey authenticates and unwraps the FairPlay ekey sent at the SETUP
+// root. The HMAC binds both the record prefix and recovered raw key to the SAP
+// exchange, so an unauthenticated key is never handed to the media decryptor.
+func (s *receiverFPSAPState) unwrapKey(ekey []byte) ([16]byte, error) {
+	var rawKey [16]byte
+	if !s.complete() {
+		return rawKey, fmt.Errorf("FairPlay SAP exchange is not complete")
+	}
+	if len(ekey) != 72 {
+		return rawKey, fmt.Errorf("FairPlay ekey length is %d, want 72", len(ekey))
+	}
+	wantHeader := []byte{
+		'F', 'P', 'L', 'Y', 0x01, 0x02, 0x01, 0x00,
+		0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x00,
+	}
+	if !bytes.Equal(ekey[:16], wantHeader) {
+		return rawKey, fmt.Errorf("invalid FairPlay ekey header %x", ekey[:16])
+	}
+	if keyLength := binary.BigEndian.Uint32(ekey[32:36]); keyLength != uint32(len(rawKey)) {
+		return rawKey, fmt.Errorf("FairPlay ekey declares key length %d, want %d", keyLength, len(rawKey))
+	}
+
+	wrappingKey := deriveFairPlayWrappingKey(s.receiverSAP, s.m3[:])
+	block, err := aes.NewCipher(wrappingKey[:])
+	if err != nil {
+		return rawKey, fmt.Errorf("create FairPlay unwrapping cipher: %w", err)
+	}
+	block.Decrypt(rawKey[:], ekey[56:72])
+	for index := range rawKey {
+		rawKey[index] ^= ekey[16+index]
+	}
+
+	var senderSAP [128]byte
+	decryptFairPlayMessage(s.m3[:], senderSAP[:])
+	macKey := fpsapDescriptorForSAP(senderSAP, s.receiverSAP)
+	mac := hmac.New(sha1.New, macKey[:])
+	_, _ = mac.Write(ekey[:36])
+	_, _ = mac.Write(rawKey[:])
+	if !hmac.Equal(ekey[36:56], mac.Sum(nil)) {
+		return [16]byte{}, fmt.Errorf("FairPlay ekey authentication failed")
+	}
+	return rawKey, nil
 }

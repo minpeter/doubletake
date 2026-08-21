@@ -12,11 +12,23 @@ import (
 // SavedCredentials holds the persistent pairing credentials and optional
 // screencast restore state for a single device.
 type SavedCredentials struct {
-	PairingID     string `json:"pairing_id"`
-	Ed25519Public []byte `json:"ed25519_public"`
-	Ed25519Seed   []byte `json:"ed25519_seed"` // 32-byte seed (private key is derived from this)
-	RestoreToken  string `json:"restore_token,omitempty"`
+	PairingID       string          `json:"pairing_id"`
+	Ed25519Public   []byte          `json:"ed25519_public"`
+	Ed25519Seed     []byte          `json:"ed25519_seed"` // 32-byte seed (private key is derived from this)
+	PairingProtocol PairingProtocol `json:"pairing_protocol,omitempty"`
+	RestoreToken    string          `json:"restore_token,omitempty"`
 }
+
+// PairingProtocol is the pair-verify wire protocol negotiated when credentials
+// were created. It must be restored before reusing the keys: HAP pair-verify
+// enables encrypted control framing, while raw AirPlay pair-verify does not.
+type PairingProtocol string
+
+const (
+	PairingProtocolUnknown PairingProtocol = ""
+	PairingProtocolHAP     PairingProtocol = "hap"
+	PairingProtocolRaw     PairingProtocol = "raw"
+)
 
 // DefaultCredentialsPath returns ~/.config/doubletake/credentials.json.
 func DefaultCredentialsPath() string {
@@ -43,6 +55,40 @@ func (c *SavedCredentials) HasPairingCredentials() bool {
 	return c != nil && c.PairingID != "" &&
 		len(c.Ed25519Public) == ed25519.PublicKeySize &&
 		len(c.Ed25519Seed) == ed25519.SeedSize
+}
+
+// RestorePairingCredentials installs a saved identity and its negotiated wire
+// protocol on the client. Call this before PairVerify.
+func (c *AirPlayClient) RestorePairingCredentials(saved *SavedCredentials) error {
+	if saved == nil || !saved.HasPairingCredentials() {
+		return fmt.Errorf("saved credentials contain no usable pairing identity")
+	}
+	protocol := saved.PairingProtocol
+	if protocol == PairingProtocolUnknown {
+		// Old credential files predate explicit protocol persistence. Preserve the
+		// previous capability-driven behavior: legacy pairing profiles used raw
+		// pair-verify, while CoreUtils/HAP profiles used encrypted verification.
+		protocol = PairingProtocolHAP
+		if c.info != nil && c.info.PrefersLegacyPairing() {
+			protocol = PairingProtocolRaw
+		}
+	}
+	switch protocol {
+	case PairingProtocolHAP:
+		c.pairingProtocol = pairingProtocolHAP
+	case PairingProtocolRaw:
+		c.pairingProtocol = pairingProtocolRaw
+	default:
+		return fmt.Errorf("saved credentials contain unknown pairing protocol %q", protocol)
+	}
+
+	pub, priv := saved.Ed25519Keys()
+	c.PairingID = saved.PairingID
+	c.PairKeys = &PairKeys{
+		Ed25519Public:  append(ed25519.PublicKey(nil), pub...),
+		Ed25519Private: append(ed25519.PrivateKey(nil), priv...),
+	}
+	return nil
 }
 
 // CredentialBackend is the storage interface for pairing credentials.
@@ -95,6 +141,19 @@ func (cs *CredentialStore) Len() int {
 
 // Save stores credentials for a device.
 func (cs *CredentialStore) Save(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey) error {
+	return cs.savePairing(deviceID, pairingID, pub, priv, PairingProtocolUnknown)
+}
+
+// SavePairing stores credentials together with the protocol which actually
+// completed. New production call sites should use this instead of Save.
+func (cs *CredentialStore) SavePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol) error {
+	if protocol != PairingProtocolHAP && protocol != PairingProtocolRaw {
+		return fmt.Errorf("cannot save unknown pairing protocol %q", protocol)
+	}
+	return cs.savePairing(deviceID, pairingID, pub, priv, protocol)
+}
+
+func (cs *CredentialStore) savePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -108,6 +167,9 @@ func (cs *CredentialStore) Save(deviceID string, pairingID string, pub ed25519.P
 	creds.PairingID = pairingID
 	creds.Ed25519Public = append([]byte(nil), pub...)
 	creds.Ed25519Seed = append([]byte(nil), priv.Seed()...)
+	if protocol != PairingProtocolUnknown {
+		creds.PairingProtocol = protocol
+	}
 	return cs.backend.Save(deviceID, creds)
 }
 

@@ -2,10 +2,12 @@ package airplay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/cipher"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,14 +24,18 @@ import (
 	"howett.net/plist"
 )
 
-// ReceiverProfile selects a complete receiver protocol personality. Profiles
-// deliberately couple pairing, control encryption, SETUP layout, and timing;
-// mixing those independently creates combinations that no real receiver uses.
+// ReceiverProfile selects a receiver protocol personality. Each profile is a
+// named combination of otherwise independent protocol axes: pairing family,
+// SETUP order, timing protocol, audio descriptor layout, and FairPlay use.
 type ReceiverProfile string
 
 const (
-	ReceiverProfileModern ReceiverProfile = "modern"
-	ReceiverProfileRoku   ReceiverProfile = "roku"
+	ReceiverProfileModern    ReceiverProfile = "modern"
+	ReceiverProfileRoku      ReceiverProfile = "roku"
+	ReceiverProfileLG        ReceiverProfile = "lg"
+	ReceiverProfileAppleTV3  ReceiverProfile = "appletv3"
+	ReceiverProfileUxPlay    ReceiverProfile = "uxplay"
+	ReceiverProfileAirServer ReceiverProfile = "airserver"
 )
 
 // ReceiverAuthMode controls which stages require the single configured Code.
@@ -53,9 +59,22 @@ type ReceiverConfig struct {
 	Profile       ReceiverProfile
 	Auth          ReceiverAuthMode
 	Code          string
-	Name          string
-	Model         string
-	DeviceID      string
+	// HidePasswordStatus keeps configured password/Digest authentication active
+	// while omitting the password-required bit from /info. Some legacy receivers
+	// reveal that requirement only by challenging the first session request.
+	HidePasswordStatus bool
+	// OmitCombinedInfo accepts combinedGetInfoWithControlSetup but omits the
+	// optional nested info dictionary. It exercises the sender's post-session
+	// GET /info compatibility fallback.
+	OmitCombinedInfo bool
+	Name             string
+	Model            string
+	Manufacturer     string
+	DeviceID         string
+	// DisplayWidth and DisplayHeight override the selected validation profile's
+	// advertised pixel size. They must be supplied together.
+	DisplayWidth  int
+	DisplayHeight int
 	Logger        *log.Logger
 	Debug         bool
 }
@@ -78,10 +97,15 @@ type ReceiverStats struct {
 	VideoConnections  uint64
 	VideoPackets      uint64
 	VideoBytes        uint64
-	AudioPackets      uint64
-	AudioBytes        uint64
-	TimingProbes      uint64
-	TimingReplies     uint64
+	VideoDecrypted    uint64
+	VideoCryptoErrors uint64
+	// VideoWidth and VideoHeight are the largest codec-header canvas observed.
+	VideoWidth    uint64
+	VideoHeight   uint64
+	AudioPackets  uint64
+	AudioBytes    uint64
+	TimingProbes  uint64
+	TimingReplies uint64
 }
 
 type receiverAtomicStats struct {
@@ -93,6 +117,8 @@ type receiverAtomicStats struct {
 	fairPlayRequests  atomic.Uint64
 	digestChallenges  atomic.Uint64
 	setupRequests     atomic.Uint64
+	audioControlPort  atomic.Uint64
+	audioConnections  atomic.Uint64
 	recordRequests    atomic.Uint64
 	parameterRequests atomic.Uint64
 	feedbackRequests  atomic.Uint64
@@ -100,12 +126,63 @@ type receiverAtomicStats struct {
 }
 
 type receiverProfileSpec struct {
-	name          string
-	model         string
-	sourceVersion string
-	features      uint64
-	modernSetup   bool
+	name                     string
+	manufacturer             string
+	model                    string
+	sourceVersion            string
+	features                 uint64
+	pairing                  receiverPairingProfile
+	setupOrder               receiverSetupOrder
+	timingProtocol           string
+	ntpInitiator             receiverNTPInitiator
+	advertisePTPInfo         bool
+	providePTPClockIdentity  bool
+	providePTPClockHeaders   bool
+	audioConnectionsWithHAP  bool
+	audioResponseConnections bool
+	audioCodec               AudioCodec
+	supportedScreenFormats   uint64
+	audioSHKWithHAP          bool
+	fairPlayRootKeys         bool
+	legacyVideoKey           receiverLegacyVideoKeyMode
+	omitEventPort            bool
+	displayWidth             int
+	displayHeight            int
+	displayMaxWidth          int
+	displayMaxHeight         int
+	displayRequiresSession   bool
 }
+
+type receiverPairingProfile uint8
+
+const (
+	receiverPairingLegacy receiverPairingProfile = iota
+	receiverPairingModern
+	receiverPairingLegacyHAP
+)
+
+type receiverSetupOrder uint8
+
+const (
+	receiverSetupMediaFirst receiverSetupOrder = iota
+	receiverSetupSessionFirst
+)
+
+type receiverNTPInitiator uint8
+
+const (
+	receiverNTPNone receiverNTPInitiator = iota
+	receiverNTPReceiver
+	receiverNTPSender
+)
+
+type receiverLegacyVideoKeyMode uint8
+
+const (
+	receiverLegacyVideoNone receiverLegacyVideoKeyMode = iota
+	receiverLegacyVideoRaw
+	receiverLegacyVideoMixed
+)
 
 // ReceiverServer implements enough of an AirPlay mirroring receiver to run the
 // real doubletake sender end to end without hardware. Pairing and encrypted
@@ -155,6 +232,13 @@ func NewReceiverServer(cfg ReceiverConfig) (*ReceiverServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	if (cfg.DisplayWidth == 0) != (cfg.DisplayHeight == 0) || cfg.DisplayWidth < 0 || cfg.DisplayHeight < 0 {
+		return nil, fmt.Errorf("receiver display dimensions must be two positive values or both zero")
+	}
+	if cfg.DisplayWidth > 0 {
+		profile.displayWidth = cfg.DisplayWidth
+		profile.displayHeight = cfg.DisplayHeight
+	}
 	switch cfg.Auth {
 	case ReceiverAuthNone:
 		if cfg.Code != "" {
@@ -172,6 +256,9 @@ func NewReceiverServer(cfg ReceiverConfig) (*ReceiverServer, error) {
 	}
 	if cfg.Model == "" {
 		cfg.Model = profile.model
+	}
+	if cfg.Manufacturer == "" {
+		cfg.Manufacturer = profile.manufacturer
 	}
 	if cfg.DeviceID == "" {
 		cfg.DeviceID, err = randomReceiverDeviceID()
@@ -223,19 +310,120 @@ func receiverProfile(profile ReceiverProfile) (receiverProfileSpec, error) {
 	switch profile {
 	case ReceiverProfileModern:
 		return receiverProfileSpec{
-			name:          "doubletake modern test receiver",
-			model:         "AppleTV-Test",
-			sourceVersion: modernAirPlaySourceVersion,
-			features: FeatureScreen | FeatureAudio | FeatureFPSAP25 | FeatureHomeKitPairing |
-				uint64(1<<38) | FeatureSystemPairing | uint64(1<<46) | FeatureTransientPairing,
-			modernSetup: true,
+			name:                     "doubletake modern Apple test receiver",
+			manufacturer:             "Apple Inc.",
+			model:                    "AppleTV14,1",
+			sourceVersion:            modernAirPlaySourceVersion,
+			features:                 uint64(0x3c177fde4a7fdfd5),
+			pairing:                  receiverPairingModern,
+			setupOrder:               receiverSetupSessionFirst,
+			timingProtocol:           timingProtocolPTP,
+			providePTPClockIdentity:  true,
+			providePTPClockHeaders:   true,
+			audioConnectionsWithHAP:  true,
+			audioResponseConnections: true,
+			audioCodec:               AudioCodecALAC,
+			supportedScreenFormats:   0x40000,
+			audioSHKWithHAP:          true,
+			displayWidth:             1920,
+			displayHeight:            1080,
+			displayMaxWidth:          3840,
+			displayMaxHeight:         2160,
+			displayRequiresSession:   true,
 		}, nil
 	case ReceiverProfileRoku:
 		return receiverProfileSpec{
-			name:          "doubletake Roku test receiver",
-			model:         "3820R2",
-			sourceVersion: legacyAirPlaySourceVersion,
-			features:      uint64(0x038bcf46007f8ad0),
+			name:         "doubletake Roku test receiver",
+			manufacturer: "Roku",
+			model:        "3820R2",
+			// Roku's current implementation advertises PTP capability but retains
+			// its established NTP behavior. Keep the real implementation version
+			// here so the sender's narrowly versioned interoperability rule is
+			// exercised instead of hiding it behind an obsolete sender version.
+			sourceVersion:            "377.40.00",
+			features:                 uint64(0x038bcf46007f8ad0),
+			pairing:                  receiverPairingLegacy,
+			setupOrder:               receiverSetupMediaFirst,
+			timingProtocol:           timingProtocolNTP,
+			ntpInitiator:             receiverNTPReceiver,
+			advertisePTPInfo:         true,
+			audioConnectionsWithHAP:  true,
+			audioResponseConnections: true,
+			audioCodec:               AudioCodecALAC,
+			supportedScreenFormats:   0x40000,
+			audioSHKWithHAP:          true,
+			displayWidth:             1920,
+			displayHeight:            1080,
+		}, nil
+	case ReceiverProfileLG:
+		return receiverProfileSpec{
+			name:                    "doubletake LG test receiver",
+			manufacturer:            "LG Electronics",
+			model:                   "75UP75009LC",
+			sourceVersion:           "377.25.06",
+			features:                uint64(0x038bcb46007f8ad0),
+			pairing:                 receiverPairingLegacyHAP,
+			setupOrder:              receiverSetupMediaFirst,
+			timingProtocol:          timingProtocolPTP,
+			advertisePTPInfo:        true,
+			providePTPClockIdentity: true,
+			audioCodec:              AudioCodecALAC,
+			supportedScreenFormats:  0x40000,
+			audioSHKWithHAP:         true,
+			displayWidth:            1920,
+			displayHeight:           1080,
+		}, nil
+	case ReceiverProfileAppleTV3:
+		return receiverProfileSpec{
+			name:                   "doubletake legacy Apple TV test receiver",
+			manufacturer:           "Apple Inc.",
+			model:                  "AppleTV3,2",
+			sourceVersion:          "220.68",
+			features:               uint64(0x1e5a7ffff7),
+			pairing:                receiverPairingLegacy,
+			setupOrder:             receiverSetupMediaFirst,
+			timingProtocol:         timingProtocolNTP,
+			ntpInitiator:           receiverNTPReceiver,
+			audioCodec:             AudioCodecALAC,
+			supportedScreenFormats: 0x40000,
+			fairPlayRootKeys:       true,
+			legacyVideoKey:         receiverLegacyVideoRaw,
+		}, nil
+	case ReceiverProfileUxPlay:
+		return receiverProfileSpec{
+			name:                   "doubletake UxPlay-compatible test receiver",
+			manufacturer:           "UxPlay",
+			model:                  "AppleTV3,2",
+			sourceVersion:          "220.68",
+			features:               uint64(0x527ffee6),
+			pairing:                receiverPairingLegacy,
+			setupOrder:             receiverSetupMediaFirst,
+			timingProtocol:         timingProtocolNTP,
+			ntpInitiator:           receiverNTPReceiver,
+			audioCodec:             AudioCodecALAC,
+			supportedScreenFormats: 0x40000,
+			fairPlayRootKeys:       true,
+			legacyVideoKey:         receiverLegacyVideoMixed,
+			omitEventPort:          true,
+			displayWidth:           1920,
+			displayHeight:          1080,
+		}, nil
+	case ReceiverProfileAirServer:
+		return receiverProfileSpec{
+			name:                    "doubletake AirServer/Airtame test receiver",
+			manufacturer:            "AirServer",
+			model:                   "AppleTV5,3",
+			sourceVersion:           "375.3",
+			features:                uint64(0x3c177fde4a7fdfd5),
+			pairing:                 receiverPairingLegacy,
+			setupOrder:              receiverSetupSessionFirst,
+			timingProtocol:          timingProtocolNTP,
+			ntpInitiator:            receiverNTPSender,
+			audioConnectionsWithHAP: true,
+			audioCodec:              AudioCodecAACELD,
+			supportedScreenFormats:  0x1000000,
+			audioSHKWithHAP:         true,
+			fairPlayRootKeys:        true,
 		}, nil
 	default:
 		return receiverProfileSpec{}, fmt.Errorf("unknown receiver profile %q", profile)
@@ -530,7 +718,7 @@ func (c *receiverConnection) dispatch(request receiverRequest) (receiverResponse
 	switch {
 	case request.method == "GET" && path == "/info":
 		s.stats.infoRequests.Add(1)
-		body, err := s.infoPlist()
+		body, err := s.infoPlist(c.sessionState != receiverSessionInitial)
 		if err != nil {
 			return receiverError(500, err), nil
 		}
@@ -546,6 +734,10 @@ func (c *receiverConnection) dispatch(request receiverRequest) (receiverResponse
 
 	case request.method == "POST" && path == "/pair-setup":
 		s.stats.pairSetup.Add(1)
+		if err := c.validatePairSetupRequest(request); err != nil {
+			s.logf("pair-setup protocol rejected: %v", err)
+			return receiverError(500, err), nil
+		}
 		body, err := c.pairing.pairSetup(request.body)
 		if err != nil {
 			s.logf("pair-setup rejected: %v", err)
@@ -623,7 +815,7 @@ func (c *receiverConnection) dispatch(request receiverRequest) (receiverResponse
 		if err != nil {
 			return receiverError(500, err), nil
 		}
-		return receiverResponse{status: 200, contentType: "application/x-apple-binary-plist", body: body, headers: s.clockHeaders()}, nil
+		return receiverResponse{status: 200, contentType: "application/x-apple-binary-plist", body: body, headers: s.profileClockHeaders()}, nil
 	case request.method == "TEARDOWN":
 		s.stats.teardownRequests.Add(1)
 		if c.sessionState == receiverSessionInitial || c.sessionState == receiverSessionTornDown {
@@ -635,6 +827,35 @@ func (c *receiverConnection) dispatch(request receiverRequest) (receiverResponse
 	default:
 		return receiverResponse{status: 404}, nil
 	}
+}
+
+func (c *receiverConnection) validatePairSetupRequest(request receiverRequest) error {
+	raw := len(request.body) == ed25519.PublicKeySize
+	hkp := pairingTypeLegacy
+	if value := request.headers["x-apple-hkp"]; value != "" {
+		var err error
+		hkp, err = strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("pair-setup has invalid X-Apple-HKP %q", value)
+		}
+	}
+	switch c.server.profile.pairing {
+	case receiverPairingModern:
+		if raw || hkp == pairingTypeLegacy {
+			return fmt.Errorf("modern profile requires CoreUtils/HAP pairing")
+		}
+	case receiverPairingLegacy:
+		if hkp != pairingTypeLegacy {
+			return fmt.Errorf("legacy profile requires X-Apple-HKP %d", pairingTypeLegacy)
+		}
+	case receiverPairingLegacyHAP:
+		if raw || hkp != pairingTypeLegacy {
+			return fmt.Errorf("third-party profile requires encrypted legacy HAP pairing")
+		}
+	default:
+		return fmt.Errorf("receiver has invalid pairing profile %d", c.server.profile.pairing)
+	}
+	return nil
 }
 
 func receiverIsSessionRequest(request receiverRequest, path string) bool {
@@ -666,40 +887,60 @@ func receiverError(status int, err error) receiverResponse {
 	return receiverResponse{status: status, contentType: "text/plain", body: body}
 }
 
-func (s *ReceiverServer) infoPlist() ([]byte, error) {
+func (s *ReceiverServer) infoPlist(sessionPrepared bool) ([]byte, error) {
+	return plist.Marshal(s.info(sessionPrepared), plist.BinaryFormat)
+}
+
+func (s *ReceiverServer) info(sessionPrepared bool) map[string]any {
 	statusFlags := uint64(4)
 	if s.cfg.Auth == ReceiverAuthPIN {
 		statusFlags |= statusFlagPINRequiredForPairing
 	}
-	if s.cfg.Auth == ReceiverAuthPassword || s.cfg.Auth == ReceiverAuthDigest || s.cfg.Auth == ReceiverAuthCombined {
+	if !s.cfg.HidePasswordStatus &&
+		(s.cfg.Auth == ReceiverAuthPassword || s.cfg.Auth == ReceiverAuthDigest || s.cfg.Auth == ReceiverAuthCombined) {
 		statusFlags |= statusFlagPasswordRequired
 	}
 	info := map[string]any{
-		"name":                     s.cfg.Name,
-		"model":                    s.cfg.Model,
-		"manufacturer":             "doubletake",
-		"deviceID":                 s.cfg.DeviceID,
-		"macAddress":               s.cfg.DeviceID,
-		"protocolVersion":          "1.1",
-		"sourceVersion":            s.profile.sourceVersion,
-		"features":                 s.profile.features,
+		"name":            s.cfg.Name,
+		"model":           s.cfg.Model,
+		"manufacturer":    s.cfg.Manufacturer,
+		"deviceID":        s.cfg.DeviceID,
+		"macAddress":      s.cfg.DeviceID,
+		"protocolVersion": "1.1",
+		"sourceVersion":   s.profile.sourceVersion,
+		"features":        s.profile.features,
+		"supportedFormats": map[string]any{
+			"screenStream": s.profile.supportedScreenFormats,
+		},
 		"statusFlags":              statusFlags,
 		"pk":                       []byte(s.publicKey),
 		"initialVolume":            float64(0),
 		"volumeControlType":        int64(0),
 		"keepAliveSendStatsAsBody": true,
-		"displays": []any{map[string]any{
-			"width": int64(1920), "height": int64(1080),
-			"widthPixels": int64(1920), "heightPixels": int64(1080),
-			"widthPixelsMax": int64(1920), "heightPixelsMax": int64(1080),
-			"maxFPS": int64(60), "uuid": generateUUID(),
-		}},
 		"audioLatencies": []any{map[string]any{
 			"type": int64(100), "ch": int64(2),
 			"inputLatencyMicros": int64(0), "outputLatencyMicros": int64(0),
 		}},
 	}
-	return plist.Marshal(info, plist.BinaryFormat)
+	if s.profile.displayWidth > 0 && s.profile.displayHeight > 0 &&
+		(sessionPrepared || !s.profile.displayRequiresSession) {
+		maxWidth, maxHeight := s.profile.displayMaxWidth, s.profile.displayMaxHeight
+		if maxWidth <= 0 || maxHeight <= 0 {
+			maxWidth, maxHeight = s.profile.displayWidth, s.profile.displayHeight
+		}
+		info["displays"] = []any{map[string]any{
+			"width": int64(s.profile.displayWidth), "height": int64(s.profile.displayHeight),
+			"widthPixels": int64(s.profile.displayWidth), "heightPixels": int64(s.profile.displayHeight),
+			"widthPixelsMax": int64(maxWidth), "heightPixelsMax": int64(maxHeight),
+			"widthPhysical": int64(0), "heightPhysical": int64(0),
+			"overscanned": false, "rotation": false, "receiverSupports444": true,
+			"maxFPS": int64(60), "uuid": generateUUID(),
+		}}
+	}
+	if s.profile.advertisePTPInfo {
+		info["PTPInfo"] = map[string]any{"SupportsClockPortMatchingOverride": true}
+	}
+	return info
 }
 
 func (c *receiverConnection) handleSetup(request receiverRequest) receiverResponse {
@@ -719,12 +960,25 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 	if err != nil {
 		return receiverError(455, err)
 	}
+	if err := c.validateSetup(setup, streams, kind); err != nil {
+		return receiverError(400, err)
+	}
 	if err := c.ensureMedia(); err != nil {
 		return receiverError(500, err)
 	}
+	if kind == receiverSetupVideo {
+		if err := c.configureLegacyVideo(setup, streams[0]); err != nil {
+			return receiverError(400, err)
+		}
+	}
 	endpoints := c.media.Endpoints()
-	response := map[string]any{"eventPort": int64(endpoints.EventPort), "skipRecord": false}
-	if c.server.profile.modernSetup {
+	response := receiverSetupResponse(c.server.profile, endpoints)
+	if kind == receiverSetupControl {
+		if combined, _ := setup["combinedGetInfoWithControlSetup"].(bool); combined && !c.server.cfg.OmitCombinedInfo {
+			response["info"] = c.server.info(true)
+		}
+	}
+	if c.server.profile.timingProtocol == timingProtocolPTP && c.server.profile.providePTPClockIdentity {
 		response["timingPeerInfo"] = map[string]any{
 			"ClockID":                           int64(0x4454424c54414b45),
 			"ID":                                c.server.identifier,
@@ -732,6 +986,9 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 			"Addresses":                         []any{controlLocalIP(c.conn)},
 			"SupportsClockPortMatchingOverride": true,
 		}
+	}
+	if c.server.profile.timingProtocol == timingProtocolNTP && c.server.profile.ntpInitiator == receiverNTPSender {
+		response["timingPort"] = int64(endpoints.TimingPort)
 	}
 
 	if len(streams) == 0 {
@@ -745,20 +1002,22 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 	for _, stream := range streams {
 		switch plistInt(stream["type"]) {
 		case 96:
-			if !c.server.profile.modernSetup && !c.timingProbed {
+			if c.server.profile.timingProtocol == timingProtocolNTP &&
+				c.server.profile.ntpInitiator == receiverNTPReceiver && !c.timingProbed {
 				c.probeLegacyTiming(setup)
 			}
 			audio := map[string]any{
 				"type":                     int64(96),
-				"dataPort":                 int64(endpoints.AudioRTPPort),
-				"controlPort":              int64(endpoints.AudioRTCPPort),
 				"arrivalToRenderLatencyMs": int64(0),
 			}
-			if c.server.profile.modernSetup {
+			if c.server.profile.audioResponseConnections {
 				audio["streamConnections"] = map[string]any{
 					"streamConnectionTypeRTP":  map[string]any{"streamConnectionKeyPort": int64(endpoints.AudioRTPPort)},
 					"streamConnectionTypeRTCP": map[string]any{"streamConnectionKeyPort": int64(endpoints.AudioRTCPPort)},
 				}
+			} else {
+				audio["dataPort"] = int64(endpoints.AudioRTPPort)
+				audio["controlPort"] = int64(endpoints.AudioRTCPPort)
 			}
 			streamResponses = append(streamResponses, audio)
 		case 110:
@@ -775,6 +1034,123 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 		c.sessionState = nextState
 	}
 	return result
+}
+
+func receiverSetupResponse(profile receiverProfileSpec, endpoints receiverMediaEndpoints) map[string]any {
+	response := map[string]any{"skipRecord": false}
+	if !profile.omitEventPort {
+		response["eventPort"] = int64(endpoints.EventPort)
+	}
+	return response
+}
+
+func (c *receiverConnection) validateSetup(setup map[string]any, streams []map[string]any, kind receiverSetupKind) error {
+	profile := c.server.profile
+	synthetic := len(setup) == 0
+	if len(streams) == 1 && len(streams[0]) == 1 {
+		_, synthetic = streams[0]["type"]
+	}
+	_, hasSession := setup["isScreenMirroringSession"]
+	if !hasSession {
+		_, hasSession = setup["timingProtocol"]
+	}
+
+	if profile.setupOrder == receiverSetupSessionFirst {
+		if kind == receiverSetupControl && !hasSession && !synthetic {
+			return fmt.Errorf("control SETUP omitted the session descriptor")
+		}
+		if kind != receiverSetupControl && hasSession {
+			return fmt.Errorf("session-first media SETUP repeated the session descriptor")
+		}
+	} else if kind == receiverSetupControl {
+		return fmt.Errorf("media-first receiver does not accept a control-only SETUP")
+	} else if !hasSession && !synthetic {
+		return fmt.Errorf("media-first SETUP omitted the session descriptor")
+	}
+
+	if hasSession {
+		protocol, _ := setup["timingProtocol"].(string)
+		if protocol != profile.timingProtocol {
+			return fmt.Errorf("timingProtocol is %q, want %q", protocol, profile.timingProtocol)
+		}
+		switch profile.timingProtocol {
+		case timingProtocolNTP:
+			if plistInt(setup["timingPort"]) <= 0 {
+				return fmt.Errorf("NTP SETUP omitted timingPort")
+			}
+		case timingProtocolPTP:
+			if _, ok := setup["timingPeerInfo"].(map[string]any); !ok {
+				return fmt.Errorf("PTP SETUP omitted timingPeerInfo")
+			}
+			if peers, ok := setup["timingPeerList"].([]any); !ok || len(peers) == 0 {
+				return fmt.Errorf("PTP SETUP omitted timingPeerList")
+			}
+		default:
+			return fmt.Errorf("receiver has invalid timing protocol %q", profile.timingProtocol)
+		}
+	}
+
+	if profile.fairPlayRootKeys && c.fairplay != nil && c.fairplay.complete() {
+		if len(plistBytes(setup["ekey"])) == 0 || len(plistBytes(setup["eiv"])) == 0 {
+			return fmt.Errorf("SETUP omitted root FairPlay ekey/eiv")
+		}
+		if kind != receiverSetupVideo && plistInt(setup["et"]) != 32 {
+			return fmt.Errorf("SETUP omitted FairPlay et=32")
+		}
+	}
+
+	if kind != receiverSetupAudio || len(streams) != 1 {
+		return nil
+	}
+	stream := streams[0]
+	if synthetic {
+		return nil
+	}
+	ct, spf, format, _, _, _ := profile.audioCodec.Info()
+	if plistInt(stream["ct"]) != int(ct) || plistInt(stream["spf"]) != int(spf) ||
+		plistInt(stream["audioFormat"]) != int(format) {
+		return fmt.Errorf("audio descriptor is ct=%d spf=%d format=0x%x, want ct=%d spf=%d format=0x%x",
+			plistInt(stream["ct"]), plistInt(stream["spf"]), plistInt(stream["audioFormat"]), ct, spf, format)
+	}
+	_, hasConnections := stream["streamConnections"].(map[string]any)
+	hasControlPort := plistInt(stream["controlPort"]) > 0
+	// Count both accepted and rejected descriptor shapes. This lets the fixture
+	// verify that capability-based selection is attempted first and that the
+	// sender performs at most one bounded alternate-layout probe after a 400.
+	if hasConnections {
+		c.server.stats.audioConnections.Add(1)
+	}
+	if hasControlPort {
+		c.server.stats.audioControlPort.Add(1)
+	}
+	wantConnections := profile.audioConnectionsWithHAP && c.hap != nil
+	if wantConnections {
+		if !hasConnections || hasControlPort {
+			return fmt.Errorf("audio descriptor must use streamConnections without controlPort")
+		}
+	} else if !hasControlPort || hasConnections {
+		return fmt.Errorf("audio descriptor must use controlPort without streamConnections")
+	}
+	if profile.audioSHKWithHAP && c.hap != nil && len(plistBytes(stream["shk"])) != chacha20poly1305.KeySize {
+		return fmt.Errorf("encrypted audio descriptor omitted 32-byte shk")
+	}
+	if profile.audioCodec == AudioCodecAACELD {
+		if _, ok := stream["redundantAudio"]; ok {
+			return fmt.Errorf("AAC-ELD descriptor must not enable redundantAudio")
+		}
+	}
+	return nil
+}
+
+func plistBytes(value any) []byte {
+	switch value := value.(type) {
+	case []byte:
+		return value
+	case plistData:
+		return []byte(value)
+	default:
+		return nil
+	}
 }
 
 func receiverSetupKindForStreams(streams []map[string]any) (receiverSetupKind, error) {
@@ -795,7 +1171,7 @@ func receiverSetupKindForStreams(streams []map[string]any) (receiverSetupKind, e
 }
 
 func (c *receiverConnection) nextSetupState(kind receiverSetupKind) (receiverSessionState, error) {
-	if c.server.profile.modernSetup {
+	if c.server.profile.setupOrder == receiverSetupSessionFirst {
 		switch {
 		case c.sessionState == receiverSessionInitial && kind == receiverSetupControl:
 			return receiverSessionControlPrepared, nil
@@ -816,7 +1192,7 @@ func (c *receiverConnection) nextSetupState(kind receiverSetupKind) (receiverSes
 }
 
 func (c *receiverConnection) handleRecord() receiverResponse {
-	if c.server.profile.modernSetup {
+	if c.server.profile.setupOrder == receiverSetupSessionFirst {
 		if c.sessionState != receiverSessionControlPrepared {
 			return c.invalidSessionState("RECORD")
 		}
@@ -861,7 +1237,7 @@ func (c *receiverConnection) setupPlistResponse(value map[string]any) receiverRe
 	}
 	return receiverResponse{
 		status: 200, contentType: "application/x-apple-binary-plist", body: body,
-		headers: c.server.clockHeaders(),
+		headers: c.server.profileClockHeaders(),
 	}
 }
 
@@ -874,6 +1250,7 @@ func (c *receiverConnection) ensureMedia() error {
 		BindIP:            controlLocalIP(c.conn),
 		EventEncrypted:    c.hap != nil,
 		EventSharedSecret: keys.sharedSecret,
+		TimingResponder:   c.server.profile.ntpInitiator == receiverNTPSender,
 		MaxVideoPayload:   32 * 1024 * 1024,
 	})
 	if err != nil {
@@ -884,6 +1261,73 @@ func (c *receiverConnection) ensureMedia() error {
 	c.server.activeMedia[media] = struct{}{}
 	c.server.mediaMu.Unlock()
 	return nil
+}
+
+func (c *receiverConnection) configureLegacyVideo(setup map[string]any, stream map[string]any) error {
+	mode := c.server.profile.legacyVideoKey
+	if mode == receiverLegacyVideoNone {
+		return nil
+	}
+	if c.hap != nil {
+		return fmt.Errorf("legacy AES video profile unexpectedly uses HAP control")
+	}
+	if c.fairplay == nil {
+		return fmt.Errorf("legacy AES video requires FairPlay SAP")
+	}
+	rawKey, err := c.fairplay.unwrapKey(plistBytes(setup["ekey"]))
+	if err != nil {
+		return fmt.Errorf("authenticate legacy video ekey: %w", err)
+	}
+	pairKeys, verified := c.pairing.sessionKeys()
+	if !verified {
+		return fmt.Errorf("legacy AES video requires pair-verify keys")
+	}
+	masterKey, err := receiverLegacyVideoMasterKey(mode, rawKey[:], pairKeys.sharedSecret)
+	if err != nil {
+		return err
+	}
+
+	streamKey := plistBytes(stream["shk"])
+	if len(streamKey) != len(masterKey) || !bytes.Equal(streamKey, masterKey) {
+		return fmt.Errorf("legacy video shk does not match the authenticated FairPlay session key")
+	}
+	rootIV := plistBytes(setup["eiv"])
+	streamIV := plistBytes(stream["shiv"])
+	if len(rootIV) != 16 || len(streamIV) != 16 || !bytes.Equal(rootIV, streamIV) {
+		return fmt.Errorf("legacy video requires matching 16-byte root eiv and stream shiv")
+	}
+	streamConnectionID := plistInt(stream["streamConnectionID"])
+	if streamConnectionID <= 0 {
+		return fmt.Errorf("legacy video omitted streamConnectionID")
+	}
+	cipherKey, cipherIV := deriveVideoKeys(masterKey, int64(streamConnectionID))
+	if err := c.media.configureLegacyVideo(cipherKey, cipherIV); err != nil {
+		return fmt.Errorf("configure legacy video decryptor: %w", err)
+	}
+	return nil
+}
+
+// receiverLegacyVideoMasterKey deliberately models both negotiated legacy-key
+// modes independently of the sender's selection logic: the key authenticated
+// by ekey can remain raw or be mixed with the raw-pair-verify X25519 secret.
+func receiverLegacyVideoMasterKey(mode receiverLegacyVideoKeyMode, rawKey, pairSecret []byte) ([]byte, error) {
+	if len(rawKey) != 16 {
+		return nil, fmt.Errorf("legacy video raw FairPlay key is %d bytes, want 16", len(rawKey))
+	}
+	switch mode {
+	case receiverLegacyVideoRaw:
+		return append([]byte(nil), rawKey...), nil
+	case receiverLegacyVideoMixed:
+		if len(pairSecret) == 0 {
+			return nil, fmt.Errorf("mixed legacy video requires the raw pair-verify shared secret")
+		}
+		digest := sha512.New()
+		_, _ = digest.Write(rawKey)
+		_, _ = digest.Write(pairSecret)
+		return digest.Sum(nil)[:16], nil
+	default:
+		return nil, fmt.Errorf("invalid legacy video key mode %d", mode)
+	}
 }
 
 func controlLocalIP(conn net.Conn) string {
@@ -934,6 +1378,13 @@ func (s *ReceiverServer) clockHeaders() map[string]string {
 		"X-Apple-RequestReceivedTimestamp": strconv.FormatInt(millis, 10),
 		"X-Apple-ProcessingTime":           "1",
 	}
+}
+
+func (s *ReceiverServer) profileClockHeaders() map[string]string {
+	if s.profile.timingProtocol == timingProtocolPTP && !s.profile.providePTPClockHeaders {
+		return nil
+	}
+	return s.clockHeaders()
 }
 
 func (c *receiverConnection) writeResponse(request receiverRequest, response receiverResponse) error {
@@ -1099,6 +1550,10 @@ func (s *ReceiverServer) Stats() ReceiverStats {
 	stats.VideoConnections = media.VideoConnections
 	stats.VideoPackets = media.VideoPackets
 	stats.VideoBytes = media.VideoBytes
+	stats.VideoDecrypted = media.VideoDecrypted
+	stats.VideoCryptoErrors = media.VideoCryptoErrors
+	stats.VideoWidth = media.VideoWidth
+	stats.VideoHeight = media.VideoHeight
 	stats.AudioPackets = media.AudioPackets
 	stats.AudioBytes = media.AudioBytes
 	stats.TimingProbes = media.TimingProbes

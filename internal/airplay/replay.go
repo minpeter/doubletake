@@ -170,13 +170,6 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 				return fmt.Errorf("send codec frame %d: %w", i, err)
 			}
 
-			// Signal first frame sent (unblocks heartbeat/feedback)
-			select {
-			case <-s.firstFrameSent:
-			default:
-				close(s.firstFrameSent)
-			}
-
 		case 0x00: // VCL frame (encrypted) — decrypt with original key, re-encrypt with session key
 			// Pace frames
 			if !lastSendTime.IsZero() {
@@ -226,6 +219,13 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send VCL frame %d (sent=%d): %w", i, sentFrames, err)
+			}
+			if sentFrames == 0 {
+				select {
+				case <-s.firstFrameSent:
+				default:
+					close(s.firstFrameSent)
+				}
 			}
 			sentFrames++
 

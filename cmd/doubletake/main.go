@@ -96,7 +96,7 @@ func main() {
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
-	airplay.DebugMode = *debug
+	airplay.SetDebugMode(*debug)
 
 	if *daemonize {
 		runDaemon(daemon.Config{
@@ -146,6 +146,7 @@ func main() {
 	}()
 
 	var addr string
+	var advertisement *airplay.AirPlayDevice
 	if *target != "" {
 		addr = *target
 	} else {
@@ -155,10 +156,20 @@ func main() {
 		}
 		addr = device.IP
 		*port = device.Port
+		advertisement = device
 		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
 	}
 
-	client := airplay.NewAirPlayClient(addr, *port)
+	newClient := func() *airplay.AirPlayClient {
+		if advertisement != nil {
+			device := *advertisement
+			device.IP = addr
+			device.Port = *port
+			return airplay.NewAirPlayClientForDevice(device)
+		}
+		return airplay.NewAirPlayClient(addr, *port)
+	}
+	client := newClient()
 	client.SetPassword(credential)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
@@ -203,7 +214,7 @@ func main() {
 
 	reconnect := func() {
 		_ = client.Close()
-		client = airplay.NewAirPlayClient(addr, *port)
+		client = newClient()
 		client.SetPassword(credential)
 		if err := client.Connect(ctx); err != nil {
 			log.Fatalf("reconnect failed: %v", err)
@@ -215,6 +226,18 @@ func main() {
 		}
 	}
 
+	savePairingCredentials := func() {
+		if client.PairKeys == nil {
+			return
+		}
+		if err := credStore.SavePairing(info.DeviceID, client.PairingID,
+			client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
+			client.PairingProtocol()); err != nil {
+			log.Printf("warning: failed to save credentials: %v", err)
+		} else {
+			log.Printf("credentials saved (%s)", *credBackend)
+		}
+	}
 	pairWithCredential := func(value string, expectPIN bool) {
 		if value == "" {
 			value = credentialOrPrompt(credential, client, expectPIN)
@@ -226,35 +249,39 @@ func main() {
 		if err := client.Pair(ctx, value); err != nil {
 			log.Fatalf("pairing failed: %v", err)
 		}
-		if client.PairKeys == nil {
-			return
-		}
-		if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
-			log.Printf("warning: failed to save credentials: %v", err)
-		} else {
-			log.Printf("credentials saved (%s)", *credBackend)
-		}
+		savePairingCredentials()
 	}
 	if needFullPair {
-		// Full pair-setup with a supplied PIN/password, or request an onscreen PIN.
-		pairWithCredential(credential, !info.RequiresPassword())
+		if forcePairUsesTransient(info) {
+			// A modern receiver's fixed playback password belongs only to HTTP
+			// Digest. Passing it to full SRP pair-setup is rejected as a bad PIN,
+			// even when -pair was requested. Keep the one entered value for Digest
+			// and establish this session with transient HAP pairing.
+			if err := client.Pair(ctx, ""); err != nil {
+				log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
+			}
+		} else {
+			// Full pair-setup with a supplied PIN/password, or request an onscreen PIN.
+			pairWithCredential(credential, !info.RequiresPassword())
+		}
 	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		// Use saved credentials — pair-verify
 		log.Printf("using saved credentials (%s)", *credBackend)
-		pub, priv := savedCreds.Ed25519Keys()
-		client.PairingID = savedCreds.PairingID
-		client.PairKeys = &airplay.PairKeys{
-			Ed25519Public:  pub,
-			Ed25519Private: priv,
+		verifyErr := restoreSavedPairing(client, savedCreds)
+		if verifyErr == nil {
+			verifyErr = client.PairVerify(ctx)
 		}
-		if err := client.PairVerify(ctx); err != nil {
-			log.Printf("pair-verify with saved creds failed: %v", err)
+		if verifyErr != nil {
+			log.Printf("pair-verify with saved creds failed: %v", verifyErr)
 			reconnect()
 			if passwordRequiresPairing(info) {
 				pairWithCredential("", false)
-			} else if info.RequiresPINPairing() {
+			} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
 				pairWithCredential("", true)
 			} else if err := client.Pair(ctx, ""); err != nil {
+				if info.RequiresPassword() {
+					log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
+				}
 				log.Printf("transient pairing fallback failed: %v, requesting pairing credentials", err)
 				// A failed pairing exchange may leave receiver state on this socket.
 				// Start and finish credential pairing together on a clean connection.
@@ -265,9 +292,12 @@ func main() {
 	} else {
 		if passwordRequiresPairing(info) {
 			pairWithCredential("", false)
-		} else if info.RequiresPINPairing() {
+		} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
 			pairWithCredential("", true)
 		} else if err := client.Pair(ctx, ""); err != nil {
+			if info.RequiresPassword() {
+				log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
+			}
 			log.Printf("transient pairing failed: %v, requesting pairing credentials", err)
 			reconnect()
 			pairWithCredential("", false)
@@ -298,59 +328,91 @@ func main() {
 		PortMin:   portMin,
 		PortMax:   portMax,
 	}
-	// On modern receivers, SetupMirror starts a roughly 30-second deadline for
-	// the first video data. Wayland capture can spend much of that time waiting
-	// for the screencast portal, leaving a stream that starts successfully but is
-	// disconnected shortly afterward. Complete portal selection and start the
-	// capture before creating the receiver session.
-	var capture *airplay.ScreenCapture
+	// Complete the potentially interactive Wayland portal request before SETUP,
+	// but delay encoder startup until control SETUP returns session-time display
+	// information. Some current receivers omit displays before that session
+	// exists; committing the pipeline earlier silently selects the 720p fallback.
+	captureCfg := airplay.CaptureConfig{
+		FPS:           *fps,
+		Bitrate:       *bitrate,
+		HWAccel:       *hwaccel,
+		X11WindowID:   xid,
+		X11WindowName: *x11WindowName,
+		ShowCursor:    !*noCursor,
+	}
+	var capturePreparation *airplay.CapturePreparation
 	if *testMode {
 		if *noAudio {
 			log.Println("using synthetic video (videotestsrc) for debugging")
 		} else {
 			log.Println("using synthetic video (videotestsrc) and audio test tone for debugging")
 		}
-		var err error
-		capture, err = airplay.StartTestCapture(ctx, airplay.CaptureConfig{
-			FPS:     *fps,
-			Bitrate: *bitrate,
-			HWAccel: *hwaccel,
-		})
-		if err != nil {
-			log.Fatalf("test capture failed: %v", err)
-		}
+		capturePreparation, err = airplay.PrepareTestCapture(ctx, captureCfg)
 	} else {
 		restoreToken := ""
 		if creds := credStore.Lookup(info.DeviceID); creds != nil {
 			restoreToken = creds.RestoreToken
 		}
-		maxW, maxH := info.DisplaySize()
-		captureCfg := airplay.CaptureConfig{
-			FPS:           *fps,
-			Bitrate:       *bitrate,
-			HWAccel:       *hwaccel,
-			MaxWidth:      maxW,
-			MaxHeight:     maxH,
-			X11WindowID:   xid,
-			X11WindowName: *x11WindowName,
-			ShowCursor:    !*noCursor,
-			RestoreToken:  restoreToken,
-			SaveRestoreToken: func(token string) error {
-				return credStore.SaveRestoreToken(info.DeviceID, token)
-			},
+		captureCfg.RestoreToken = restoreToken
+		captureCfg.SaveRestoreToken = func(token string) error {
+			return credStore.SaveRestoreToken(info.DeviceID, token)
 		}
-		var err error
-		capture, err = airplay.StartCapture(ctx, captureCfg)
-		if err != nil {
-			log.Fatalf("screen capture failed: %v", err)
-		}
+		capturePreparation, err = airplay.PrepareCapture(ctx, captureCfg)
 	}
-	defer capture.Stop()
-	log.Println("screen capture started")
+	if err != nil {
+		log.Fatalf("prepare screen capture: %v", err)
+	}
 
-	session, err := client.SetupMirror(ctx, streamCfg)
+	var capture *airplay.ScreenCapture
+	var broadcast *airplay.BroadcastCapture
+	var broadcastDone chan error
+	startedWidth, startedHeight := -1, -1
+	prepareVideo := func(width, height int) error {
+		if capture != nil {
+			if width == startedWidth && height == startedHeight {
+				return nil
+			}
+			return fmt.Errorf("receiver changed video canvas from %dx%d to %dx%d during setup", startedWidth, startedHeight, width, height)
+		}
+		capture, err = capturePreparation.Start(width, height)
+		if err != nil {
+			return err
+		}
+		startedWidth, startedHeight = width, height
+		broadcast = airplay.NewBroadcastCapture(capture)
+		broadcastDone = make(chan error, 1)
+		go func(active *airplay.BroadcastCapture, done chan<- error) {
+			done <- active.Run()
+		}(broadcast, broadcastDone)
+		log.Printf("screen capture started at %dx%d", width, height)
+		return nil
+	}
+	defer func() {
+		capturePreparation.Close()
+		if capture != nil {
+			capture.Stop()
+			<-broadcastDone
+		}
+	}()
+
+	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	if errors.Is(err, airplay.ErrCredentialsRequired) {
+		// Some legacy receivers do not advertise their configured password in
+		// /info. They reveal it only by challenging the first media SETUP. Keep
+		// the completed pairing/FairPlay state and running capture, configure the
+		// cached Digest challenge, and retry this setup exactly once.
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ")
+		if credential == "" {
+			log.Fatal("receiver code/password cannot be empty")
+		}
+		client.SetPassword(credential)
+		session, err = client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	}
 	if err != nil {
 		log.Fatalf("mirror setup failed: %v", err)
+	}
+	if capture == nil || broadcast == nil {
+		log.Fatal("mirror setup completed without preparing video capture")
 	}
 	defer session.Close()
 	log.Printf("mirror session ready (data port: %d)", session.DataPort)
@@ -363,7 +425,7 @@ func main() {
 
 	// Start audio capture and streaming unless disabled.
 	if !*noAudio && session.HasAudio() {
-		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode)
+		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
 		if err != nil {
 			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
 		} else {
@@ -379,7 +441,9 @@ func main() {
 		log.Println("audio disabled (receiver did not provide audio ports)")
 	}
 
-	if err := session.StreamFrames(ctx, capture, 0*time.Second); err != nil && ctx.Err() == nil {
+	videoSink := broadcast.AddSink()
+	defer videoSink.Close()
+	if err := session.StreamFrames(ctx, videoSink.AsCapture(), 0*time.Second); err != nil && ctx.Err() == nil {
 		log.Fatalf("streaming error: %v", err)
 	}
 	log.Println("stream ended")
@@ -415,9 +479,20 @@ func pairingCredentialPrompt(expectPIN bool, displayErr error) string {
 }
 
 func passwordRequiresPairing(info *airplay.ReceiverInfo) bool {
-	// A failed transient exchange puts Roku's password pairer into an error
-	// state, so legacy password receivers must start with authenticated SRP.
-	return info.RequiresPassword() && (info.RequiresPINPairing() || info.PrefersLegacyPairing())
+	// A failed transient exchange can put a legacy password pairer into an error
+	// state, so receivers advertising that pairing generation start with SRP.
+	// Modern receivers retain the password only for Digest, even when their
+	// status flags also advertise on-screen PIN pairing.
+	return info.RequiredPairingCredential() == airplay.PairingCredentialPassword
+}
+
+func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCredentials) error {
+	return client.RestorePairingCredentials(saved)
+}
+
+func forcePairUsesTransient(info *airplay.ReceiverInfo) bool {
+	return info != nil && info.RequiresPassword() &&
+		info.RequiredPairingCredential() == airplay.PairingCredentialNone
 }
 
 func readCredential(reader *bufio.Reader, prompt string) string {

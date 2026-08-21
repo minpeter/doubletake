@@ -3,6 +3,7 @@ package airplay
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -156,8 +157,13 @@ func TestRTSPRequestWithoutPasswordDoesNotRetry(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 
-	if _, _, err := client.rtspRequest("SETUP", "rtsp://127.0.0.1/stream", "text/plain", []byte("x"), nil); err == nil {
-		t.Fatal("expected the 401 to surface when no password is configured")
+	if _, _, err := client.rtspRequest("SETUP", "rtsp://127.0.0.1/stream", "text/plain", []byte("x"), nil); !errors.Is(err, ErrCredentialsRequired) {
+		t.Fatalf("error = %v, want ErrCredentialsRequired", err)
+	} else {
+		var statusErr *HTTPStatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != 401 {
+			t.Fatalf("error = %v, want wrapped HTTP 401", err)
+		}
 	}
 	client.Close()
 

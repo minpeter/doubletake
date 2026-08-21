@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,8 +24,9 @@ type CaptureConfig struct {
 	Bitrate int    // Video bitrate in kbps (0 = auto)
 	HWAccel string // "auto", "nvenc", "vaapi", "openh264", or "none" (x264)
 
-	// MaxWidth/MaxHeight clamp the encoded frame to the size the receiver
-	// advertised in /info. Zero leaves the capture at its native size.
+	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
+	// The captured image is aspect-fitted into it. Zero leaves the capture at
+	// its native size.
 	MaxWidth  int
 	MaxHeight int
 
@@ -71,23 +73,191 @@ type ScreenCapture struct {
 	stopped  bool
 }
 
+type capturePreparationKind uint8
+
+const (
+	capturePreparationX11 capturePreparationKind = iota
+	capturePreparationWayland
+	capturePreparationTest
+)
+
+// CapturePreparation performs the potentially interactive part of screen
+// capture before the receiver session starts. In particular, a Wayland
+// preparation completes the screencast portal request and retains its PipeWire
+// connection without starting the encoder. Start can then apply display
+// dimensions learned from the receiver's control SETUP without putting portal
+// UI inside the receiver's first-frame deadline.
+//
+// A preparation is single-use. Call Close when it will not be started.
+type CapturePreparation struct {
+	mu   sync.Mutex
+	ctx  context.Context
+	cfg  CaptureConfig
+	kind capturePreparationKind
+	used bool
+
+	pwNodeID   uint32
+	pwFd       *os.File
+	dbusConn   *dbus.Conn
+	streamSize [2]int
+}
+
 // StartCapture detects the display server (Wayland or X11) and initiates screen
 // capture accordingly. On Wayland it uses xdg-desktop-portal + PipeWire for
 // capture; on X11 it uses ximagesrc. Both use GStreamer for H.264 encoding.
 func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	preparation, err := PrepareCapture(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	capture, err := preparation.Start(cfg.MaxWidth, cfg.MaxHeight)
+	if err != nil {
+		preparation.Close()
+		return nil, err
+	}
+	return capture, nil
+}
+
+// PrepareCapture selects and validates the capture path. Wayland portal access
+// is acquired immediately; X11 needs no external session and is merely
+// validated until Start is called.
+func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, err
 	}
+	kind := capturePreparationX11
 	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
-		return startX11Capture(ctx, cfg)
+		kind = capturePreparationX11
+	} else if os.Getenv("WAYLAND_DISPLAY") != "" {
+		kind = capturePreparationWayland
+	} else if os.Getenv("DISPLAY") == "" {
+		return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
 	}
-	if os.Getenv("WAYLAND_DISPLAY") != "" {
-		return startWaylandCapture(ctx, cfg)
+
+	if _, err := selectGstEncoderWithProbe(cfg, hasGstElement, false); err != nil {
+		return nil, err
 	}
-	if os.Getenv("DISPLAY") != "" {
-		return startX11Capture(ctx, cfg)
+	preparation := &CapturePreparation{ctx: ctx, cfg: cfg, kind: kind}
+	if kind == capturePreparationX11 {
+		if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
+			return nil, fmt.Errorf("GStreamer 'ximagesrc' plugin not found; install gst-plugins-good")
+		}
+		return preparation, nil
 	}
-	return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
+
+	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
+		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
+	}
+	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &preparation.streamSize)
+	if err != nil {
+		return nil, fmt.Errorf("screencast portal: %w", err)
+	}
+	if restoreToken != "" && cfg.SaveRestoreToken != nil {
+		if err := cfg.SaveRestoreToken(restoreToken); err != nil {
+			log.Printf("[CAPTURE] warning: failed to save screencast restore token: %v", err)
+		}
+	}
+	dbg("pipewire node ID: %d", nodeID)
+	preparation.pwNodeID = nodeID
+	preparation.pwFd = pwFd
+	preparation.dbusConn = dbusConn
+	return preparation, nil
+}
+
+// PrepareTestCapture validates a synthetic capture without starting its
+// GStreamer process. It mirrors PrepareCapture for callers that negotiate the
+// receiver canvas between preparation and encoder startup.
+func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
+		return nil, err
+	}
+	if _, err := selectGstEncoderWithProbe(cfg, hasGstElement, false); err != nil {
+		return nil, err
+	}
+	return &CapturePreparation{ctx: ctx, cfg: cfg, kind: capturePreparationTest}, nil
+}
+
+// Start launches the prepared encoder using the supplied nominal receiver
+// canvas. Zero dimensions leave the captured source at its native size.
+func (p *CapturePreparation) Start(width, height int) (*ScreenCapture, error) {
+	return p.StartWithContext(nil, width, height)
+}
+
+// StartWithContext is Start with an optional lifetime context for the launched
+// encoder. The portal acquisition remains tied to the preparation context, but
+// daemon capture groups use an independent context so the encoder can outlive
+// the receiver which happened to create that shared group.
+func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, height int) (*ScreenCapture, error) {
+	if p == nil {
+		return nil, fmt.Errorf("capture preparation is nil")
+	}
+	p.mu.Lock()
+	if p.used {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("capture preparation has already been used")
+	}
+	p.used = true
+	cfg := p.cfg
+	cfg.MaxWidth = width
+	cfg.MaxHeight = height
+	kind := p.kind
+	ctx := lifetime
+	if ctx == nil {
+		ctx = p.ctx
+	}
+	nodeID := p.pwNodeID
+	pwFd := p.pwFd
+	dbusConn := p.dbusConn
+	streamSize := p.streamSize
+	p.pwFd = nil
+	p.dbusConn = nil
+	p.mu.Unlock()
+	encoder, err := detectGstEncoder(cfg)
+	if err != nil {
+		if pwFd != nil {
+			_ = pwFd.Close()
+		}
+		if dbusConn != nil {
+			_ = dbusConn.Close()
+		}
+		return nil, err
+	}
+
+	switch kind {
+	case capturePreparationWayland:
+		return startPreparedWaylandCapture(ctx, cfg, encoder, nodeID, pwFd, dbusConn, streamSize)
+	case capturePreparationX11:
+		return startPreparedX11Capture(ctx, cfg, encoder)
+	case capturePreparationTest:
+		return startPreparedTestCapture(ctx, cfg, encoder)
+	default:
+		return nil, fmt.Errorf("invalid capture preparation kind %d", kind)
+	}
+}
+
+// Close releases an unconsumed portal preparation. Once Start has taken
+// ownership, ScreenCapture.Stop owns the corresponding resources.
+func (p *CapturePreparation) Close() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.used {
+		p.mu.Unlock()
+		return
+	}
+	p.used = true
+	pwFd := p.pwFd
+	dbusConn := p.dbusConn
+	p.pwFd = nil
+	p.dbusConn = nil
+	p.mu.Unlock()
+	if pwFd != nil {
+		_ = pwFd.Close()
+	}
+	if dbusConn != nil {
+		_ = dbusConn.Close()
+	}
 }
 
 func hasGstElement(name string) bool {
@@ -181,11 +351,34 @@ func appendGstStage(args []string, stage gstStage) []string {
 	return append(args, stage...)
 }
 
-// buildGstVideoPipeline joins source-specific stages to the one encoding and
-// Annex-B output path used by Wayland, X11, and synthetic test capture.
-// beforeConvert and afterFormat preserve the few ordering requirements that
-// genuinely differ between capture sources.
-func buildGstVideoPipeline(source gstStage, beforeConvert, afterFormat []gstStage, encoder encoderResult) []string {
+// receiverScaleStages fits the captured image into the receiver's advertised
+// canvas without changing its aspect ratio. Exact, even receiver dimensions
+// are important here: bounded caps can negotiate an odd fitted width for a
+// HiDPI source (for example 3024x1964 becomes 1109x720), which x264 cannot
+// encode and some legacy mirror decoders reject. videoscale adds any necessary
+// letterbox or pillarbox bars instead of stretching the image.
+func receiverScaleStages(maxWidth, maxHeight int) []gstStage {
+	if maxWidth <= 0 || maxHeight <= 0 {
+		return nil
+	}
+	// Every encoder consumes 4:2:0 video. Keep each chroma plane integral and
+	// never exceed an odd receiver limit.
+	maxWidth &^= 1
+	maxHeight &^= 1
+	if maxWidth == 0 || maxHeight == 0 {
+		return nil
+	}
+	return []gstStage{
+		{"videoscale", "add-borders=true"},
+		{fmt.Sprintf("video/x-raw,width=%d,height=%d,pixel-aspect-ratio=1/1", maxWidth, maxHeight)},
+	}
+}
+
+// buildGstVideoPipeline joins source-specific stages to the one scaling,
+// encoding, and Annex-B output path used by Wayland, X11, and synthetic test
+// capture. beforeConvert and afterScale preserve the few ordering requirements
+// that genuinely differ between capture sources.
+func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage, encoder encoderResult, maxWidth, maxHeight int) []string {
 	args := append([]string{"--quiet"}, source...)
 	for _, stage := range beforeConvert {
 		args = appendGstStage(args, stage)
@@ -193,7 +386,10 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterFormat []gstStag
 
 	args = appendGstStage(args, gstStage{"videoconvert"})
 	args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
-	for _, stage := range afterFormat {
+	for _, stage := range receiverScaleStages(maxWidth, maxHeight) {
+		args = appendGstStage(args, stage)
+	}
+	for _, stage := range afterScale {
 		args = appendGstStage(args, stage)
 	}
 	if encoder.needsVulkan {
@@ -205,28 +401,16 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterFormat []gstStag
 	return appendGstStage(args, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
 }
 
-func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
-	// Check dependencies
-	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
-		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
-	}
-	encoderParts, err := detectGstEncoder(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	var streamSize [2]int
-	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &streamSize)
-	if err != nil {
-		return nil, fmt.Errorf("screencast portal: %w", err)
-	}
-	if restoreToken != "" && cfg.SaveRestoreToken != nil {
-		if err := cfg.SaveRestoreToken(restoreToken); err != nil {
-			log.Printf("[CAPTURE] warning: failed to save screencast restore token: %v", err)
+func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int) (*ScreenCapture, error) {
+	if pwFd == nil || dbusConn == nil {
+		if pwFd != nil {
+			_ = pwFd.Close()
 		}
+		if dbusConn != nil {
+			_ = dbusConn.Close()
+		}
+		return nil, fmt.Errorf("prepared Wayland capture is missing portal resources")
 	}
-	dbg("pipewire node ID: %d", nodeID)
-
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
@@ -245,54 +429,34 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	const pwFdNum = 3
 	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
 
-	// Receivers advertise the largest frame their decoder accepts; an oversized
-	// stream makes some of them stop consuming after the first IDR. add-borders
-	// preserves the display aspect ratio when the source and receiver differ.
-	scaleToReceiver := cfg.MaxWidth > 0 && cfg.MaxHeight > 0
 	hasCompositor := streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor")
 
 	var beforeConvert []gstStage
 	if hasGstElement("vapostproc") {
-		stage := gstStage{"vapostproc"}
-		if scaleToReceiver && !hasCompositor {
-			stage = append(stage, "add-borders=true")
-		}
-		beforeConvert = append(beforeConvert, stage)
+		beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
 	} else {
 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
-		if scaleToReceiver && !hasCompositor {
-			beforeConvert = append(beforeConvert, gstStage{"videoscale", "add-borders=true"})
-		}
 	}
 
-	var afterFormat []gstStage
+	var afterScale []gstStage
 	if hasCompositor {
 		beforeConvert = append(beforeConvert,
 			gstStage{"compositor", "force-live=true", "ignore-inactive-pads=true", "background=black"},
 			gstStage{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", streamSize[0], streamSize[1], fps)},
 		)
-		// The compositor fixes its output to the portal size, so scale downstream.
-		if scaleToReceiver {
-			afterFormat = append(afterFormat, gstStage{"videoscale", "add-borders=true"})
-		}
 	} else {
 		log.Printf("[CAPTURE] idle-frame compositor unavailable; using portal frame timing")
 	}
-	if scaleToReceiver {
-		afterFormat = append(afterFormat, gstStage{fmt.Sprintf(
-			"video/x-raw,width=%d,height=%d,pixel-aspect-ratio=1/1", cfg.MaxWidth, cfg.MaxHeight,
-		)})
-	}
 	if hasCompositor {
-		afterFormat = append(afterFormat, lowLatencyVideoQueueStage())
+		afterScale = append(afterScale, lowLatencyVideoQueueStage())
 	} else {
-		afterFormat = append(afterFormat,
+		afterScale = append(afterScale,
 			gstStage{"videorate", "drop-only=true", "skip-to-first=true"},
 			frameRateStage(fps),
 			lowLatencyVideoQueueStage(),
 		)
 	}
-	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterFormat, encoderParts)
+	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterScale, encoderParts, cfg.MaxWidth, cfg.MaxHeight)
 
 	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -334,15 +498,7 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	return capture, nil
 }
 
-func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
-	if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
-		return nil, fmt.Errorf("GStreamer 'ximagesrc' plugin not found; install gst-plugins-good")
-	}
-	encoder, err := detectGstEncoder(cfg)
-	if err != nil {
-		return nil, err
-	}
-
+func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder encoderResult) (*ScreenCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
@@ -383,7 +539,7 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	}
 
 	beforeConvert := []gstStage{frameRateStage(fps), lowLatencyVideoQueueStage()}
-	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder)
+	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight)
 
 	dbg("[CAPTURE] gst-launch-1.0 (x11) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -554,10 +710,19 @@ func parseXrandrGeometry(line string) (xOffset, yOffset, width, height int, ok b
 // fall through the priority list; an explicit method either uses its own
 // encoder element (or elements, for NVENC) or returns an error.
 func detectGstEncoder(cfg CaptureConfig) (encoderResult, error) {
-	return detectGstEncoderWithProbe(cfg, hasGstElement)
+	return selectGstEncoderWithProbe(cfg, hasGstElement, true)
 }
 
 func detectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool) (encoderResult, error) {
+	return selectGstEncoderWithProbe(cfg, hasElement, true)
+}
+
+func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, announce bool) (encoderResult, error) {
+	if !announce && cfg.Bitrate <= 0 {
+		// Preparation only validates element availability. The real automatic
+		// bitrate depends on the session-time canvas and is computed by Start.
+		cfg.Bitrate = defaultVideoBitrateKbps
+	}
 	fps := cfg.FPS
 	if fps <= 0 {
 		fps = 30
@@ -660,7 +825,9 @@ func detectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool) 
 			continue
 		}
 		if hasElement(candidate.element) {
-			log.Printf("[CAPTURE] using %s", candidate.label)
+			if announce {
+				log.Printf("[CAPTURE] using %s", candidate.label)
+			}
 			return candidate.result, nil
 		}
 	}
@@ -681,13 +848,19 @@ func detectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool) 
 
 // StartTestCapture creates a synthetic H.264 stream with the configured encoder.
 func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
-	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
-		return nil, err
-	}
-	encoder, err := detectGstEncoder(cfg)
+	preparation, err := PrepareTestCapture(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	capture, err := preparation.Start(cfg.MaxWidth, cfg.MaxHeight)
+	if err != nil {
+		preparation.Close()
+		return nil, err
+	}
+	return capture, nil
+}
+
+func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder encoderResult) (*ScreenCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
@@ -704,7 +877,7 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps)},
 		{"timeoverlay"},
 	}
-	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder)
+	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight)
 
 	dbg("[CAPTURE] launching gst-launch-1.0 (test mode) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -766,10 +939,18 @@ func captureBitrateKbps(cfg CaptureConfig) int {
 	if fps <= 0 {
 		fps = 30
 	}
-	// The encoded resolution is not known until frames flow (it comes from the
-	// captured display), so size the auto bitrate for a 1080p budget. Pass
-	// -bitrate to override for higher-resolution displays.
 	width, height := 1920, 1080
+	if cfg.MaxWidth > 0 && cfg.MaxHeight > 0 {
+		// A decoder ceiling may force us below the normal 1080p budget, but it
+		// does not prove the captured source is large enough to justify raising
+		// bitrate. Keep 1080p as the automatic upper budget; -bitrate remains the
+		// explicit way to allocate more for a genuinely high-resolution source.
+		if canvasWidth, canvasHeight := cfg.MaxWidth&^1, cfg.MaxHeight&^1; canvasWidth > 0 && canvasHeight > 0 {
+			if canvasWidth*canvasHeight < width*height {
+				width, height = canvasWidth, canvasHeight
+			}
+		}
+	}
 
 	bitrate := recommendedBitrateKbps(width, height, fps)
 	log.Printf("[CAPTURE] auto bitrate selected: %d kbps for %dx%d@%dfps", bitrate, width, height, fps)

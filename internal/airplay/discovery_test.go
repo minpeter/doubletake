@@ -189,6 +189,77 @@ func TestUnescapeDNSName(t *testing.T) {
 	}
 }
 
+func TestParseFeaturesUsesLowThenHighWireOrder(t *testing.T) {
+	if got, want := parseFeatures("0x89ABCDEF,0x01234567"), uint64(0x0123456789abcdef); got != want {
+		t.Fatalf("parseFeatures() = 0x%x, want 0x%x", got, want)
+	}
+	if got, want := parseFeatures("0x1e5a7ffff7"), uint64(0x1e5a7ffff7); got != want {
+		t.Fatalf("single-word parseFeatures() = 0x%x, want 0x%x", got, want)
+	}
+	if got := parseFeatures("not-a-feature-mask"); got != 0 {
+		t.Fatalf("invalid parseFeatures() = 0x%x, want 0", got)
+	}
+}
+
+func TestParseServiceEntryPreservesCapabilityAdvertisement(t *testing.T) {
+	entry := zeroconf.NewServiceEntry("Living\\ Room\\ TV", "_airplay._tcp", "local.")
+	entry.Port = 7000
+	entry.AddrIPv4 = []net.IP{net.ParseIP("192.168.1.124")}
+	entry.Text = []string{
+		"deviceid=46:7F:F0:39:E3:D8",
+		"fex=1d9/St5/Fzw4oY7cDg",
+		"features=0x4A7FDFD5,0x3C177FDE",
+		"flags=0x18644",
+		"model=AppleTV14,1",
+		"protovers=1.1",
+		"pi=92a5af57-631f-4453-8eb2-d90aa0558dea",
+		"psi=447FF039-E3D8-4828-A804-3A60F64DBFCA",
+		"pk=9d6c6f7b96fd15faad5b840fca30d2399daae390a7855ce7cd85fff2c604af0e",
+		"srcvers=980.77.2",
+		"osvers=27.0",
+		"vv=1",
+	}
+
+	device := parseServiceEntry(entry)
+	if device == nil {
+		t.Fatal("parseServiceEntry returned nil")
+	}
+	if device.Name != "Living Room TV" || device.IP != "192.168.1.124" || device.Port != 7000 {
+		t.Fatalf("address fields = %+v", device)
+	}
+	if device.Model != "AppleTV14,1" || device.DeviceID != "46:7F:F0:39:E3:D8" {
+		t.Fatalf("identity fields = %+v", device)
+	}
+	if device.SourceVersion != "980.77.2" || device.ProtocolVersion != "1.1" || device.VV != 1 {
+		t.Fatalf("version fields = %+v", device)
+	}
+	if device.PI != "92a5af57-631f-4453-8eb2-d90aa0558dea" || device.PSI != "447FF039-E3D8-4828-A804-3A60F64DBFCA" {
+		t.Fatalf("pairing identifiers = %+v", device)
+	}
+	if device.Features != 0x3c177fde4a7fdfd5 || device.Flags != 0x18644 {
+		t.Fatalf("legacy features/status = (0x%x, 0x%x)", device.Features, device.Flags)
+	}
+	if device.FEX != "1d9/St5/Fzw4oY7cDg" || device.FeaturesEx.Low64() != device.Features {
+		t.Fatalf("extended features = %q/%x", device.FEX, []byte(device.FeaturesEx))
+	}
+	if !device.HasFeature(99) {
+		t.Fatal("extended feature bit 99 was not preserved")
+	}
+	if device.RawTXT["osvers"] != "27.0" || device.RawTXT["fex"] != device.FEX {
+		t.Fatalf("raw TXT = %#v", device.RawTXT)
+	}
+}
+
+func TestFeatureSetSupportsBitsBeyondLegacyMask(t *testing.T) {
+	features, err := decodeFeatureSet("AAAAAAAAAAAI") // bit 67 in little-endian wire order
+	if err != nil {
+		t.Fatal(err)
+	}
+	if features.Has(66) || !features.Has(67) {
+		t.Fatalf("decoded feature bits = %x", []byte(features))
+	}
+}
+
 func testInterface(name string, flags net.Flags) net.Interface {
 	return net.Interface{Name: name, Flags: flags}
 }
@@ -223,6 +294,15 @@ func TestSupportsFairPlaySAP(t *testing.T) {
 	}
 	if !(&AirPlayDevice{Features: withFairPlay}).SupportsFairPlaySAP() {
 		t.Fatalf("AirPlayDevice with FPSAP bit did not advertise FairPlay SAP")
+	}
+}
+
+func TestSupportsScreenUsesMirroringFeatureNotRotation(t *testing.T) {
+	if !(&AirPlayDevice{Features: FeatureScreen}).SupportsScreen() {
+		t.Fatal("screen-mirroring feature was not recognized")
+	}
+	if (&AirPlayDevice{Features: FeatureScreenRotate}).SupportsScreen() {
+		t.Fatal("screen-rotation-only feature was mistaken for screen mirroring")
 	}
 }
 

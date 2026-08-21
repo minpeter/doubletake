@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"net"
 	"strings"
 	"testing"
@@ -9,6 +11,53 @@ import (
 
 	"doubletake/internal/airplay"
 )
+
+func TestRequiredPairingCredentialKind(t *testing.T) {
+	const (
+		passwordFlag  = uint64(1 << 7)
+		pinFlag       = uint64(1 << 9)
+		modernFeature = airplay.FeatureSystemPairing | airplay.FeatureTransientPairing | uint64(1<<38) | uint64(1<<46)
+		legacyFeature = modernFeature | uint64(1<<51)
+	)
+
+	for _, test := range []struct {
+		name string
+		info *airplay.ReceiverInfo
+		want CredentialKind
+	}{
+		{name: "modern password is not an SRP credential", info: &airplay.ReceiverInfo{Features: modernFeature, StatusFlags: passwordFlag}},
+		{name: "modern password suppresses advertised PIN", info: &airplay.ReceiverInfo{Features: modernFeature, StatusFlags: passwordFlag | pinFlag}},
+		{name: "modern PIN only", info: &airplay.ReceiverInfo{Features: modernFeature, StatusFlags: pinFlag}, want: CredentialKindPIN},
+		{name: "legacy password", info: &airplay.ReceiverInfo{Features: legacyFeature, StatusFlags: passwordFlag}, want: CredentialKindPassword},
+		{name: "legacy password wins over PIN", info: &airplay.ReceiverInfo{Features: legacyFeature, StatusFlags: passwordFlag | pinFlag}, want: CredentialKindPassword},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requiredPairingCredentialKind(test.info); got != test.want {
+				t.Fatalf("requiredPairingCredentialKind() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRestoreSavedPairingRestoresRawProtocol(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	client := airplay.NewAirPlayClient("127.0.0.1", 7000)
+	err = restoreSavedPairing(client, &airplay.SavedCredentials{
+		PairingID:       "pair-id",
+		Ed25519Public:   pub,
+		Ed25519Seed:     priv.Seed(),
+		PairingProtocol: airplay.PairingProtocolRaw,
+	})
+	if err != nil {
+		t.Fatalf("restoreSavedPairing: %v", err)
+	}
+	if got := client.PairingProtocol(); got != airplay.PairingProtocolRaw {
+		t.Fatalf("restored protocol = %q, want raw", got)
+	}
+}
 
 func TestHandleConnectSubmitsPINToPendingStream(t *testing.T) {
 	const (

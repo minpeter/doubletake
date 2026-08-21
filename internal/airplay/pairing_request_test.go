@@ -2,7 +2,9 @@ package airplay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -311,6 +313,87 @@ func TestPairTransientStopsWhenReceiverRequiresPINPairing(t *testing.T) {
 	if (*ReceiverInfo)(nil).RequiresPassword() {
 		t.Fatal("nil ReceiverInfo reports a configured password")
 	}
+}
+
+func TestRequiredPairingCredential(t *testing.T) {
+	const modernFeatures = FeatureSystemPairing | FeatureTransientPairing | uint64(1<<38) | uint64(1<<46)
+	const legacyFeatures = modernFeatures | uint64(1<<51)
+
+	for _, test := range []struct {
+		name   string
+		info   *ReceiverInfo
+		wanted PairingCredential
+	}{
+		{name: "missing info"},
+		{name: "modern transient", info: &ReceiverInfo{Features: modernFeatures}},
+		{name: "modern fixed password is Digest only", info: &ReceiverInfo{Features: modernFeatures, StatusFlags: statusFlagPasswordRequired}},
+		{name: "modern PIN only", info: &ReceiverInfo{Features: modernFeatures, StatusFlags: statusFlagPINRequiredForPairing}, wanted: PairingCredentialPIN},
+		{name: "modern password suppresses PIN", info: &ReceiverInfo{Features: modernFeatures, StatusFlags: statusFlagPasswordRequired | statusFlagPINRequiredForPairing}},
+		{name: "legacy fixed password", info: &ReceiverInfo{Features: legacyFeatures, StatusFlags: statusFlagPasswordRequired}, wanted: PairingCredentialPassword},
+		{name: "legacy PIN only", info: &ReceiverInfo{Features: legacyFeatures, StatusFlags: statusFlagPINRequiredForPairing}, wanted: PairingCredentialPIN},
+		{name: "legacy password wins over PIN", info: &ReceiverInfo{Features: legacyFeatures, StatusFlags: statusFlagPasswordRequired | statusFlagPINRequiredForPairing}, wanted: PairingCredentialPassword},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.info.RequiredPairingCredential(); got != test.wanted {
+				t.Fatalf("RequiredPairingCredential() = %d, want %d", got, test.wanted)
+			}
+		})
+	}
+}
+
+func TestModernPasswordAndPINFlagsStillStartTransientPairing(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	if err := clientConn.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &AirPlayClient{
+		conn: clientConn,
+		info: &ReceiverInfo{
+			Features:    FeatureSystemPairing | FeatureTransientPairing | uint64(1<<38) | uint64(1<<46),
+			StatusFlags: statusFlagPasswordRequired | statusFlagPINRequiredForPairing,
+		},
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		defer serverConn.Close()
+		request, err := readRTSPTestRequest(bufio.NewReader(serverConn))
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if request.method != "POST" || request.uri != "/pair-setup" {
+			serverDone <- fmt.Errorf("request = %s %s, want POST /pair-setup", request.method, request.uri)
+			return
+		}
+		if got := request.headers["x-apple-hkp"]; got != "4" {
+			serverDone <- fmt.Errorf("X-Apple-HKP = %q, want transient type 4", got)
+			return
+		}
+		message := tlv8Decode(request.body)
+		if !bytes.Equal(message[tlvState], []byte{1}) ||
+			!bytes.Equal(message[tlvMethod], []byte{0}) ||
+			len(message[tlvFlags]) != 4 ||
+			binary.LittleEndian.Uint32(message[tlvFlags]) != pairingFlagTransient {
+			serverDone <- fmt.Errorf("pair-setup M1 is not transient: %x", request.body)
+			return
+		}
+		serverDone <- writeRTSPTestResponse(serverConn, 500, nil, nil)
+	}()
+
+	if err := client.Pair(context.Background(), ""); err == nil {
+		t.Fatal("Pair succeeded after the scripted receiver rejected transient setup")
+	} else if errors.Is(err, ErrPINRequired) {
+		t.Fatalf("modern password+PIN flags incorrectly required full PIN pairing: %v", err)
+	}
+	waitPairingTestServer(t, serverDone)
 }
 
 func TestRokuTransientPairingStartsWithRawProtocol(t *testing.T) {

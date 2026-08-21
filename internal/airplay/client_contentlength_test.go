@@ -1,10 +1,14 @@
 package airplay
 
 import (
+	"encoding/binary"
+	"errors"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // A receiver answering with a negative Content-Length used to crash the sender:
@@ -93,5 +97,52 @@ func TestValidateContentLength(t *testing.T) {
 		if err := validateContentLength(tc.n); (err == nil) != tc.ok {
 			t.Errorf("validateContentLength(%d): err=%v, want ok=%v", tc.n, err, tc.ok)
 		}
+	}
+}
+
+func TestReadPlaintextErrorRequiresCompleteBody(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		_, _ = server.Write([]byte("RTSP/1.0 500 Error\r\nContent-Length: 5\r\n\r\nno"))
+		_ = server.Close()
+	}()
+
+	c := &AirPlayClient{conn: client}
+	_, _, err := c.readHTTPResponseWithTimeout(time.Second)
+	if err == nil || !strings.Contains(err.Error(), "read error response body") {
+		t.Fatalf("truncated plaintext error = %v, want body-read failure", err)
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		t.Fatalf("truncated plaintext error was misclassified as HTTP status: %v", err)
+	}
+}
+
+func TestReadEncryptedErrorRequiresCompleteBody(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	key := make([]byte, chacha20poly1305.KeySize)
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("RTSP/1.0 500 Error\r\nContent-Length: 5\r\n\r\nno")
+	length := make([]byte, 2)
+	binary.LittleEndian.PutUint16(length, uint16(len(plaintext)))
+	wire := append(append([]byte(nil), length...), aead.Seal(nil, make([]byte, 12), plaintext, length)...)
+	go func() {
+		_, _ = server.Write(wire)
+		_ = server.Close()
+	}()
+
+	c := &AirPlayClient{conn: client, encrypted: true, encReadKey: key}
+	_, _, err = c.readHTTPResponseWithTimeout(time.Second)
+	if err == nil || !strings.Contains(err.Error(), "read encrypted error body") {
+		t.Fatalf("truncated encrypted error = %v, want body-read failure", err)
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		t.Fatalf("truncated encrypted error was misclassified as HTTP status: %v", err)
 	}
 }

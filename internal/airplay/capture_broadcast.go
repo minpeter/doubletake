@@ -1,27 +1,55 @@
 package airplay
 
 import (
+	"errors"
 	"io"
 	"sync"
+	"time"
 )
 
+const (
+	// A video socket can legitimately spend up to two seconds in Write. At the
+	// maximum supported 12 Mbit/s bitrate that is about 3 MB of encoded video.
+	// Eight MiB leaves ample room for keyframe bursts and scheduler jitter while
+	// still putting a firm per-receiver bound on queued payload data.
+	broadcastSinkQueueBytes = 8 << 20
+
+	// The byte limit is normally reached first. This second bound prevents a
+	// pathological source that returns tiny reads from consuming unbounded slice
+	// metadata; it is deliberately generous for normal H.264 buffer cadence.
+	broadcastSinkQueueChunks = 4096
+
+	// Source shutdown normally races with consumers draining their last few
+	// buffers. Do not let a receiver that stopped reading keep Run alive forever.
+	broadcastSinkDrainTimeout = 2 * time.Second
+)
+
+var errBroadcastSinkBacklog = errors.New("broadcast sink backlog limit exceeded")
+
 // BroadcastCapture reads from a single ScreenCapture and fans the raw byte
-// stream out to multiple registered sinks. Each sink is a pipe-based reader
-// that can be passed to MirrorSession.StreamFrames just like a ScreenCapture.
+// stream out to multiple registered sinks. Each sink has an independent,
+// bounded queue, so a stalled receiver cannot stop capture or its peers.
 //
 // Usage:
 //
 //	bc := NewBroadcastCapture(underlying)
+//	go bc.Run()          // pumps bytes from the underlying capture
 //	sink1 := bc.AddSink()
 //	sink2 := bc.AddSink()
-//	go bc.Run()          // pumps bytes from the underlying capture
 //	go session1.StreamFrames(ctx, sink1.AsCapture(), 0)
 //	go session2.StreamFrames(ctx, sink2.AsCapture(), 0)
 type BroadcastCapture struct {
-	src  *ScreenCapture
-	mu   sync.Mutex
-	done chan struct{}
-	err  error // set once Run() exits
+	src     *ScreenCapture
+	mu      sync.Mutex
+	done    chan struct{}
+	err     error // set before done is closed
+	stopped bool
+	// sequence is reserved before each source Read. A late sink starts at the
+	// following sequence, which gives attachment an exact cutover even when a
+	// source read has completed but has not yet been fanned out.
+	sequence uint64
+
+	drainTimeout time.Duration
 
 	sinks []*BroadcastSink
 }
@@ -30,38 +58,75 @@ type BroadcastCapture struct {
 // Read interface as ScreenCapture and can be wrapped into a ScreenCapture-like
 // value via AsCapture().
 type BroadcastSink struct {
-	pr     *io.PipeReader
-	pw     *io.PipeWriter
-	closed bool
-	mu     sync.Mutex
+	owner *BroadcastCapture
+
+	mu   sync.Mutex
+	cond *sync.Cond
+
+	queue       [][]byte
+	headOffset  int
+	queuedBytes int
+
+	maxQueuedBytes  int
+	maxQueuedChunks int
+
+	inputClosed   bool // the source ended; drain queue, then return EOF
+	closed        bool // explicitly removed; discard queue and return EOF
+	doneClosed    bool
+	done          chan struct{}
+	startSequence uint64
 }
 
-// NewBroadcastCapture wraps src. Call AddSink before calling Run.
+func newBroadcastSink(owner *BroadcastCapture) *BroadcastSink {
+	s := &BroadcastSink{
+		owner:           owner,
+		maxQueuedBytes:  broadcastSinkQueueBytes,
+		maxQueuedChunks: broadcastSinkQueueChunks,
+		done:            make(chan struct{}),
+	}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+// NewBroadcastCapture wraps src. Sinks may be added before or while Run is
+// active; running without sinks simply drains the encoder until a session is
+// ready to consume frames.
 func NewBroadcastCapture(src *ScreenCapture) *BroadcastCapture {
 	return &BroadcastCapture{
-		src:  src,
-		done: make(chan struct{}),
+		src:          src,
+		done:         make(chan struct{}),
+		drainTimeout: broadcastSinkDrainTimeout,
 	}
 }
 
-// AddSink registers a new fan-out reader. Must be called before Run.
+// AddSink registers a new fan-out reader before or while Run is active.
 func (bc *BroadcastCapture) AddSink() *BroadcastSink {
-	pr, pw := io.Pipe()
-	s := &BroadcastSink{pr: pr, pw: pw}
+	s := newBroadcastSink(bc)
 	bc.mu.Lock()
+	if bc.stopped {
+		bc.mu.Unlock()
+		s.finish()
+		return s
+	}
+	s.startSequence = bc.sequence + 1
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s
 }
 
-// RemoveSink closes and removes a sink so it no longer receives data.
-// Safe to call concurrently with Run.
+// RemoveSink closes and removes a sink so it no longer receives data. Any
+// blocked Read is released immediately. It is safe to call concurrently with
+// Run or more than once.
 func (bc *BroadcastCapture) RemoveSink(s *BroadcastSink) {
-	s.close()
+	if s == nil {
+		return
+	}
+	s.abort()
+
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
-	for i, ss := range bc.sinks {
-		if ss == s {
+	for i, current := range bc.sinks {
+		if current == s {
 			bc.sinks = append(bc.sinks[:i], bc.sinks[i+1:]...)
 			return
 		}
@@ -69,53 +134,87 @@ func (bc *BroadcastCapture) RemoveSink(s *BroadcastSink) {
 }
 
 // Run pumps data from the underlying ScreenCapture to all registered sinks.
-// It returns when the capture ends or all sinks are removed. The caller
-// should run this in a dedicated goroutine.
+// It returns when the capture ends and every active sink has consumed the data
+// already queued for it, or after the bounded drain grace period. The caller
+// should run this in a dedicated goroutine; an empty sink list is intentionally
+// not terminal.
 func (bc *BroadcastCapture) Run() error {
 	buf := make([]byte, 256*1024)
-	defer func() {
-		bc.mu.Lock()
-		sinks := make([]*BroadcastSink, len(bc.sinks))
-		copy(sinks, bc.sinks)
-		bc.mu.Unlock()
-		for _, s := range sinks {
-			s.close()
-		}
-		close(bc.done)
-	}()
-
 	for {
-		n, err := bc.src.Read(buf)
+		// Reserve this read's sequence before blocking in the source. A sink added
+		// at any point after this reservation must begin with the next read, not
+		// with bytes that may have been captured before its session was ready.
+		bc.mu.Lock()
+		bc.sequence++
+		sequence := bc.sequence
+		bc.mu.Unlock()
+
+		n, readErr := bc.src.Read(buf)
 		if n > 0 {
-			chunk := buf[:n]
 			bc.mu.Lock()
-			sinks := make([]*BroadcastSink, len(bc.sinks))
-			copy(sinks, bc.sinks)
+			sinks := make([]*BroadcastSink, 0, len(bc.sinks))
+			for _, sink := range bc.sinks {
+				if sink.startSequence <= sequence {
+					sinks = append(sinks, sink)
+				}
+			}
 			bc.mu.Unlock()
 
-			if len(sinks) == 0 {
-				// No active sinks; keep draining to avoid blocking capture.
-				if err != nil {
-					return err
-				}
-				continue
-			}
-
-			for _, s := range sinks {
-				if writeErr := s.write(chunk); writeErr != nil {
-					// Sink is closed or broken; remove it.
-					bc.RemoveSink(s)
+			if len(sinks) > 0 {
+				// The payload is immutable after this point and can therefore be
+				// shared by all sink queues instead of copied once per receiver.
+				chunk := append([]byte(nil), buf[:n]...)
+				for _, s := range sinks {
+					if err := s.enqueue(chunk); err != nil {
+						// A receiver that accumulates more than the bounded
+						// backlog is detached without delaying healthy peers.
+						bc.RemoveSink(s)
+					}
 				}
 			}
 		}
-		if err != nil {
-			bc.err = err
-			return err
+		if readErr != nil {
+			bc.finish(readErr)
+			return readErr
 		}
 	}
 }
 
-// Done returns a channel that is closed when Run has finished.
+// finish stops accepting sinks, lets existing sinks drain, and only then
+// publishes BroadcastCapture completion.
+func (bc *BroadcastCapture) finish(err error) {
+	bc.mu.Lock()
+	bc.err = err
+	bc.stopped = true
+	sinks := append([]*BroadcastSink(nil), bc.sinks...)
+	bc.sinks = nil
+	bc.mu.Unlock()
+
+	for _, s := range sinks {
+		s.finish()
+	}
+	timer := time.NewTimer(bc.drainTimeout)
+	defer timer.Stop()
+	for i, s := range sinks {
+		select {
+		case <-s.done:
+		case <-timer.C:
+			// The grace period is shared by every sink, so shutdown is bounded
+			// regardless of receiver count. Aborting an already-drained sink is
+			// harmless and avoids a second bookkeeping pass.
+			for _, pending := range sinks[i:] {
+				pending.abort()
+			}
+			close(bc.done)
+			return
+		}
+	}
+	close(bc.done)
+}
+
+// Done returns a channel that is closed after Run has finished and all queued
+// sink data has either been consumed, explicitly discarded by closing the
+// sink, or discarded when the bounded drain grace period expires.
 func (bc *BroadcastCapture) Done() <-chan struct{} {
 	return bc.done
 }
@@ -137,44 +236,132 @@ func (bc *BroadcastCapture) Source() *ScreenCapture {
 
 // --- BroadcastSink ---
 
-func (s *BroadcastSink) write(p []byte) error {
-	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if closed {
-		return io.ErrClosedPipe
+// enqueue appends immutable capture data without waiting for the receiver. A
+// full queue is an error so BroadcastCapture can detach only that receiver.
+func (s *BroadcastSink) enqueue(p []byte) error {
+	if len(p) == 0 {
+		return nil
 	}
-	_, err := s.pw.Write(p)
-	return err
-}
 
-func (s *BroadcastSink) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return
+	if s.closed || s.inputClosed {
+		return io.ErrClosedPipe
 	}
-	s.closed = true
-	s.pr.CloseWithError(io.EOF)
-	s.pw.CloseWithError(io.EOF)
+	if len(s.queue) >= s.maxQueuedChunks || len(p) > s.maxQueuedBytes-s.queuedBytes {
+		return errBroadcastSinkBacklog
+	}
+	s.queue = append(s.queue, p)
+	s.queuedBytes += len(p)
+	s.cond.Signal()
+	return nil
 }
 
-// Read implements io.Reader — reads broadcast data. Blocks until data arrives
-// or the broadcast ends.
+// finish marks source EOF without discarding data already queued.
+func (s *BroadcastSink) finish() {
+	s.mu.Lock()
+	if !s.closed && !s.inputClosed {
+		s.inputClosed = true
+		if len(s.queue) == 0 {
+			s.closeDoneLocked()
+		}
+		s.cond.Broadcast()
+	}
+	s.mu.Unlock()
+}
+
+// abort discards queued data and releases a blocked reader immediately.
+func (s *BroadcastSink) abort() {
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		s.inputClosed = true
+		for i := range s.queue {
+			s.queue[i] = nil
+		}
+		s.queue = nil
+		s.headOffset = 0
+		s.queuedBytes = 0
+		s.closeDoneLocked()
+		s.cond.Broadcast()
+	}
+	s.mu.Unlock()
+}
+
+func (s *BroadcastSink) closeDoneLocked() {
+	if !s.doneClosed {
+		s.doneClosed = true
+		close(s.done)
+	}
+}
+
+// Read implements io.Reader. It blocks until data arrives, the source ends, or
+// the sink is explicitly closed.
 func (s *BroadcastSink) Read(p []byte) (int, error) {
-	return s.pr.Read(p)
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.queue) == 0 && !s.inputClosed && !s.closed {
+		s.cond.Wait()
+	}
+	if s.closed {
+		return 0, io.EOF
+	}
+	if len(s.queue) == 0 {
+		s.closeDoneLocked()
+		return 0, io.EOF
+	}
+
+	chunk := s.queue[0]
+	n := copy(p, chunk[s.headOffset:])
+	s.headOffset += n
+	s.queuedBytes -= n
+	if s.headOffset == len(chunk) {
+		s.queue[0] = nil
+		s.queue = s.queue[1:]
+		s.headOffset = 0
+		if len(s.queue) == 0 {
+			s.queue = nil
+			if s.inputClosed {
+				s.closeDoneLocked()
+				return n, io.EOF
+			}
+		}
+	}
+	return n, nil
+}
+
+type broadcastSinkReadCloser struct {
+	sink *BroadcastSink
+}
+
+func (r broadcastSinkReadCloser) Read(p []byte) (int, error) {
+	return r.sink.Read(p)
+}
+
+func (r broadcastSinkReadCloser) Close() error {
+	r.sink.Close()
+	return nil
 }
 
 // AsCapture wraps this sink in a synthetic ScreenCapture so it can be passed
 // directly to MirrorSession.StreamFrames.
 func (s *BroadcastSink) AsCapture() *ScreenCapture {
 	return &ScreenCapture{
-		stdout: s.pr,
-		waitCh: make(chan struct{}), // never closed; EOF comes from pipe
+		stdout: broadcastSinkReadCloser{sink: s},
+		waitCh: s.done,
 	}
 }
 
-// Close closes this sink, signalling EOF to its reader.
+// Close closes this sink, discarding queued data and signalling EOF to its
+// reader.
 func (s *BroadcastSink) Close() {
-	s.close()
+	if s.owner != nil {
+		s.owner.RemoveSink(s)
+		return
+	}
+	s.abort()
 }

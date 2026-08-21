@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"howett.net/plist"
 )
 
 func TestEncryptedEventChannelAcknowledgesSplitCommand(t *testing.T) {
@@ -28,7 +29,7 @@ func TestEncryptedEventChannelAcknowledgesSplitCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- serveEventChannel(ctx, clientChannel)
+		serveErr <- serveEventChannel(ctx, clientChannel, nil)
 	}()
 
 	commandBody := []byte(strings.Repeat("x", 2200))
@@ -73,7 +74,7 @@ func TestPlaintextEventChannelPreservesPipelinedRequests(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- serveEventChannel(ctx, clientChannel)
+		serveErr <- serveEventChannel(ctx, clientChannel, nil)
 	}()
 
 	body1 := []byte("first")
@@ -99,6 +100,76 @@ func TestPlaintextEventChannelPreservesPipelinedRequests(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("plaintext event server did not stop after cancellation")
+	}
+}
+
+func TestEventChannelUpdatesTimingPeerAndStillAcknowledges(t *testing.T) {
+	clientConn, receiverConn := net.Pipe()
+	defer clientConn.Close()
+	defer receiverConn.Close()
+
+	clientChannel, err := newEventChannel(clientConn, false, nil)
+	if err != nil {
+		t.Fatalf("create plaintext event channel: %v", err)
+	}
+	anchorLocal := time.Now().Add(-time.Second)
+	anchorTimestamp := compactTimestamp(10 * time.Second)
+	clock := &mediaClock{
+		anchorLocal:     anchorLocal,
+		anchorTimestamp: anchorTimestamp,
+		timelineID:      1,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- serveEventChannel(ctx, clientChannel, clock)
+	}()
+
+	const timeline = uint64(0x48e15caa8da00008)
+	body, err := plist.Marshal(map[string]interface{}{
+		"type": "updateTimingPeerInfo",
+		"value": map[string]interface{}{
+			"ClockID":   timeline,
+			"Addresses": []interface{}{"192.0.2.1"},
+		},
+	}, plist.BinaryFormat)
+	if err != nil {
+		t.Fatalf("encode timing peer update: %v", err)
+	}
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := receiverConn.Write(eventTestRequest(19, body))
+		writeErr <- err
+	}()
+	readEventTestResponse(t, bufio.NewReader(receiverConn), 19)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write timing peer update: %v", err)
+	}
+
+	clock.mu.RLock()
+	gotTimeline := clock.timelineID
+	gotAnchorLocal := clock.anchorLocal
+	gotAnchorTimestamp := clock.anchorTimestamp
+	clock.mu.RUnlock()
+	if gotTimeline != timeline {
+		t.Fatalf("timeline = 0x%016x, want 0x%016x", gotTimeline, timeline)
+	}
+	if !gotAnchorLocal.After(anchorLocal) {
+		t.Fatalf("anchor local time = %v, want after %v", gotAnchorLocal, anchorLocal)
+	}
+	if gotAnchorTimestamp <= anchorTimestamp {
+		t.Fatalf("anchor timestamp = 0x%016x, want after 0x%016x", gotAnchorTimestamp, anchorTimestamp)
+	}
+
+	cancel()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serve event channel after cancel: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("event server did not stop after cancellation")
 	}
 }
 

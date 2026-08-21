@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,44 +23,34 @@ type rtspTestRequest struct {
 	headers map[string]string
 }
 
-func TestSourceVersionForSession(t *testing.T) {
-	if got := sourceVersionForSession(false); got != legacyAirPlaySourceVersion {
-		t.Fatalf("legacy source version = %q, want %q", got, legacyAirPlaySourceVersion)
-	}
-	if got := sourceVersionForSession(true); got != modernAirPlaySourceVersion {
-		t.Fatalf("modern source version = %q, want %q", got, modernAirPlaySourceVersion)
-	}
-}
-
 func TestMirrorSetupRequestUsesProtocolSpecificTimingFields(t *testing.T) {
 	for _, test := range []struct {
 		name           string
-		encrypted      bool
+		protocol       string
+		sourceVersion  string
 		wantTimingPort bool
 		wantTimingPeer bool
 	}{
-		{name: "legacy NTP", wantTimingPort: true},
-		{name: "modern PTP", encrypted: true, wantTimingPeer: true},
+		{name: "legacy NTP", protocol: timingProtocolNTP, sourceVersion: legacyAirPlaySourceVersion, wantTimingPort: true},
+		{name: "modern PTP", protocol: timingProtocolPTP, sourceVersion: modernAirPlaySourceVersion, wantTimingPeer: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			protocol := timingProtocolForSession(test.encrypted)
-			sourceVersion := sourceVersionForSession(test.encrypted)
 			request := (mirrorSetupRequest{
 				deviceID:          "00:11:22:33:44:55",
 				sessionUUID:       "session",
-				sourceVersion:     sourceVersion,
-				timingProtocol:    protocol,
+				sourceVersion:     test.sourceVersion,
+				timingProtocol:    test.protocol,
 				timingPort:        6000,
 				timingPeerID:      "peer-id",
 				timingPeerAddress: "192.0.2.1",
 				name:              "sender",
 			}).sessionPlist()
 
-			if got := request["timingProtocol"]; got != protocol {
-				t.Fatalf("timingProtocol = %v, want %q", got, protocol)
+			if got := request["timingProtocol"]; got != test.protocol {
+				t.Fatalf("timingProtocol = %v, want %q", got, test.protocol)
 			}
-			if got := request["sourceVersion"]; got != sourceVersion {
-				t.Fatalf("sourceVersion = %v, want %q", got, sourceVersion)
+			if got := request["sourceVersion"]; got != test.sourceVersion {
+				t.Fatalf("sourceVersion = %v, want %q", got, test.sourceVersion)
 			}
 			_, hasTimingPort := request["timingPort"]
 			if hasTimingPort != test.wantTimingPort {
@@ -87,6 +78,46 @@ func TestMirrorSetupRequestUsesProtocolSpecificTimingFields(t *testing.T) {
 				if len(list) != 1 {
 					t.Fatalf("timingPeerList = %#v, want one peer", list)
 				}
+			}
+		})
+	}
+}
+
+func TestSetupShapeRejected(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "bad request", err: fmt.Errorf("audio SETUP: %w", &HTTPStatusError{StatusCode: 400}), want: true},
+		{name: "invalid state", err: &HTTPStatusError{StatusCode: 455}, want: true},
+		{name: "digest challenge", err: &HTTPStatusError{StatusCode: 401}},
+		{name: "transport error", err: io.EOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := setupShapeRejected(test.err); got != test.want {
+				t.Fatalf("setupShapeRejected(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestSetupOrderRejectedOnlyForProtocolResponses(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "bad request", err: &HTTPStatusError{StatusCode: 400}, want: true},
+		{name: "method not allowed", err: &HTTPStatusError{StatusCode: 405}, want: true},
+		{name: "invalid state", err: fmt.Errorf("control SETUP: %w", &HTTPStatusError{StatusCode: 455}), want: true},
+		{name: "server failure", err: &HTTPStatusError{StatusCode: 500}},
+		{name: "digest challenge", err: &HTTPStatusError{StatusCode: 401}},
+		{name: "transport error", err: io.EOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := setupOrderRejected(test.err); got != test.want {
+				t.Fatalf("setupOrderRejected(%v) = %t, want %t", test.err, got, test.want)
 			}
 		})
 	}
@@ -138,6 +169,141 @@ func TestModernStreamSetupPlistsContainOnlyStreams(t *testing.T) {
 				t.Fatalf("stream = %#v, want type %d", streams[0], streamType)
 			}
 		})
+	}
+}
+
+func TestSetupMirrorDigestRetryReusesStartedVideoPreparation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen RTSP: %v", err)
+	}
+	defer listener.Close()
+
+	responseBody, err := plist.Marshal(map[string]interface{}{
+		"skipRecord": false,
+		"info": map[string]interface{}{
+			"displays": []interface{}{map[string]interface{}{
+				"widthPixels":     int64(1920),
+				"heightPixels":    int64(1080),
+				"widthPixelsMax":  int64(3840),
+				"heightPixelsMax": int64(2160),
+			}},
+		},
+	}, plist.BinaryFormat)
+	if err != nil {
+		t.Fatalf("marshal control response: %v", err)
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+
+		for attempt := 0; attempt < 2; attempt++ {
+			control, err := readRTSPTestRequest(reader)
+			if err != nil {
+				serverErr <- fmt.Errorf("read control SETUP %d: %w", attempt+1, err)
+				return
+			}
+			if control.method != "SETUP" {
+				serverErr <- fmt.Errorf("request before Digest attempt %d = %s, want control SETUP", attempt+1, control.method)
+				return
+			}
+			if attempt == 1 && !strings.HasPrefix(control.headers["authorization"], "Digest ") {
+				serverErr <- fmt.Errorf("retried control SETUP omitted cached Digest authorization")
+				return
+			}
+			if err := writeRTSPTestResponse(conn, 200, nil, responseBody); err != nil {
+				serverErr <- err
+				return
+			}
+
+			record, err := readRTSPTestRequest(reader)
+			if err != nil {
+				serverErr <- fmt.Errorf("read RECORD %d: %w", attempt+1, err)
+				return
+			}
+			if record.method != "RECORD" {
+				serverErr <- fmt.Errorf("request after control SETUP %d = %s, want RECORD", attempt+1, record.method)
+				return
+			}
+			if attempt == 0 {
+				if err := writeRTSPTestResponse(conn, 401, map[string]string{
+					"WWW-Authenticate": `Digest realm="airplay", nonce="late-challenge"`,
+				}, nil); err != nil {
+					serverErr <- err
+					return
+				}
+				continue
+			}
+			if !strings.HasPrefix(record.headers["authorization"], "Digest ") {
+				serverErr <- fmt.Errorf("retried RECORD omitted cached Digest authorization")
+				return
+			}
+			// Stop after proving that the second negotiation crossed the video
+			// preparation boundary. A full media fixture is unnecessary here.
+			if err := writeRTSPTestResponse(conn, 500, nil, nil); err != nil {
+				serverErr <- err
+				return
+			}
+			serverErr <- nil
+			return
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := NewAirPlayClient("127.0.0.1", listener.Addr().(*net.TCPAddr).Port)
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
+
+	callbackCalls := 0
+	encoderStarts := 0
+	startedWidth, startedHeight := 0, 0
+	prepareVideo := func(width, height int) error {
+		callbackCalls++
+		if encoderStarts != 0 {
+			if width != startedWidth || height != startedHeight {
+				return fmt.Errorf("receiver changed canvas from %dx%d to %dx%d", startedWidth, startedHeight, width, height)
+			}
+			return nil
+		}
+		encoderStarts++
+		startedWidth, startedHeight = width, height
+		return nil
+	}
+
+	if _, err := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, prepareVideo); !errors.Is(err, ErrCredentialsRequired) {
+		t.Fatalf("first setup error = %v, want ErrCredentialsRequired", err)
+	}
+	client.SetPassword("configured password")
+	if _, err := client.SetupMirrorWithVideoPreparation(ctx, StreamConfig{NoAudio: true}, prepareVideo); err == nil {
+		t.Fatal("second setup unexpectedly completed past the scripted stop")
+	} else {
+		var statusErr *HTTPStatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != 500 {
+			t.Fatalf("second setup error = %v, want scripted HTTP 500", err)
+		}
+	}
+	if callbackCalls != 2 {
+		t.Fatalf("video preparation callbacks = %d, want one per setup attempt", callbackCalls)
+	}
+	if encoderStarts != 1 {
+		t.Fatalf("encoder starts = %d, want one shared start across Digest retry", encoderStarts)
+	}
+	if startedWidth != 1920 || startedHeight != 1080 {
+		t.Fatalf("started canvas = %dx%d, want 1920x1080", startedWidth, startedHeight)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -270,7 +436,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 	}
 	defer rtspListener.Close()
 
-	requests := make(chan rtspTestRequest, 8)
+	requests := make(chan rtspTestRequest, 10)
 	feedbackReceived := make(chan struct{}, 1)
 	serverErr := make(chan error, 1)
 	go func() {
@@ -283,6 +449,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 
 		reader := bufio.NewReader(conn)
 		timingPort := 0
+		controlSetups := 0
 		for {
 			req, err := readRTSPTestRequest(reader)
 			if err != nil {
@@ -304,6 +471,33 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 					return
 				}
 				streams, _ := setup["streams"].([]interface{})
+				if len(streams) == 0 {
+					controlSetups++
+					if controlSetups > 1 {
+						serverErr <- fmt.Errorf("received %d control SETUP attempts, want one", controlSetups)
+						return
+					}
+					if mirroring, _ := setup["isScreenMirroringSession"].(bool); !mirroring {
+						serverErr <- fmt.Errorf("control-first probe omitted session fields")
+						return
+					}
+					if update, ok := setup["updateSessionRequest"].(bool); !ok || update {
+						serverErr <- fmt.Errorf("control-first probe omitted updateSessionRequest=false")
+						return
+					}
+					combined, _ := setup["combinedGetInfoWithControlSetup"].(bool)
+					if !combined {
+						serverErr <- fmt.Errorf("first control SETUP omitted combined GetInfo request")
+						return
+					}
+					// Explicitly reject the artifact-preferred control-first shape so
+					// this test also exercises the one-way media-first negotiation.
+					if err := writeRTSPTestResponse(conn, 400, nil, nil); err != nil {
+						serverErr <- err
+						return
+					}
+					continue
+				}
 				if len(streams) != 1 {
 					serverErr <- fmt.Errorf("expected one stream in setup, got %d", len(streams))
 					return
@@ -342,7 +536,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 						serverErr <- fmt.Errorf("audio latencyMin = %d, want 0", got)
 						return
 					}
-					if got, want := plistInt(stream["latencyMax"]), int(samplesFor44k1(conservativePlayoutLatency)); got != want {
+					if got, want := plistInt(stream["latencyMax"]), int(samplesFor44k1(ntpPlayoutLatencyFloor)); got != want {
 						serverErr <- fmt.Errorf("audio latencyMax = %d, want %d", got, want)
 						return
 					}
@@ -447,6 +641,9 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	// -no-audio is also the escape hatch for receivers that advertise no screen
+	// audio codec we can encode. Timing and video setup must remain usable.
+	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	session, err := client.SetupMirror(ctx, StreamConfig{FPS: 30, NoAudio: true})
 	if err != nil {
@@ -482,7 +679,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 		t.Fatalf("Close: %v", err)
 	}
 
-	wantMethods := []string{"SETUP", "SETUP"}
+	wantMethods := []string{"SETUP", "SETUP", "SETUP"}
 	recordIndex := -1
 	if !skipRecord {
 		recordIndex = len(wantMethods)
@@ -503,18 +700,23 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 			t.Fatalf("request %d = %s, want %s", index, got[index].method, want)
 		}
 	}
-	if got[0].uri == got[1].uri {
+	const audioIndex = 1
+	const videoIndex = 2
+	if got[0].uri != got[audioIndex].uri {
+		t.Fatal("control-first probe should use the audio session URI")
+	}
+	if got[audioIndex].uri == got[videoIndex].uri {
 		t.Fatal("video SETUP should use a distinct URI from the audio control session")
 	}
-	for index := 2; index < len(got); index++ {
+	for index := videoIndex + 1; index < len(got); index++ {
 		if got[index].method == "POST" {
 			if got[index].uri != "/feedback" {
 				t.Fatalf("feedback URI = %s, want /feedback", got[index].uri)
 			}
 			continue
 		}
-		if got[index].uri != got[0].uri {
-			t.Fatalf("request %d URI = %s, want audio session URI %s", index, got[index].uri, got[0].uri)
+		if got[index].uri != got[audioIndex].uri {
+			t.Fatalf("request %d URI = %s, want audio session URI %s", index, got[index].uri, got[audioIndex].uri)
 		}
 	}
 	if recordIndex >= 0 {

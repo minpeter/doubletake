@@ -2,10 +2,54 @@ package airplay
 
 import (
 	"bytes"
+	"encoding/binary"
+	"io"
+	"math"
+	"net"
 	"testing"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
+
+func TestCodecFrameUsesEncodedRasterForAllRects(t *testing.T) {
+	sender, receiver := net.Pipe()
+	defer sender.Close()
+	defer receiver.Close()
+
+	session := &MirrorSession{
+		dataConn:    sender,
+		videoWidth:  1280,
+		videoHeight: 800,
+	}
+	done := make(chan error, 1)
+	go func() { done <- session.sendCodecFrame([]byte{1, 2, 3}, 0) }()
+
+	packet := make([]byte, 131)
+	if _, err := io.ReadFull(receiver, packet); err != nil {
+		t.Fatalf("read codec frame: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("send codec frame: %v", err)
+	}
+	floatAt := func(offset int) float32 {
+		return math.Float32frombits(binary.LittleEndian.Uint32(packet[offset : offset+4]))
+	}
+	for _, offset := range []int{16, 40, 56} {
+		if got := floatAt(offset); got != 1280 {
+			t.Errorf("width at offset %d = %v, want encoded width 1280", offset, got)
+		}
+	}
+	for _, offset := range []int{20, 44, 60} {
+		if got := floatAt(offset); got != 800 {
+			t.Errorf("height at offset %d = %v, want encoded height 800", offset, got)
+		}
+	}
+	for _, offset := range []int{32, 36, 48, 52} {
+		if got := floatAt(offset); got != 0 {
+			t.Errorf("rectangle origin at offset %d = %v, want 0", offset, got)
+		}
+	}
+}
 
 func TestIsFirstSlice(t *testing.T) {
 	// NAL header 0x61 (type 1), slice header starts with bit 1 → first_mb_in_slice=0
@@ -41,6 +85,27 @@ func TestSPSDimensions(t *testing.T) {
 	// Truncated SPS must be rejected.
 	if _, _, ok := spsDimensions([]byte{0x67, 0x42}); ok {
 		t.Fatal("expected truncated SPS to be rejected")
+	}
+}
+
+func TestCodecConfigCadence(t *testing.T) {
+	sps := []byte{0x67, 0x42, 0x00, 0x1f}
+	pps := []byte{0x68, 0xce, 0x06, 0xe2}
+	if !codecConfigNeedsSend(false, sps, pps, nil, nil) {
+		t.Fatal("first decoder configuration was suppressed")
+	}
+	if codecConfigNeedsSend(true, sps, pps, append([]byte(nil), sps...), append([]byte(nil), pps...)) {
+		t.Fatal("identical decoder configuration was repeated")
+	}
+	changedSPS := append([]byte(nil), sps...)
+	changedSPS[len(changedSPS)-1]++
+	if !codecConfigNeedsSend(true, changedSPS, pps, sps, pps) {
+		t.Fatal("changed SPS was not advertised")
+	}
+	changedPPS := append([]byte(nil), pps...)
+	changedPPS[len(changedPPS)-1]++
+	if !codecConfigNeedsSend(true, sps, changedPPS, sps, pps) {
+		t.Fatal("changed PPS was not advertised")
 	}
 }
 

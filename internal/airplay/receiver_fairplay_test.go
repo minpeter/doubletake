@@ -33,6 +33,27 @@ func TestReceiverFPSAPCompletesSenderExchange(t *testing.T) {
 	if !receiver.complete() {
 		t.Fatal("receiver did not mark FPSAP exchange complete")
 	}
+
+	rawKey := [16]byte{0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f}
+	ekey, err := sender.wrapKey(rawKey, bytes.NewReader(bytes.Repeat([]byte{0xa5}, 16)))
+	if err != nil {
+		t.Fatalf("wrap FairPlay key: %v", err)
+	}
+	unwrapped, err := receiver.unwrapKey(ekey[:])
+	if err != nil {
+		t.Fatalf("unwrap FairPlay key: %v", err)
+	}
+	if unwrapped != rawKey {
+		t.Fatalf("unwrapped key = %x, want %x", unwrapped, rawKey)
+	}
+
+	for _, index := range []int{16, 36, 56} {
+		tampered := ekey
+		tampered[index] ^= 1
+		if _, err := receiver.unwrapKey(tampered[:]); err == nil {
+			t.Fatalf("receiver accepted ekey tampered at byte %d", index)
+		}
+	}
 }
 
 func TestReceiverFPSAPRejectsMalformedAndOutOfOrderMessages(t *testing.T) {

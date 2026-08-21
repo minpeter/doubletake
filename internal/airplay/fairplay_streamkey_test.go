@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// The stream master key must be the raw FairPlay key on a legacy receiver and
-// the SHA-512 mixture on a HAP-paired one. The discriminator is whether the
-// channel is HAP-encrypted, not whether a shared secret happens to exist --
-// rawPairVerify stores one even though it leaves the channel unencrypted.
+// The stream master key is either the raw FairPlay key or its SHA-512 mixture
+// with the pair-verify secret. Physical AppleTV3 hardware takes the raw branch;
+// HAP receivers and UxPlay take the mixed branch even though UxPlay leaves its
+// control channel plaintext.
 func TestDeriveStreamMasterKey(t *testing.T) {
 	raw := bytes.Repeat([]byte{0xa5}, 16)
 	secret := bytes.Repeat([]byte{0x5a}, 32)
@@ -20,20 +20,20 @@ func TestDeriveStreamMasterKey(t *testing.T) {
 	mixed := h.Sum(nil)[:16]
 
 	for _, tc := range []struct {
-		name         string
-		secret       []byte
-		hapEncrypted bool
-		want         []byte
+		name      string
+		secret    []byte
+		mixSecret bool
+		want      []byte
 	}{
 		// The case issue #17 was about: rawPairVerify leaves a shared secret
 		// behind, but the receiver only ever saw ekey, which wraps the raw key.
-		{"legacy pairing, secret present", secret, false, raw},
-		{"legacy pairing, no secret", nil, false, raw},
-		{"HAP pairing", secret, true, mixed},
-		{"HAP flagged but no secret", nil, true, raw},
+		{"physical legacy receiver, secret present", secret, false, raw},
+		{"physical legacy receiver, no secret", nil, false, raw},
+		{"HAP or UxPlay pairing", secret, true, mixed},
+		{"mix requested but no secret", nil, true, raw},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := deriveStreamMasterKey(raw, tc.secret, tc.hapEncrypted)
+			got := deriveStreamMasterKey(raw, tc.secret, tc.mixSecret)
 			if !bytes.Equal(got, tc.want) {
 				t.Fatalf("got %x, want %x", got, tc.want)
 			}
@@ -53,9 +53,9 @@ func TestDeriveStreamMasterKeyBranchesDiffer(t *testing.T) {
 	}
 }
 
-// rawPairVerify must keep leaving the channel unencrypted, since that flag is
-// what now selects the derivation. If it ever sets c.encrypted, legacy
-// receivers silently regress to the mixed key and the picture goes black again.
+// rawPairVerify must keep leaving the channel unencrypted. Receiver policy may
+// independently request the UxPlay key mixture; physical AppleTV3 hardware
+// still relies on this transport flag remaining false to select its raw path.
 func TestRawPairVerifyDoesNotEnableHAPEncryption(t *testing.T) {
 	if !bytes.Contains(readSource(t, "pairing.go"), []byte("c.PairKeys.SharedSecret = shared")) {
 		t.Skip("pairing.go no longer stores a shared secret in the expected form")
@@ -70,7 +70,7 @@ func TestRawPairVerifyDoesNotEnableHAPEncryption(t *testing.T) {
 		body = body[:end]
 	}
 	if bytes.Contains(body, []byte("c.encrypted = true")) {
-		t.Error("rawPairVerify now enables HAP encryption; deriveStreamMasterKey " +
-			"would switch legacy receivers to the mixed key (see issue #17)")
+		t.Error("rawPairVerify now enables HAP encryption; physical AppleTV3 " +
+			"receivers would switch to the mixed key (see issue #17)")
 	}
 }

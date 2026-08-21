@@ -2,10 +2,14 @@ package airplay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -129,6 +133,80 @@ func TestReceiverMediaSessionRejectsOversizeVideoAndAcceptsNextConnection(t *tes
 	}
 }
 
+func TestReceiverMediaSessionDecryptsAndValidatesLegacyVideo(t *testing.T) {
+	key := bytes.Repeat([]byte{0x31}, 16)
+	iv := bytes.Repeat([]byte{0x72}, 16)
+	session, senderConn := newPipeReceiverMediaSession(t, key, iv)
+
+	senderCipher, err := newMirrorCipher(key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idr := receiverTestAVCC([]byte{0x65, 0x80})
+	writeReceiverMirrorPacket(t, senderConn, 0x00, 0x10, senderCipher.EncryptFrame(idr))
+	// Plaintext packets do not advance the legacy VCL cipher between frames.
+	writeReceiverMirrorPacket(t, senderConn, 0x02, 0, nil)
+	nonIDR := receiverTestAVCC([]byte{0x61}, []byte{0x41, 0x9a, 0x01})
+	writeReceiverMirrorPacket(t, senderConn, 0x00, 0, senderCipher.EncryptFrame(nonIDR))
+	if err := senderConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitReceiverPipeSession(t, session)
+
+	stats := session.Snapshot()
+	if stats.VideoFrames != 2 || stats.VideoKeyFrames != 1 || stats.VideoHeartbeats != 1 ||
+		stats.VideoDecrypted != 2 || stats.VideoCryptoErrors != 0 || stats.VideoMalformed != 0 {
+		t.Fatalf("legacy video stats = %+v", stats)
+	}
+}
+
+func TestReceiverMediaSessionRejectsCorruptLegacyVideo(t *testing.T) {
+	key := bytes.Repeat([]byte{0x14}, 16)
+	iv := bytes.Repeat([]byte{0x25}, 16)
+	session, senderConn := newPipeReceiverMediaSession(t, key, iv)
+	senderCipher, err := newMirrorCipher(key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := senderCipher.EncryptFrame(receiverTestAVCC([]byte{0x65, 0x80}))
+	ciphertext[0] ^= 0x80 // Corrupt the decrypted AVCC length deterministically.
+	writeReceiverMirrorPacket(t, senderConn, 0x00, 0x10, ciphertext)
+	_ = senderConn.Close()
+	waitReceiverPipeSession(t, session)
+
+	stats := session.Snapshot()
+	if stats.VideoFrames != 1 || stats.VideoDecrypted != 0 || stats.VideoCryptoErrors != 1 || stats.VideoMalformed != 1 {
+		t.Fatalf("corrupt legacy video stats = %+v", stats)
+	}
+}
+
+func TestValidateReceiverAVCCFrame(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		payload  []byte
+		keyframe bool
+		wantErr  bool
+	}{
+		{name: "IDR", payload: receiverTestAVCC([]byte{0x65, 0x80}), keyframe: true},
+		{name: "multiple non-IDR slices", payload: receiverTestAVCC([]byte{0x61}, []byte{0x42, 0x01})},
+		{name: "empty", wantErr: true},
+		{name: "truncated length", payload: []byte{0, 0, 0}, wantErr: true},
+		{name: "zero length", payload: []byte{0, 0, 0, 0}, wantErr: true},
+		{name: "oversize NAL", payload: []byte{0, 0, 0, 2, 0x61}, wantErr: true},
+		{name: "forbidden bit", payload: receiverTestAVCC([]byte{0xe5}), keyframe: true, wantErr: true},
+		{name: "non-VCL", payload: receiverTestAVCC([]byte{0x67}), wantErr: true},
+		{name: "IDR without flag", payload: receiverTestAVCC([]byte{0x65}), wantErr: true},
+		{name: "flag without IDR", payload: receiverTestAVCC([]byte{0x61}), keyframe: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateReceiverAVCCFrame(test.payload, test.keyframe)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateReceiverAVCCFrame() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestReceiverMediaSessionProbesLegacyTiming(t *testing.T) {
 	session := newTestReceiverMediaSession(t, receiverMediaConfig{BindIP: "127.0.0.1"})
 
@@ -189,6 +267,83 @@ func TestReceiverMediaSessionProbesLegacyTiming(t *testing.T) {
 	}
 }
 
+func TestReceiverMediaSessionAnswersSenderInitiatedTiming(t *testing.T) {
+	session := newTestReceiverMediaSession(t, receiverMediaConfig{
+		BindIP:          "127.0.0.1",
+		TimingResponder: true,
+	})
+	endpoint := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: session.Endpoints().TimingPort}
+	sender, err := net.DialUDP("udp4", nil, endpoint)
+	if err != nil {
+		t.Fatalf("dial receiver timing: %v", err)
+	}
+	defer sender.Close()
+	if err := sender.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set timing deadline: %v", err)
+	}
+
+	for sequence := uint16(1); sequence <= 3; sequence++ {
+		var request [32]byte
+		request[0], request[1] = 0x80, 0xd2
+		binary.BigEndian.PutUint16(request[2:4], sequence)
+		transmit := ntpBootTimestamp()
+		binary.BigEndian.PutUint64(request[24:32], transmit)
+		if _, err := sender.Write(request[:]); err != nil {
+			t.Fatalf("write timing probe %d: %v", sequence, err)
+		}
+		var reply [32]byte
+		if _, err := io.ReadFull(sender, reply[:]); err != nil {
+			t.Fatalf("read timing reply %d: %v", sequence, err)
+		}
+		if reply[0] != 0x80 || reply[1] != 0xd3 {
+			t.Fatalf("timing reply %d type = %02x%02x, want 80d3", sequence, reply[0], reply[1])
+		}
+		if reference := binary.BigEndian.Uint64(reply[8:16]); reference != transmit {
+			t.Fatalf("timing reply %d reference = 0x%016x, want 0x%016x", sequence, reference, transmit)
+		}
+	}
+
+	waitForReceiverMediaStats(t, session, func(stats receiverMediaStats) bool {
+		return stats.TimingProbes == 3 && stats.TimingReplies == 3
+	})
+	stats := session.Snapshot()
+	if stats.TimingErrors != 0 {
+		t.Fatalf("sender-initiated timing stats = %+v", stats)
+	}
+}
+
+func TestReceiverMediaTimingResponderIgnoresReplies(t *testing.T) {
+	session := newTestReceiverMediaSession(t, receiverMediaConfig{
+		BindIP:          "127.0.0.1",
+		TimingResponder: true,
+	})
+	sender, err := net.DialUDP("udp4", nil, &net.UDPAddr{
+		IP: net.ParseIP("127.0.0.1"), Port: session.Endpoints().TimingPort,
+	})
+	if err != nil {
+		t.Fatalf("dial receiver timing: %v", err)
+	}
+	defer sender.Close()
+	if err := sender.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set timing deadline: %v", err)
+	}
+	reply := make([]byte, 32)
+	reply[0], reply[1] = 0x80, 0xd3
+	if _, err := sender.Write(reply); err != nil {
+		t.Fatalf("write unsolicited timing reply: %v", err)
+	}
+	var unexpected [32]byte
+	if _, err := sender.Read(unexpected[:]); err == nil {
+		t.Fatal("receiver answered a timing reply and would create a loop")
+	} else if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read after unsolicited timing reply: %v", err)
+	}
+	stats := session.Snapshot()
+	if stats.TimingProbes != 0 || stats.TimingReplies != 0 || stats.TimingErrors != 0 {
+		t.Fatalf("unsolicited timing reply changed counters: %+v", stats)
+	}
+}
+
 func TestReceiverMediaSessionParentCancellationClosesActiveConnections(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	session, err := newReceiverMediaSession(ctx, receiverMediaConfig{})
@@ -246,6 +401,49 @@ func newTestReceiverMediaSession(t *testing.T, cfg receiverMediaConfig) *receive
 		}
 	})
 	return session
+}
+
+func newPipeReceiverMediaSession(t *testing.T, key, iv []byte) (*receiverMediaSession, net.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	session := &receiverMediaSession{
+		ctx: ctx, connections: make(map[net.Conn]struct{}),
+		maxVideoPayload: defaultReceiverMaxVideoPayload,
+	}
+	if err := session.configureLegacyVideo(key, iv); err != nil {
+		t.Fatalf("configure legacy video: %v", err)
+	}
+	receiverConn, senderConn := net.Pipe()
+	session.connections[receiverConn] = struct{}{}
+	session.wg.Add(1)
+	go session.drainVideo(receiverConn)
+	return session, senderConn
+}
+
+func waitReceiverPipeSession(t *testing.T, session *receiverMediaSession) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		session.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("receiver video worker did not stop")
+	}
+}
+
+func receiverTestAVCC(nals ...[]byte) []byte {
+	var payload []byte
+	for _, nal := range nals {
+		var length [4]byte
+		binary.BigEndian.PutUint32(length[:], uint32(len(nal)))
+		payload = append(payload, length[:]...)
+		payload = append(payload, nal...)
+	}
+	return payload
 }
 
 func dialReceiverMediaTCP(t *testing.T, port int) net.Conn {

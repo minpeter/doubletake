@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ type receiverMediaConfig struct {
 	BindIP            string
 	EventEncrypted    bool
 	EventSharedSecret []byte
+	TimingResponder   bool
 	MaxVideoPayload   uint32
 }
 
@@ -64,7 +66,11 @@ type receiverMediaStats struct {
 	VideoFrames       uint64
 	VideoKeyFrames    uint64
 	VideoHeartbeats   uint64
+	VideoDecrypted    uint64
+	VideoCryptoErrors uint64
 	VideoMalformed    uint64
+	VideoWidth        uint64
+	VideoHeight       uint64
 
 	AudioRTPPackets  uint64
 	AudioRTPBytes    uint64
@@ -93,7 +99,15 @@ func (s *receiverMediaStats) add(other receiverMediaStats) {
 	s.VideoFrames += other.VideoFrames
 	s.VideoKeyFrames += other.VideoKeyFrames
 	s.VideoHeartbeats += other.VideoHeartbeats
+	s.VideoDecrypted += other.VideoDecrypted
+	s.VideoCryptoErrors += other.VideoCryptoErrors
 	s.VideoMalformed += other.VideoMalformed
+	if other.VideoWidth > s.VideoWidth {
+		s.VideoWidth = other.VideoWidth
+	}
+	if other.VideoHeight > s.VideoHeight {
+		s.VideoHeight = other.VideoHeight
+	}
 	s.AudioRTPPackets += other.AudioRTPPackets
 	s.AudioRTPBytes += other.AudioRTPBytes
 	s.AudioRTCPPackets += other.AudioRTCPPackets
@@ -119,7 +133,11 @@ type receiverMediaCounters struct {
 	videoFrames       atomic.Uint64
 	videoKeyFrames    atomic.Uint64
 	videoHeartbeats   atomic.Uint64
+	videoDecrypted    atomic.Uint64
+	videoCryptoErrors atomic.Uint64
 	videoMalformed    atomic.Uint64
+	videoWidth        atomic.Uint64
+	videoHeight       atomic.Uint64
 
 	audioRTPPackets  atomic.Uint64
 	audioRTPBytes    atomic.Uint64
@@ -132,9 +150,9 @@ type receiverMediaCounters struct {
 }
 
 // receiverMediaSession owns the media listeners used by one receiver session.
-// It intentionally drains and accounts for traffic without decoding or
-// rendering it, making it suitable for deterministic protocol integration
-// tests and diagnostic receiver implementations.
+// It drains and accounts for traffic without decoding or rendering it. Legacy
+// FairPlay profiles can additionally decrypt and validate video access units,
+// making key-derivation regressions observable in protocol integration tests.
 type receiverMediaSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -149,6 +167,10 @@ type receiverMediaSession struct {
 	eventEncrypted  bool
 	eventSecret     []byte
 	maxVideoPayload uint32
+	videoCryptoMu   sync.RWMutex
+	legacyVideoKey  [16]byte
+	legacyVideoIV   [16]byte
+	legacyVideoSet  bool
 
 	connectionsMu sync.Mutex
 	connections   map[net.Conn]struct{}
@@ -255,11 +277,18 @@ func newReceiverMediaSession(parent context.Context, cfg receiverMediaConfig) (*
 		},
 	}
 
-	s.wg.Add(4)
+	workers := 4
+	if cfg.TimingResponder {
+		workers++
+	}
+	s.wg.Add(workers)
 	go s.acceptEvents()
 	go s.acceptVideo()
 	go s.drainUDP(audioRTPConn, &s.counters.audioRTPPackets, &s.counters.audioRTPBytes)
 	go s.drainUDP(audioRTCPConn, &s.counters.audioRTCPPackets, &s.counters.audioRTCPBytes)
+	if cfg.TimingResponder {
+		go s.respondLegacyTiming()
+	}
 	go func() {
 		<-ctx.Done()
 		_ = s.Close()
@@ -297,7 +326,11 @@ func (s *receiverMediaSession) Snapshot() receiverMediaStats {
 		VideoFrames:       c.videoFrames.Load(),
 		VideoKeyFrames:    c.videoKeyFrames.Load(),
 		VideoHeartbeats:   c.videoHeartbeats.Load(),
+		VideoDecrypted:    c.videoDecrypted.Load(),
+		VideoCryptoErrors: c.videoCryptoErrors.Load(),
 		VideoMalformed:    c.videoMalformed.Load(),
+		VideoWidth:        c.videoWidth.Load(),
+		VideoHeight:       c.videoHeight.Load(),
 		AudioRTPPackets:   audioRTPPackets,
 		AudioRTPBytes:     audioRTPBytes,
 		AudioRTCPPackets:  audioRTCPPackets,
@@ -507,6 +540,13 @@ func (s *receiverMediaSession) drainVideo(conn net.Conn) {
 	defer s.untrackConnection(conn)
 	defer conn.Close()
 
+	videoCipher, err := s.newLegacyVideoCipher()
+	if err != nil {
+		s.counters.videoCryptoErrors.Add(1)
+		dbg("[RECEIVER-VIDEO] initialize legacy cipher: %v", err)
+		return
+	}
+
 	header := make([]byte, receiverMirrorHeaderSize)
 	for {
 		if _, err := io.ReadFull(conn, header); err != nil {
@@ -526,16 +566,31 @@ func (s *receiverMediaSession) drainVideo(conn net.Conn) {
 			dbg("[RECEIVER-VIDEO] payload %d exceeds limit %d", payloadSize, s.maxVideoPayload)
 			return
 		}
+		var payload []byte
 		if payloadSize > 0 {
-			n, err := io.CopyN(io.Discard, conn, int64(payloadSize))
-			s.counters.videoBytes.Add(uint64(n))
-			s.counters.videoPayloadBytes.Add(uint64(n))
-			if err != nil {
-				if !receiverMediaClosed(s.ctx, err) {
-					s.counters.videoMalformed.Add(1)
-					dbg("[RECEIVER-VIDEO] read payload: %v", err)
+			if videoCipher != nil && header[4] == 0x00 {
+				payload = make([]byte, payloadSize)
+				n, err := io.ReadFull(conn, payload)
+				s.counters.videoBytes.Add(uint64(n))
+				s.counters.videoPayloadBytes.Add(uint64(n))
+				if err != nil {
+					if !receiverMediaClosed(s.ctx, err) {
+						s.counters.videoMalformed.Add(1)
+						dbg("[RECEIVER-VIDEO] read payload: %v", err)
+					}
+					return
 				}
-				return
+			} else {
+				n, err := io.CopyN(io.Discard, conn, int64(payloadSize))
+				s.counters.videoBytes.Add(uint64(n))
+				s.counters.videoPayloadBytes.Add(uint64(n))
+				if err != nil {
+					if !receiverMediaClosed(s.ctx, err) {
+						s.counters.videoMalformed.Add(1)
+						dbg("[RECEIVER-VIDEO] read payload: %v", err)
+					}
+					return
+				}
 			}
 		}
 
@@ -543,15 +598,111 @@ func (s *receiverMediaSession) drainVideo(conn net.Conn) {
 		switch header[4] {
 		case 0x00:
 			s.counters.videoFrames.Add(1)
-			if header[5]&0x10 != 0 {
+			keyframe := header[5]&0x10 != 0
+			if keyframe {
 				s.counters.videoKeyFrames.Add(1)
+			}
+			if videoCipher != nil {
+				plain := videoCipher.EncryptFrame(payload) // CTR encryption and decryption are identical.
+				if err := validateReceiverAVCCFrame(plain, keyframe); err != nil {
+					s.counters.videoCryptoErrors.Add(1)
+					s.counters.videoMalformed.Add(1)
+					dbg("[RECEIVER-VIDEO] legacy frame decryption failed validation: %v", err)
+					return
+				}
+				s.counters.videoDecrypted.Add(1)
 			}
 		case 0x01:
 			s.counters.videoCodecFrames.Add(1)
+			width := math.Float32frombits(binary.LittleEndian.Uint32(header[16:20]))
+			height := math.Float32frombits(binary.LittleEndian.Uint32(header[20:24]))
+			if width > 0 && height > 0 && width <= 16384 && height <= 16384 {
+				storeReceiverMaximum(&s.counters.videoWidth, uint64(width))
+				storeReceiverMaximum(&s.counters.videoHeight, uint64(height))
+			}
 		case 0x02:
 			s.counters.videoHeartbeats.Add(1)
 		}
 	}
+}
+
+func storeReceiverMaximum(counter *atomic.Uint64, value uint64) {
+	for current := counter.Load(); value > current; current = counter.Load() {
+		if counter.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+// configureLegacyVideo installs a receiver-side AES-CTR key. A fresh stream is
+// created for each accepted TCP connection; only encrypted VCL packets advance
+// it because codec configuration and heartbeat packets are plaintext.
+func (s *receiverMediaSession) configureLegacyVideo(key, iv []byte) error {
+	if len(key) != 16 || len(iv) != 16 {
+		return fmt.Errorf("legacy video cipher requires a 16-byte key and IV")
+	}
+	if _, err := newMirrorCipher(key, iv); err != nil {
+		return fmt.Errorf("validate legacy video cipher: %w", err)
+	}
+	s.videoCryptoMu.Lock()
+	copy(s.legacyVideoKey[:], key)
+	copy(s.legacyVideoIV[:], iv)
+	s.legacyVideoSet = true
+	s.videoCryptoMu.Unlock()
+	return nil
+}
+
+func (s *receiverMediaSession) newLegacyVideoCipher() (*mirrorCipher, error) {
+	s.videoCryptoMu.RLock()
+	configured := s.legacyVideoSet
+	key, iv := s.legacyVideoKey, s.legacyVideoIV
+	s.videoCryptoMu.RUnlock()
+	if !configured {
+		return nil, nil
+	}
+	return newMirrorCipher(key[:], iv[:])
+}
+
+// validateReceiverAVCCFrame validates the decrypted VCL access unit. Legacy
+// AES-CTR has no per-frame tag, so authenticated FairPlay key setup plus this
+// strict AVCC/NAL check is what makes wrong-key or corrupted frames observable
+// in the diagnostic receiver instead of counting opaque ciphertext as success.
+func validateReceiverAVCCFrame(payload []byte, keyframe bool) error {
+	if len(payload) == 0 {
+		return fmt.Errorf("empty AVCC access unit")
+	}
+	sawIDR := false
+	nalCount := 0
+	for len(payload) > 0 {
+		if len(payload) < 4 {
+			return fmt.Errorf("truncated AVCC NAL length")
+		}
+		nalLength := uint64(binary.BigEndian.Uint32(payload[:4]))
+		payload = payload[4:]
+		if nalLength == 0 || nalLength > uint64(len(payload)) {
+			return fmt.Errorf("invalid AVCC NAL length %d with %d bytes remaining", nalLength, len(payload))
+		}
+		nal := payload[:int(nalLength)]
+		payload = payload[int(nalLength):]
+		if nal[0]&0x80 != 0 {
+			return fmt.Errorf("H.264 forbidden_zero_bit is set")
+		}
+		nalType := nal[0] & 0x1f
+		if nalType < 1 || nalType > 5 {
+			return fmt.Errorf("unexpected VCL NAL type %d", nalType)
+		}
+		if nalType == 5 {
+			sawIDR = true
+		}
+		nalCount++
+	}
+	if keyframe != sawIDR {
+		return fmt.Errorf("keyframe flag is %t but decrypted access unit IDR is %t", keyframe, sawIDR)
+	}
+	if nalCount == 0 {
+		return fmt.Errorf("AVCC access unit contains no NAL units")
+	}
+	return nil
 }
 
 func (s *receiverMediaSession) drainUDP(conn *net.UDPConn, packets, bytes *atomic.Uint64) {
@@ -567,6 +718,49 @@ func (s *receiverMediaSession) drainUDP(conn *net.UDPConn, packets, bytes *atomi
 		}
 		packets.Add(1)
 		bytes.Add(uint64(n))
+	}
+}
+
+// respondLegacyTiming implements the inverse NTP role used by AirServer-style
+// receivers. The receiver advertises TimingPort and waits for the sender to
+// initiate three 0xd2 probes instead of probing the sender's timingPort.
+func (s *receiverMediaSession) respondLegacyTiming() {
+	defer s.wg.Done()
+	var request [32]byte
+	for {
+		n, from, err := s.timingConn.ReadFromUDP(request[:])
+		if err != nil {
+			if s.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				s.counters.timingErrors.Add(1)
+				dbg("[RECEIVER-TIMING] read failed: %v", err)
+			}
+			return
+		}
+		if n != len(request) || request[0] != 0x80 || request[1] != 0xd2 {
+			// A 0xd3 packet is a response to a receiver-originated probe. Ignore it
+			// rather than replying and creating a timing response loop.
+			if n >= 2 && request[0] == 0x80 && request[1] == 0xd3 {
+				continue
+			}
+			s.counters.timingErrors.Add(1)
+			continue
+		}
+		s.counters.timingProbes.Add(1)
+
+		reply := request
+		reply[0], reply[1] = 0x80, 0xd3
+		copy(reply[8:16], request[24:32])
+		now := ntpBootTimestamp()
+		binary.BigEndian.PutUint64(reply[16:24], now)
+		binary.BigEndian.PutUint64(reply[24:32], now)
+		if _, err := s.timingConn.WriteToUDP(reply[:], from); err != nil {
+			if s.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				s.counters.timingErrors.Add(1)
+				dbg("[RECEIVER-TIMING] reply failed: %v", err)
+			}
+			return
+		}
+		s.counters.timingReplies.Add(1)
 	}
 }
 

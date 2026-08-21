@@ -108,9 +108,10 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	dbg("[FP] wrapped fpAesKey: %02x", fpAesKey[:])
 	dbg("[FP] m3 first 32 bytes: %02x", c.fpM3[:min(32, len(c.fpM3))])
 
-	finalKey := deriveStreamMasterKey(c.fpAesKey, sharedSecret(c.PairKeys), c.encrypted)
-	if c.encrypted && len(sharedSecret(c.PairKeys)) > 0 {
-		dbg("[FP] hashed with SharedSecret (%d bytes)", len(sharedSecret(c.PairKeys)))
+	mixPairVerifyKey := c.PairKeys != nil && c.PairKeys.MixFairPlayKey
+	finalKey := deriveStreamMasterKey(c.fpAesKey, sharedSecret(c.PairKeys), mixPairVerifyKey)
+	if mixPairVerifyKey && len(sharedSecret(c.PairKeys)) > 0 {
+		dbg("[FP] mixed with pair-verify SharedSecret (%d bytes)", len(sharedSecret(c.PairKeys)))
 	} else {
 		dbg("[FP] using raw fpAesKey (legacy receiver or no SharedSecret)")
 	}
@@ -164,17 +165,12 @@ func sharedSecret(keys *PairKeys) []byte {
 //
 //	SHA-512(fairplay_decrypt(ekey) || ecdh_secret)[:16]
 //
-// A legacy receiver does not. ekey wraps the raw key, and that is the only key
-// material a legacy receiver ever sees, so it decrypts with that key directly.
-//
-// hapEncrypted is the discriminator, not the presence of a secret: rawPairVerify
-// stores a shared secret even though it deliberately leaves the channel
-// unencrypted, so keying off the secret alone mixed it in on the legacy path
-// too. The sender then encrypted with SHA-512(key || secret) while the receiver
-// decrypted with the raw key -- RTSP setup succeeded and the picture stayed
-// black. See issue #17.
-func deriveStreamMasterKey(rawKey, secret []byte, hapEncrypted bool) []byte {
-	if !hapEncrypted || len(secret) == 0 {
+// The PairKeys flag records the pair-verify mode which actually completed. HAP
+// always selects the mixture; raw pair-verify selects it by sending
+// X-Apple-PD. That keeps FairPlay derivation tied to negotiated protocol state
+// instead of a receiver name or model.
+func deriveStreamMasterKey(rawKey, secret []byte, mixPairVerifySecret bool) []byte {
+	if !mixPairVerifySecret || len(secret) == 0 {
 		return rawKey
 	}
 	h := sha512.New()

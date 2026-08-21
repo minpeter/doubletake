@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -36,6 +37,11 @@ type PairKeys struct {
 	SharedSecret   []byte
 	WriteKey       []byte
 	ReadKey        []byte
+	// MixFairPlayKey records the transformation negotiated by pair-verify.
+	// HAP always mixes its shared secret. The raw protocol requests the same
+	// transformation with X-Apple-PD unless the receiver advertises feature 27,
+	// the empirical compatibility signal for the original unmixed key path.
+	MixFairPlayKey bool
 }
 
 // TLV8 types for HomeKit-style pairing.
@@ -48,9 +54,16 @@ const (
 	tlvEncryptedData = 0x05
 	tlvState         = 0x06
 	tlvError         = 0x07
+	tlvRetryDelay    = 0x08
 	tlvSignature     = 0x0A
 	tlvACL           = 0x12
 	tlvFlags         = 0x13
+)
+
+const (
+	pairingErrorBackoff       = 3
+	pairSetupBackoffRetries   = 3
+	pairSetupMaximumRetryWait = 30 * time.Second
 )
 
 // Pairing flags.
@@ -65,6 +78,31 @@ const (
 	pairingTypeTransient     = 4
 	pairingTypeScreenCapture = 5
 )
+
+// pairingProtocol is learned from the exchange, rather than receiver identity.
+// Feature flags select the first probe; only a completed setup and verify pins
+// the protocol for subsequent verification attempts on the same client.
+type pairingProtocol uint8
+
+const (
+	pairingProtocolUnknown pairingProtocol = iota
+	pairingProtocolHAP
+	pairingProtocolRaw
+)
+
+// PairingProtocol reports the wire protocol which most recently completed on
+// this client. Persist it with the long-term identity so a later PairVerify
+// uses the same framing without relying on receiver identity or fingerprints.
+func (c *AirPlayClient) PairingProtocol() PairingProtocol {
+	switch c.pairingProtocol {
+	case pairingProtocolHAP:
+		return PairingProtocolHAP
+	case pairingProtocolRaw:
+		return PairingProtocolRaw
+	default:
+		return PairingProtocolUnknown
+	}
+}
 
 const defaultPairingClientName = "doubletake device"
 
@@ -118,6 +156,9 @@ func (c *AirPlayClient) pairVerifyHeaders() map[string]string {
 }
 
 func (c *AirPlayClient) effectivePairType() int {
+	if c.pairingProtocol == pairingProtocolRaw {
+		return pairingTypeLegacy
+	}
 	if c.info.PrefersLegacyPairing() {
 		return pairingTypeLegacy
 	}
@@ -174,9 +215,10 @@ var (
 
 // pairTransient performs transient pairing (no PIN required).
 func (c *AirPlayClient) pairTransient(ctx context.Context) error {
-	if c.info != nil && c.info.RequiresPINPairing() {
+	if c.info != nil && c.info.RequiredPairingCredential() == PairingCredentialPIN {
 		return ErrPINRequired
 	}
+	c.pairingProtocol = pairingProtocolUnknown
 	c.pairType = c.transientPairingType()
 
 	// Generate Ed25519 key pair for this session
@@ -199,18 +241,26 @@ func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) erro
 	if c.info != nil && c.info.usesModernPairing() && c.info.SupportsTransientPairing() {
 		dbg("[PAIR] receiver advertises modern transient pairing; using TLV8 directly")
 		if err := c.pairSetupTransient(ctx); err != nil {
-			return fmt.Errorf("pair-setup: %w", err)
+			if !isUnsupportedHAPPairSetup(err) {
+				return fmt.Errorf("pair-setup: %w", err)
+			}
+			dbg("[PAIR] advertised HAP pair-setup is unsupported (%v); probing raw AirPlay pairing", err)
+			if rawErr := c.performRawSetupAndVerify(ctx); rawErr != nil {
+				return fmt.Errorf("pair-setup: advertised HAP protocol was rejected (%v); raw fallback: %w", err, rawErr)
+			}
+			return nil
 		}
 		if err := c.PairVerify(ctx); err != nil {
 			return fmt.Errorf("pair-verify: %w", err)
 		}
+		c.pairingProtocol = pairingProtocolHAP
 		dbg("[PAIR] pair-verify complete, channel is now encrypted")
 		return nil
 	}
 
-	// Try raw binary pair-setup first (UxPlay / legacy AirPlay protocol).
+	// Try the original raw binary AirPlay pair-setup first.
 	// Send 32-byte Ed25519 public key, expect 32-byte server public key back.
-	dbg("[PAIR] trying raw binary pair-setup (UxPlay-compatible)")
+	dbg("[PAIR] trying raw binary AirPlay pair-setup")
 	serverPub, err := c.rawPairSetup(ctx)
 	if err != nil {
 		// Fall back to TLV8/HomeKit-style pair-setup (Apple TV)
@@ -222,17 +272,32 @@ func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) erro
 		if err := c.PairVerify(ctx); err != nil {
 			return fmt.Errorf("pair-verify: %w", err)
 		}
+		c.pairingProtocol = pairingProtocolHAP
 		dbg("[PAIR] pair-verify complete, channel is now encrypted")
 		return nil
 	}
 
 	// Raw pair-setup succeeded — store server's Ed25519 public key and use raw pair-verify
 	dbg("[PAIR] raw pair-setup OK, server Ed25519 pub: %02x", serverPub[:8])
+	return c.completeRawSetupAndVerify(ctx, serverPub)
+}
+
+// performRawSetupAndVerify probes the original binary AirPlay pairing
+// protocol. It deliberately takes no PIN/password: a playback password belongs
+// to HTTP Digest on receivers which advertise modern pairing.
+func (c *AirPlayClient) performRawSetupAndVerify(ctx context.Context) error {
+	serverPub, err := c.rawPairSetup(ctx)
+	if err != nil {
+		return fmt.Errorf("raw pair-setup: %w", err)
+	}
+	return c.completeRawSetupAndVerify(ctx, serverPub)
+}
+
+func (c *AirPlayClient) completeRawSetupAndVerify(ctx context.Context, serverPub []byte) error {
 	if c.info == nil {
 		c.info = &ReceiverInfo{}
 	}
 	c.info.PK = serverPub
-
 	dbg("[PAIR] starting raw pair-verify (no HAP encryption)")
 	if err := c.rawPairVerify(ctx); err != nil {
 		return fmt.Errorf("raw pair-verify: %w", err)
@@ -241,8 +306,26 @@ func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) erro
 	return nil
 }
 
+// isUnsupportedHAPPairSetup recognizes transport responses which mean the
+// receiver rejected the HAP wire format before returning a TLV8 M2. It is kept
+// intentionally narrow: authentication, rate limiting, HomeKit backoff, and
+// all errors after setup must surface to the caller instead of changing
+// protocols.
+func isUnsupportedHAPPairSetup(err error) bool {
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case 400, 404, 405, 415, 455, 500, 501, 505:
+		return true
+	default:
+		return false
+	}
+}
+
 // rawPairSetup sends a 32-byte Ed25519 public key to /pair-setup and expects
-// a 32-byte server Ed25519 public key back. This is the UxPlay / legacy AirPlay
+// a 32-byte server Ed25519 public key back. This is the original AirPlay
 // transient pair-setup protocol.
 func (c *AirPlayClient) rawPairSetup(ctx context.Context) ([]byte, error) {
 	resp, err := c.httpRequest("POST", "/pair-setup", "application/octet-stream", c.PairKeys.Ed25519Public)
@@ -267,14 +350,11 @@ func (c *AirPlayClient) pairSetupTransient(ctx context.Context) error {
 		{Tag: tlvFlags, Value: flags},
 	})
 
-	m2Bytes, err := c.httpRequest("POST", "/pair-setup", "application/octet-stream", m1, c.pairHeaders())
+	m2, err := exchangePairSetupM1(ctx, func() ([]byte, error) {
+		return c.httpRequest("POST", "/pair-setup", "application/octet-stream", m1, c.pairHeaders())
+	})
 	if err != nil {
-		return fmt.Errorf("M1: %w", err)
-	}
-
-	m2 := tlv8Decode(m2Bytes)
-	if errTLV, ok := m2[tlvError]; ok {
-		return fmt.Errorf("pair-setup M2 error: %d", errTLV[0])
+		return err
 	}
 
 	serverPub := m2[tlvPublicKey]
@@ -304,6 +384,7 @@ func (c *AirPlayClient) StartPINDisplay() error {
 
 // pairWithPIN performs PIN-based pairing.
 func (c *AirPlayClient) pairWithPIN(ctx context.Context, pin string) error {
+	c.pairingProtocol = pairingProtocolUnknown
 	c.pairType = c.pinPairingType()
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -326,6 +407,7 @@ func (c *AirPlayClient) performPairSetupAndVerify(ctx context.Context, pin strin
 	if err := c.PairVerify(ctx); err != nil {
 		return fmt.Errorf("pair-verify: %w", err)
 	}
+	c.pairingProtocol = pairingProtocolHAP
 	return nil
 }
 
@@ -337,14 +419,11 @@ func (c *AirPlayClient) pairSetup(ctx context.Context, pin string) error {
 		{Tag: tlvState, Value: []byte{0x01}},
 	})
 
-	m2Bytes, err := c.httpRequest("POST", "/pair-setup", "application/octet-stream", m1, c.pairHeaders())
+	m2, err := exchangePairSetupM1(ctx, func() ([]byte, error) {
+		return c.httpRequest("POST", "/pair-setup", "application/octet-stream", m1, c.pairHeaders())
+	})
 	if err != nil {
-		return fmt.Errorf("M1: %w", err)
-	}
-
-	m2 := tlv8Decode(m2Bytes)
-	if errTLV, ok := m2[tlvError]; ok {
-		return fmt.Errorf("pair-setup M2 error: %d", errTLV[0])
+		return err
 	}
 
 	salt := m2[tlvSalt]
@@ -354,6 +433,90 @@ func (c *AirPlayClient) pairSetup(ctx context.Context, pin string) error {
 	}
 
 	return c.completeSRPExchange(ctx, pin, salt, serverPubB)
+}
+
+// exchangePairSetupM1 sends an unchanged pair-setup M1 until the receiver
+// returns M2 or its bounded HomeKit backoff cannot be honored. Backoff happens
+// before SRP uses the PIN/password, so reporting it as a bad credential is both
+// misleading and prevents current Apple receivers from recovering.
+func exchangePairSetupM1(ctx context.Context, send func() ([]byte, error)) (map[byte][]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for retry := 0; ; retry++ {
+		m2Bytes, err := send()
+		if err != nil {
+			return nil, fmt.Errorf("M1: %w", err)
+		}
+		m2 := tlv8Decode(m2Bytes)
+		errorValue := m2[tlvError]
+		if len(errorValue) == 0 {
+			return m2, nil
+		}
+
+		code := int(errorValue[0])
+		if code != pairingErrorBackoff {
+			return nil, fmt.Errorf("pair-setup M2 error: %s (%d)", pairingErrorName(code), code)
+		}
+		if retry >= pairSetupBackoffRetries {
+			return nil, fmt.Errorf("pair-setup M2 error: backoff (3) persisted after %d retries", retry)
+		}
+		delay, err := pairingRetryDelay(m2[tlvRetryDelay])
+		if err != nil {
+			return nil, fmt.Errorf("pair-setup M2 backoff: %w", err)
+		}
+		dbg("[PAIR] receiver requested pair-setup backoff for %v (retry %d/%d)", delay, retry+1, pairSetupBackoffRetries)
+		if delay == 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, fmt.Errorf("pair-setup M2 backoff: %w", ctx.Err())
+		}
+	}
+}
+
+func pairingRetryDelay(value []byte) (time.Duration, error) {
+	if len(value) == 0 || len(value) > 8 {
+		return 0, fmt.Errorf("invalid RetryDelay length %d", len(value))
+	}
+	var seconds uint64
+	for index, octet := range value {
+		seconds |= uint64(octet) << (8 * index)
+	}
+	if seconds > uint64(pairSetupMaximumRetryWait/time.Second) {
+		return 0, fmt.Errorf("RetryDelay %ds exceeds %v limit", seconds, pairSetupMaximumRetryWait)
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func pairingErrorName(code int) string {
+	switch code {
+	case 1:
+		return "unknown"
+	case 2:
+		return "authentication"
+	case pairingErrorBackoff:
+		return "backoff"
+	case 4:
+		return "maximum peers"
+	case 5:
+		return "maximum tries"
+	case 6:
+		return "unavailable"
+	case 7:
+		return "busy"
+	default:
+		return "unknown"
+	}
 }
 
 // completeSRPExchange finishes SRP from M3 onward (shared by PIN and transient flows).
@@ -502,6 +665,13 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 
 // pairVerify establishes an encrypted channel using X25519 + Ed25519.
 func (c *AirPlayClient) PairVerify(ctx context.Context) error {
+	if c.pairingProtocol == pairingProtocolRaw {
+		return c.rawPairVerify(ctx)
+	}
+	return c.hapPairVerify(ctx)
+}
+
+func (c *AirPlayClient) hapPairVerify(ctx context.Context) error {
 	// Generate ephemeral X25519 key pair
 	var clientPrivate, clientPublic [32]byte
 	if _, err := rand.Read(clientPrivate[:]); err != nil {
@@ -622,6 +792,8 @@ func (c *AirPlayClient) PairVerify(ctx context.Context) error {
 	c.encWriteNonce = 0
 	c.encReadNonce = 0
 	c.encrypted = true
+	c.PairKeys.MixFairPlayKey = true
+	c.pairingProtocol = pairingProtocolHAP
 	dbg("[PAIR-VERIFY] encryption ENABLED (HAP framing, nonces at 0)")
 
 	return nil
@@ -711,9 +883,8 @@ func nonceBytes(n uint64) []byte {
 	return nonce
 }
 
-// rawPairVerify performs a non-HAP ("AirMyPC-style") pair-verify that keeps the
-// connection in plaintext. This is required because Apple TV rejects FairPlay
-// fp-setup phase 2 over HAP-encrypted connections.
+// rawPairVerify performs the original non-HAP pair-verify, which keeps the
+// control connection in plaintext.
 //
 // Protocol (raw binary, NOT TLV8):
 //
@@ -727,6 +898,17 @@ func nonceBytes(n uint64) []byte {
 //	key = SHA-512("Pair-Verify-AES-Key" || X25519_shared_secret)[:16]
 //	iv  = SHA-512("Pair-Verify-AES-IV"  || X25519_shared_secret)[:16]
 func (c *AirPlayClient) rawPairVerify(ctx context.Context) error {
+	// X-Apple-PD asks the receiver to apply the pair-verify shared secret to
+	// FairPlay key derivation. Apple's senders advertise it unconditionally, but
+	// observed raw receivers split on feature 27: those advertising the original
+	// legacy-pairing capability require the unmixed key path, while those without
+	// it require PD mixing. Keep this empirical exception capability-based.
+	mixFairPlayKey := c.info == nil || !c.info.SupportsLegacyPairing()
+	var verifyHeaders map[string]string
+	if mixFairPlayKey {
+		verifyHeaders = map[string]string{"X-Apple-PD": "1"}
+	}
+
 	// Generate ephemeral X25519 key pair
 	var clientPrivate [32]byte
 	rand.Read(clientPrivate[:])
@@ -741,7 +923,7 @@ func (c *AirPlayClient) rawPairVerify(ctx context.Context) error {
 
 	dbg("[RAW-PV] V1: sending 68 bytes (X25519 pub + Ed25519 pub)")
 	dbg("[RAW-PV] V1 hex: %02x", v1)
-	v2, err := c.rawRequest("POST", "/pair-verify", "application/octet-stream", v1)
+	v2, err := c.rawRequest("POST", "/pair-verify", "application/octet-stream", v1, verifyHeaders)
 	if err != nil {
 		return fmt.Errorf("V1: %w", err)
 	}
@@ -809,7 +991,7 @@ func (c *AirPlayClient) rawPairVerify(ctx context.Context) error {
 	copy(v3[4:68], encryptedClientSig)
 
 	dbg("[RAW-PV] V3: sending encrypted proof (68 bytes)")
-	v4, err := c.rawRequest("POST", "/pair-verify", "application/octet-stream", v3)
+	v4, err := c.rawRequest("POST", "/pair-verify", "application/octet-stream", v3, verifyHeaders)
 	if err != nil {
 		return fmt.Errorf("V3: %w", err)
 	}
@@ -822,6 +1004,9 @@ func (c *AirPlayClient) rawPairVerify(ctx context.Context) error {
 	// Store shared secret for potential stream key derivation,
 	// but do NOT enable HAP encryption on the control channel
 	c.PairKeys.SharedSecret = shared
+	c.PairKeys.MixFairPlayKey = mixFairPlayKey
+	c.pairType = pairingTypeLegacy
+	c.pairingProtocol = pairingProtocolRaw
 	return nil
 }
 

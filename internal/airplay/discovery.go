@@ -2,25 +2,77 @@ package airplay
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/grandcat/zeroconf"
 )
 
 // AirPlayDevice represents a discovered AirPlay receiver.
 type AirPlayDevice struct {
-	Name     string
-	Model    string
-	IP       string
-	Port     int
-	DeviceID string
-	Features uint64
-	PK       string // hex-encoded Ed25519 public key
-	Flags    uint64
+	Name            string
+	Model           string
+	IP              string
+	Port            int
+	DeviceID        string
+	Features        uint64
+	FeaturesEx      FeatureSet
+	FEX             string
+	PK              string // hex-encoded Ed25519 public key
+	Flags           uint64
+	SourceVersion   string
+	ProtocolVersion string
+	VV              uint64
+	PI              string
+	PSI             string
+	RawTXT          map[string]string
+}
+
+// FeatureSet is AirPlay's arbitrary-length, little-endian feature bit vector.
+// mDNS publishes it as base64 in fex; /info publishes the same representation
+// as featuresEx.
+type FeatureSet []byte
+
+// Has reports whether the numbered AirPlay feature bit is set.
+func (f FeatureSet) Has(bit uint) bool {
+	byteIndex := bit / 8
+	return byteIndex < uint(len(f)) && f[byteIndex]&(1<<uint(bit%8)) != 0
+}
+
+// Low64 returns the legacy 64-bit prefix of the feature vector.
+func (f FeatureSet) Low64() uint64 {
+	var low [8]byte
+	copy(low[:], f)
+	return binary.LittleEndian.Uint64(low[:])
+}
+
+func (f FeatureSet) clone() FeatureSet {
+	return append(FeatureSet(nil), f...)
+}
+
+// UnmarshalPlist accepts both the base64 string used by current Apple
+// receivers and data values used by some third-party implementations.
+func (f *FeatureSet) UnmarshalPlist(unmarshal func(interface{}) error) error {
+	var encoded string
+	if err := unmarshal(&encoded); err == nil {
+		decoded, err := decodeFeatureSet(encoded)
+		if err != nil {
+			return err
+		}
+		*f = decoded
+		return nil
+	}
+
+	var data []byte
+	if err := unmarshal(&data); err != nil {
+		return err
+	}
+	*f = append((*f)[:0], data...)
+	return nil
 }
 
 // DiscoverAirPlayDevices browses the local network for AirPlay receivers.
@@ -175,19 +227,47 @@ func parseServiceEntry(entry *zeroconf.ServiceEntry) *AirPlayDevice {
 		dev.IP = entry.AddrIPv6[0].String()
 	}
 
-	txt := parseTXT(entry.Text)
+	populateDeviceFromTXT(dev, parseTXT(entry.Text))
+
+	return dev
+}
+
+func populateDeviceFromTXT(dev *AirPlayDevice, txt map[string]string) {
+	dev.RawTXT = cloneTXT(txt)
 	dev.Model = txt["model"]
 	dev.DeviceID = txt["deviceid"]
 	dev.PK = txt["pk"]
+	dev.FEX = txt["fex"]
+	dev.SourceVersion = txt["srcvers"]
+	dev.ProtocolVersion = txt["protovers"]
+	dev.PI = txt["pi"]
+	dev.PSI = txt["psi"]
 
+	if dev.FEX != "" {
+		dev.FeaturesEx, _ = decodeFeatureSet(dev.FEX)
+	}
 	if f := txt["features"]; f != "" {
 		dev.Features = parseFeatures(f)
+	} else {
+		dev.Features = dev.FeaturesEx.Low64()
 	}
 	if f := txt["flags"]; f != "" {
-		fmt.Sscanf(f, "0x%x", &dev.Flags)
+		dev.Flags, _ = strconv.ParseUint(f, 0, 64)
 	}
+	if vv := txt["vv"]; vv != "" {
+		dev.VV, _ = strconv.ParseUint(vv, 0, 64)
+	}
+}
 
-	return dev
+func cloneTXT(txt map[string]string) map[string]string {
+	if txt == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(txt))
+	for key, value := range txt {
+		clone[key] = value
+	}
+	return clone
 }
 
 func parseTXT(records []string) map[string]string {
@@ -229,39 +309,85 @@ func isASCIIDigit(b byte) bool {
 	return b >= '0' && b <= '9'
 }
 
-// parseFeatures parses the AirPlay features string "0xHIGH,0xLOW" into a 64-bit value.
+// parseFeatures parses AirPlay's legacy "0xLOW32,0xHIGH32" wire value.
 func parseFeatures(s string) uint64 {
 	parts := strings.Split(s, ",")
 	if len(parts) != 2 {
-		var v uint64
-		fmt.Sscanf(s, "0x%x", &v)
+		v, _ := strconv.ParseUint(strings.TrimSpace(s), 0, 64)
 		return v
 	}
-	var lo, hi uint64
-	fmt.Sscanf(parts[0], "0x%x", &lo)
-	fmt.Sscanf(parts[1], "0x%x", &hi)
+	lo, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 0, 32)
+	if err != nil {
+		return 0
+	}
+	hi, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 0, 32)
+	if err != nil {
+		return 0
+	}
 	return hi<<32 | lo
+}
+
+func decodeFeatureSet(s string) (FeatureSet, error) {
+	s = strings.TrimSpace(s)
+	decoded, err := base64.RawStdEncoding.DecodeString(s)
+	if err != nil {
+		decoded, err = base64.StdEncoding.DecodeString(s)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("decode AirPlay extended features: %w", err)
+	}
+	return FeatureSet(decoded), nil
 }
 
 // Feature bit constants for AirPlay receivers.
 const (
-	FeatureScreen           uint64 = 1 << 8
-	FeatureAudio            uint64 = 1 << 10
-	FeatureFPSAP25          uint64 = 1 << 14
-	FeatureHomeKitPairing   uint64 = 1 << 17
-	FeatureSystemPairing    uint64 = 1 << 43
-	FeatureTransientPairing uint64 = 1 << 48
-	FeatureUDPMirroring     uint64 = 1 << 49
+	FeatureScreen         uint64 = 1 << 7
+	FeatureScreenRotate   uint64 = 1 << 8
+	FeatureAudio          uint64 = 1 << 10
+	FeatureFPSAP25        uint64 = 1 << 14
+	FeatureHomeKitPairing uint64 = 1 << 17
+	FeatureLegacyPairing  uint64 = 1 << 27
+	// Apple's APEndpointDisplayDescription defaulting path uses feature 28 to
+	// select a 1920x1080 display when the receiver omits displays[]; without it,
+	// the legacy default is 1280x720.
+	featureDefaultDisplay1080p uint64 = 1 << 28
+	FeatureSystemPairing       uint64 = 1 << 43
+	FeatureTransientPairing    uint64 = 1 << 48
+	FeatureUDPMirroring        uint64 = 1 << 49
 
-	// These masks mirror the receiver classification used by Apple's sender.
-	// Third-party receivers commonly copy broad modern feature masks, so bits
-	// 43/48 alone are not enough to select the CoreUtils/HAP pairing protocol.
+	// Apple defines the CoreUtils mask from bits 38/43/46/48 and identifies
+	// third-party implementations with bits 26/51. Apple's own CoreUtils test
+	// does not subtract the latter; doing so here is an empirical initial-probe
+	// choice for receivers which copy the modern bits but implement HKP. The
+	// bounded pairing fallback still lets the wire exchange determine the result.
 	featureThirdPartyReceiverMask = uint64(1<<26 | 1<<51)
 	featureCoreUtilsPairingMask   = uint64(1<<38 | 1<<43 | 1<<46 | 1<<48)
 )
 
 func (d *AirPlayDevice) SupportsScreen() bool {
-	return d.Features&FeatureScreen != 0
+	return d.HasFeature(7)
+}
+
+// HasFeature reports whether a legacy or extended advertised feature is set.
+func (d *AirPlayDevice) HasFeature(bit uint) bool {
+	if d == nil {
+		return false
+	}
+	if bit < 64 {
+		return d.Features&(uint64(1)<<bit) != 0
+	}
+	return d.FeaturesEx.Has(bit)
+}
+
+// HasFeature reports whether a legacy or extended /info feature is set.
+func (i *ReceiverInfo) HasFeature(bit uint) bool {
+	if i == nil {
+		return false
+	}
+	if bit < 64 {
+		return i.Features&(uint64(1)<<bit) != 0
+	}
+	return i.FeaturesEx.Has(bit)
 }
 
 func (d *AirPlayDevice) SupportsTransientPairing() bool {
@@ -269,20 +395,33 @@ func (d *AirPlayDevice) SupportsTransientPairing() bool {
 }
 
 func (i *ReceiverInfo) SupportsTransientPairing() bool {
-	return i != nil && supportsTransientPairing(i.Features)
+	return i != nil && (i.HasFeature(43) || i.HasFeature(48))
 }
 
 func supportsTransientPairing(features uint64) bool {
 	return features&(FeatureTransientPairing|FeatureSystemPairing) != 0
 }
 
+// SupportsLegacyPairing reports the original HKP pairing feature (bit 27).
+func (d *AirPlayDevice) SupportsLegacyPairing() bool {
+	return d != nil && d.HasFeature(27)
+}
+
+// SupportsLegacyPairing reports the original HKP pairing feature (bit 27).
+func (i *ReceiverInfo) SupportsLegacyPairing() bool {
+	return i != nil && i.HasFeature(27)
+}
+
 // usesModernPairing reports whether the receiver can use the first-party
 // CoreUtils/HAP profile directly. Third-party receivers retain HKP type 3 and
 // legacy session setup even when they copy the modern pairing feature bits.
 func (i *ReceiverInfo) usesModernPairing() bool {
-	return i != nil &&
-		i.Features&featureCoreUtilsPairingMask != 0 &&
-		i.Features&featureThirdPartyReceiverMask == 0
+	if i == nil {
+		return false
+	}
+	coreUtils := i.HasFeature(38) || i.HasFeature(43) || i.HasFeature(46) || i.HasFeature(48)
+	thirdParty := i.HasFeature(26) || i.HasFeature(51)
+	return coreUtils && !thirdParty
 }
 
 // PrefersLegacyPairing reports whether protocol probing classified the
@@ -292,21 +431,9 @@ func (i *ReceiverInfo) PrefersLegacyPairing() bool {
 }
 
 func (d *AirPlayDevice) SupportsFairPlaySAP() bool {
-	return d.Features&FeatureFPSAP25 != 0
+	return d != nil && d.HasFeature(14)
 }
 
 func (i *ReceiverInfo) SupportsFairPlaySAP() bool {
-	return i != nil && i.Features&FeatureFPSAP25 != 0
-}
-
-// playoutLatencyFloor returns the minimum playout lead this receiver needs.
-// Modern Apple receivers advertise FairPlay SAP and have robust audio jitter
-// buffers, so they can play at very low latency (floor 0). Receivers without it
-// (Roku and other third-party AirPlay implementations) need a conservative lead
-// or they drop audio they can no longer schedule.
-func (i *ReceiverInfo) playoutLatencyFloor() time.Duration {
-	if i != nil && i.SupportsFairPlaySAP() {
-		return 0
-	}
-	return conservativePlayoutLatency
+	return i != nil && i.HasFeature(14)
 }

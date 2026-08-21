@@ -69,9 +69,7 @@ func TestPINRequiredPairingStaysOnOriginalConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create daemon: %v", err)
 	}
-	t.Cleanup(func() {
-		d.handleDisconnect(Request{})
-	})
+	t.Cleanup(d.Shutdown)
 
 	response := d.handleConnect(Request{Cmd: "connect", Target: host, Port: port})
 	if !response.OK {
@@ -166,7 +164,7 @@ func TestPINRequiredPairingStaysOnOriginalConnection(t *testing.T) {
 	pinFlowWaitForState(t, d, StateIdle)
 }
 
-func TestPasswordTakesPrecedenceOverPINWithoutStartingDisplay(t *testing.T) {
+func TestModernPasswordAndPINFlagsUseTransientPairingWithoutStartingDisplay(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -177,7 +175,7 @@ func TestPasswordTakesPrecedenceOverPINWithoutStartingDisplay(t *testing.T) {
 		"name":        "Password TV",
 		"model":       "AppleTV-Test",
 		"deviceID":    "00:11:22:33:44:66",
-		"features":    uint64(airplay.FeatureSystemPairing),
+		"features":    uint64(airplay.FeatureSystemPairing | airplay.FeatureTransientPairing | uint64(1<<38) | uint64(1<<46)),
 		"statusFlags": uint64(0x280), // configured password and on-screen PIN
 	}, plist.BinaryFormat)
 	if err != nil {
@@ -205,7 +203,7 @@ func TestPasswordTakesPrecedenceOverPINWithoutStartingDisplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create daemon: %v", err)
 	}
-	t.Cleanup(func() { d.handleDisconnect(Request{}) })
+	t.Cleanup(d.Shutdown)
 
 	response := d.handleConnect(Request{Cmd: "connect", Target: host, Port: port})
 	if !response.OK {
@@ -217,35 +215,15 @@ func TestPasswordTakesPrecedenceOverPINWithoutStartingDisplay(t *testing.T) {
 		t.Fatalf("first request = %s %s, want GET /info", request.method, request.path)
 	}
 
-	pinFlowWaitForState(t, d, StatePINRequired)
-	status := d.handleStatus()
-	if !status.NeedsCredential || status.NeedsPIN || status.CredentialKind != CredentialKindPassword {
-		t.Fatalf("password status metadata = %+v", status)
-	}
-	if status.Device != "Password TV" || status.DeviceIP != host {
-		t.Fatalf("password status target = %q (%q), want Password TV (%q)", status.Device, status.DeviceIP, host)
-	}
-	if len(status.Streams) != 1 || status.Streams[0].CredentialKind != CredentialKindPassword {
-		t.Fatalf("password stream metadata = %+v", status.Streams)
-	}
-
-	// A PIN-start request here would mean the daemon selected the wrong prompt.
-	select {
-	case request := <-requestSeen:
-		t.Fatalf("request before password submission = %s %s", request.method, request.path)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	response = d.handleConnect(Request{Cmd: "connect", Pin: "password with spaces"})
-	if !response.OK {
-		t.Fatalf("password submission rejected: %+v", response)
-	}
 	request = pinFlowNextRequest(t, requestSeen)
 	if request.method != "POST" || request.path != "/pair-setup" {
-		t.Fatalf("request after password submission = %s %s, want POST /pair-setup", request.method, request.path)
+		t.Fatalf("request after /info = %s %s, want transient POST /pair-setup", request.method, request.path)
 	}
-	if got := pinFlowTLVValue(request.body, 0x13); got != nil {
-		t.Fatalf("password pair-setup unexpectedly contains transient flags: %x", got)
+	if got := request.headers["x-apple-hkp"]; got != "4" {
+		t.Fatalf("pair-setup X-Apple-HKP = %q, want transient type 4", got)
+	}
+	if got := pinFlowTLVValue(request.body, 0x13); !bytes.Equal(got, []byte{0x10, 0, 0, 0}) {
+		t.Fatalf("pair-setup transient flags = %x, want 10000000", got)
 	}
 
 	result := pinFlowServerResultWithin(t, serverDone)
@@ -254,7 +232,7 @@ func TestPasswordTakesPrecedenceOverPINWithoutStartingDisplay(t *testing.T) {
 	}
 	for _, request := range result.requests {
 		if request.path == "/pair-pin-start" {
-			t.Fatalf("password flow called /pair-pin-start: %+v", result.requests)
+			t.Fatalf("modern password+PIN flow called /pair-pin-start: %+v", result.requests)
 		}
 	}
 	pinFlowWaitForState(t, d, StateIdle)
@@ -298,7 +276,7 @@ func TestSubmittedPasswordCompletesPairingWithoutSecondPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create daemon: %v", err)
 	}
-	t.Cleanup(func() { d.handleDisconnect(Request{}) })
+	t.Cleanup(d.Shutdown)
 
 	response := d.handleConnect(Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port})
 	if !response.OK {
