@@ -9,14 +9,13 @@ import (
 )
 
 const (
-	audioSampleRate             = 44100
-	audioChannels               = 2
-	audioBytesPerSample         = 2
-	audioBytesPerSampleFrame    = audioChannels * audioBytesPerSample
-	audioCapturePayloadType     = 96
-	audioONVIFRTPHeaderProfile  = 0xabac
-	maxAudioCapturePacketBytes  = 65535
-	audioTimestampSlopInSamples = 1
+	audioSampleRate            = 44100
+	audioChannels              = 2
+	audioBytesPerSample        = 2
+	audioBytesPerSampleFrame   = audioChannels * audioBytesPerSample
+	audioCapturePayloadType    = 96
+	audioONVIFRTPHeaderProfile = 0xabac
+	maxAudioCapturePacketBytes = 65535
 )
 
 // audioPCMFrameReader is the timestamp-preserving boundary between the
@@ -24,6 +23,19 @@ const (
 // always interleaved stereo S16LE PCM and PTS identifies its first sample.
 type audioPCMFrameReader interface {
 	ReadPCMFrame(dst []byte) (pts time.Time, err error)
+}
+
+// audioPCMFramePosition preserves both halves of the capture clock mapping.
+// sourceRTP is the sample-domain position of the first PCM sample; PTS is that
+// same sample's presentation time in the local monotonic clock domain.
+type audioPCMFramePosition struct {
+	PTS          time.Time
+	SourceRTP    uint32
+	HasSourceRTP bool
+}
+
+type audioPCMFramePositionReader interface {
+	ReadPCMFramePosition(dst []byte) (audioPCMFramePosition, error)
 }
 
 // rtpL16PCMFrameReader consumes RFC4571-framed RTP/L16 produced by GStreamer.
@@ -58,27 +70,35 @@ func newRTPL16PCMFrameReaderWithNow(reader io.Reader, now func() time.Time) *rtp
 }
 
 func (r *rtpL16PCMFrameReader) ReadPCMFrame(dst []byte) (time.Time, error) {
+	position, err := r.ReadPCMFramePosition(dst)
+	return position.PTS, err
+}
+
+func (r *rtpL16PCMFrameReader) ReadPCMFramePosition(dst []byte) (audioPCMFramePosition, error) {
 	if r.reader == nil {
-		return time.Time{}, fmt.Errorf("RTP audio: nil capture reader")
+		return audioPCMFramePosition{}, fmt.Errorf("RTP audio: nil capture reader")
 	}
 	if len(dst) == 0 || len(dst)%audioBytesPerSampleFrame != 0 {
-		return time.Time{}, fmt.Errorf("RTP audio: PCM frame size %d is not whole stereo S16 samples", len(dst))
+		return audioPCMFramePosition{}, fmt.Errorf("RTP audio: PCM frame size %d is not whole stereo S16 samples", len(dst))
 	}
 
 	for len(r.pcm) < len(dst) {
 		if err := r.readPacket(); err != nil {
 			if err == io.EOF && len(r.pcm) != 0 {
-				return time.Time{}, io.ErrUnexpectedEOF
+				return audioPCMFramePosition{}, io.ErrUnexpectedEOF
 			}
-			return time.Time{}, err
+			return audioPCMFramePosition{}, err
 		}
 	}
 
-	pts := r.timelinePTS.Add(audioSamplesDuration(r.consumedSamples))
+	sourceRTP := r.timelineRTP + uint32(r.consumedSamples)
+	// Use the newest packet's RTP/PTS correlation. This retains slow source-clock
+	// rate changes instead of extrapolating forever from the first packet.
+	pts := r.timelinePTS.Add(audioSamplesDuration(uint64(uint32(sourceRTP - r.timelineRTP))))
 	copy(dst, r.pcm[:len(dst)])
 	r.pcm = r.pcm[len(dst):]
 	r.consumedSamples += uint64(len(dst) / audioBytesPerSampleFrame)
-	return pts, nil
+	return audioPCMFramePosition{PTS: pts, SourceRTP: sourceRTP, HasSourceRTP: true}, nil
 }
 
 func (r *rtpL16PCMFrameReader) readPacket() error {
@@ -107,12 +127,19 @@ func (r *rtpL16PCMFrameReader) readPacket() error {
 		expectedPTS := r.timelinePTS.Add(audioSamplesDuration(r.receivedSamples))
 		ptsDeltaSamples := durationToAudioSamples(packetPTS.Sub(expectedPTS))
 		discontinuous = !r.havePacket || header.sequence != r.sequence+1 || header.ssrc != r.ssrc ||
-			header.timestamp != expectedRTP || absInt64(ptsDeltaSamples) > audioTimestampSlopInSamples
+			header.timestamp != expectedRTP
 		if discontinuous {
 			r.discontinuities++
 			dbg("[AUDIO] capture discontinuity: seq=%d->%d rtp=%d->%d pts-delta=%d samples; dropping %d partial PCM bytes",
 				r.sequence, header.sequence, expectedRTP, header.timestamp, ptsDeltaSamples, len(r.pcm))
 		}
+	}
+	if !discontinuous {
+		// Rebase the correlation without disturbing buffered sample positions.
+		// The source RTP clock is authoritative for sample progression, while PTS
+		// tells us where that sample boundary lies on the system/network timeline.
+		consumedBeforePacket := r.receivedSamples
+		r.timelinePTS = packetPTS.Add(-audioSamplesDuration(consumedBeforePacket))
 	}
 	if discontinuous {
 		r.pcm = r.pcm[:0]
@@ -246,24 +273,20 @@ func durationToAudioSamples(delta time.Duration) int64 {
 	return whole - ((-remainder)*audioSampleRate+int64(time.Second)/2)/int64(time.Second)
 }
 
-func absInt64(value int64) int64 {
-	if value < 0 {
-		return -value
-	}
-	return value
-}
-
 // audioRTPClock maps the source sample timebase onto the sender's random RTP
 // epoch. It is safe for the media loop and periodic TimeAnnounce loop to share.
 type audioRTPClock struct {
 	mu sync.RWMutex
 
-	valid          bool
-	anchorPTS      time.Time
-	anchorRTP      uint32
-	lastFramePTS   time.Time
-	lastFrameRTP   uint32
-	lastFrameCount uint32
+	valid           bool
+	anchorPTS       time.Time
+	anchorRTP       uint32
+	lastFramePTS    time.Time
+	lastFrameRTP    uint32
+	lastFrameCount  uint32
+	anchorSourceRTP uint32
+	lastSourceRTP   uint32
+	hasSourceRTP    bool
 }
 
 func newAudioRTPClock(epoch uint32) *audioRTPClock {
@@ -274,8 +297,13 @@ func newAudioRTPClock(epoch uint32) *audioRTPClock {
 // gaps remain RTP gaps. A backward source-clock reset starts a new linear map
 // after the previous frame and asks the caller to publish a reset announce.
 func (c *audioRTPClock) mapFrame(pts time.Time, samples uint32) (rtp uint32, reset bool) {
+	return c.mapFramePosition(audioPCMFramePosition{PTS: pts}, samples)
+}
+
+func (c *audioRTPClock) mapFramePosition(position audioPCMFramePosition, samples uint32) (rtp uint32, reset bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	pts := position.PTS
 
 	if !c.valid {
 		c.valid = true
@@ -283,14 +311,31 @@ func (c *audioRTPClock) mapFrame(pts time.Time, samples uint32) (rtp uint32, res
 		c.lastFramePTS = pts
 		c.lastFrameRTP = c.anchorRTP
 		c.lastFrameCount = samples
+		c.hasSourceRTP = position.HasSourceRTP
+		c.anchorSourceRTP = position.SourceRTP
+		c.lastSourceRTP = position.SourceRTP
 		return c.anchorRTP, false
 	}
 
-	if pts.Before(c.lastFramePTS) {
+	sourceReset := position.HasSourceRTP != c.hasSourceRTP
+	if position.HasSourceRTP && c.hasSourceRTP {
+		expectedSource := c.lastSourceRTP + c.lastFrameCount
+		sourceReset = int32(position.SourceRTP-expectedSource) < 0
+	}
+	if sourceReset || (!position.HasSourceRTP && pts.Before(c.lastFramePTS)) {
 		c.anchorRTP = c.lastFrameRTP + c.lastFrameCount
 		c.anchorPTS = pts
+		c.anchorSourceRTP = position.SourceRTP
 		rtp = c.anchorRTP
 		reset = true
+	} else if position.HasSourceRTP {
+		// Media RTP advances from captured sample positions. This preserves the
+		// source clock's rate and any real capture gaps without deriving either
+		// from wall-clock duration.
+		rtp = c.anchorRTP + (position.SourceRTP - c.anchorSourceRTP)
+		// A large source-PTS phase reset needs an immediate TimeAnnounce, but it
+		// must not break otherwise continuous media RTP sample progression.
+		reset = pts.Before(c.lastFramePTS.Add(-100 * time.Millisecond))
 	} else {
 		deltaSamples := durationToAudioSamples(pts.Sub(c.anchorPTS))
 		rtp = c.anchorRTP + uint32(deltaSamples)
@@ -305,6 +350,8 @@ func (c *audioRTPClock) mapFrame(pts time.Time, samples uint32) (rtp uint32, res
 	c.lastFramePTS = pts
 	c.lastFrameRTP = rtp
 	c.lastFrameCount = samples
+	c.hasSourceRTP = position.HasSourceRTP
+	c.lastSourceRTP = position.SourceRTP
 	return rtp, reset
 }
 
@@ -316,4 +363,18 @@ func (c *audioRTPClock) rtpAt(localTime time.Time) (uint32, bool) {
 	}
 	deltaSamples := durationToAudioSamples(localTime.Sub(c.anchorPTS))
 	return c.anchorRTP + uint32(deltaSamples), true
+}
+
+// latestBoundary returns the sample boundary immediately after the most recent
+// frame. TimeAnnounce must map RTP and network time for the same instant; this
+// future/apply boundary avoids assuming that the audio device clock runs at
+// exactly the host clock's rate.
+func (c *audioRTPClock) latestBoundary() (uint32, time.Time, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.valid || c.lastFramePTS.IsZero() {
+		return 0, time.Time{}, false
+	}
+	return c.lastFrameRTP + c.lastFrameCount,
+		c.lastFramePTS.Add(audioSamplesDuration(uint64(c.lastFrameCount))), true
 }

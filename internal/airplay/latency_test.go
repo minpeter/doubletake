@@ -7,7 +7,9 @@ import (
 
 func TestScreenLatenciesForConnectionHint(t *testing.T) {
 	SetTargetLatency(0)
-	t.Cleanup(func() { SetTargetLatency(0) })
+	t.Cleanup(func() {
+		SetTargetLatency(0)
+	})
 
 	tests := []struct {
 		name  string
@@ -33,7 +35,9 @@ func TestScreenLatenciesForConnectionHint(t *testing.T) {
 
 func TestTargetLatencyOverrideAppliesJointLead(t *testing.T) {
 	SetTargetLatency(120 * time.Millisecond)
-	t.Cleanup(func() { SetTargetLatency(0) })
+	t.Cleanup(func() {
+		SetTargetLatency(0)
+	})
 
 	for _, hint := range []connectionLatencyHint{connectionLatencyLow, connectionLatencyNormal, connectionLatencyHigh} {
 		got := screenLatenciesForHint(hint)
@@ -50,7 +54,10 @@ func TestTargetLatencyOverrideAppliesJointLead(t *testing.T) {
 }
 
 func TestTargetLatencyAutomaticAndClamp(t *testing.T) {
-	t.Cleanup(func() { SetTargetLatency(0) })
+	SetTargetLatency(0)
+	t.Cleanup(func() {
+		SetTargetLatency(0)
+	})
 
 	SetTargetLatency(time.Millisecond)
 	if got := screenLatenciesForHint(connectionLatencyNormal); got.video != 5*time.Millisecond || got.audio != 5*time.Millisecond {

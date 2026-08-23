@@ -15,7 +15,7 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 	args := strings.Join(audioCapturePipelineArgs([]string{"audiotestsrc"}, AudioCodecALAC, true), " ")
 	for _, want := range []string{
 		"format=S16BE",
-		"rtpL16pay pt=96 mtu=60000 timestamp-offset=0 seqnum-offset=0 perfect-rtptime=false",
+		"rtpL16pay pt=96 mtu=60000 timestamp-offset=0 seqnum-offset=0 perfect-rtptime=true",
 		"rtponviftimestamp ntp-offset=-1 set-e-bit=false set-t-bit=false",
 		"rtpstreampay",
 	} {
@@ -51,15 +51,22 @@ func TestAudioCaptureTestToneCarriesSourcePTSWithoutHardware(t *testing.T) {
 	defer capture.Stop()
 
 	buf := make([]byte, 8192)
-	n, pts, err := capture.ReadFrameAt(buf)
+	n, position, err := capture.readFramePosition(buf)
 	if err != nil {
 		t.Fatalf("read timestamped test-tone frame: %v", err)
 	}
-	if n == 0 || pts.IsZero() {
-		t.Fatalf("test-tone frame = %d bytes pts=%v, want encoded bytes and source PTS", n, pts)
+	if n == 0 || position.PTS.IsZero() || !position.HasSourceRTP {
+		t.Fatalf("test-tone frame = %d bytes position=%#v, want encoded bytes, source PTS, and source RTP", n, position)
 	}
-	if age := time.Since(pts); age < -time.Second || age > 2*time.Second {
+	if age := time.Since(position.PTS); age < -time.Second || age > 2*time.Second {
 		t.Fatalf("test-tone source PTS age = %v, want a current capture time", age)
+	}
+	_, second, err := capture.readFramePosition(buf)
+	if err != nil {
+		t.Fatalf("read second timestamped test-tone frame: %v", err)
+	}
+	if delta := second.SourceRTP - position.SourceRTP; delta != 352 {
+		t.Fatalf("test-tone source RTP delta = %d, want one ALAC frame (352 samples)", delta)
 	}
 }
 
@@ -99,6 +106,34 @@ func TestRTPL16PCMFrameReaderPreservesPTSAndCodecBoundaries(t *testing.T) {
 	wantSecondPTS := wantFirstPTS.Add(audioSamplesDuration(352))
 	if !secondPTS.Equal(wantSecondPTS) {
 		t.Fatalf("second PTS = %v, want %v", secondPTS, wantSecondPTS)
+	}
+}
+
+func TestRTPL16PCMFrameReaderPreservesSamplePositionAndRebasesPTS(t *testing.T) {
+	base := time.Unix(1787356850, 0).UTC()
+	firstBE, _ := testL16Samples(200, 0x1000)
+	secondBE, _ := testL16Samples(200, 0x2000)
+	// Model a source clock whose presentation-time correlation moved by 2ms.
+	// RTP remains the authoritative count of captured samples.
+	secondPTS := base.Add(audioSamplesDuration(200)).Add(2 * time.Millisecond)
+	stream := bytes.Join([][]byte{
+		testFramedL16Packet(10, 9000, base, firstBE),
+		testFramedL16Packet(11, 9200, secondPTS, secondBE),
+	}, nil)
+	reader := newRTPL16PCMFrameReaderWithNow(bytes.NewReader(stream), func() time.Time { return base.Add(time.Second) })
+	pcm := make([]byte, 352*audioBytesPerSampleFrame)
+	position, err := reader.ReadPCMFramePosition(pcm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !position.HasSourceRTP || position.SourceRTP != 9000 {
+		t.Fatalf("source position = %#v, want RTP 9000", position)
+	}
+	// The newest packet correlation is projected back to the first sample of
+	// this codec frame, retaining the source clock's observed 2ms phase change.
+	wantPTS := timeFromNTP(testNTPFromTime(secondPTS)).Add(-audioSamplesDuration(200))
+	if !position.PTS.Equal(wantPTS) {
+		t.Fatalf("frame PTS = %v, want rebased %v", position.PTS, wantPTS)
 	}
 }
 
@@ -159,6 +194,65 @@ func TestAudioRTPClockPreservesSourceGapsAndReanchorsBackwardClock(t *testing.T)
 	}
 	if at, ok := clock.rtpAt(backwardPTS.Add(time.Second)); !ok || at != afterReset+audioSampleRate {
 		t.Fatalf("rtpAt after reset = %#x ok=%t, want %#x true", at, ok, afterReset+audioSampleRate)
+	}
+}
+
+func TestAudioRTPClockUsesCapturedSampleClockWithoutLongTermWallDrift(t *testing.T) {
+	epoch := uint32(0x12345678)
+	base := time.Unix(1787357050, 0)
+	clock := newAudioRTPClock(epoch)
+	firstPosition := audioPCMFramePosition{PTS: base, SourceRTP: 1000, HasSourceRTP: true}
+	first, reset := clock.mapFramePosition(firstPosition, 352)
+	if first != epoch || reset {
+		t.Fatalf("first map = %#x reset=%t, want %#x false", first, reset, epoch)
+	}
+
+	// After ten minutes, model an audio clock running 200ppm faster than the
+	// host/video clock. A wall-duration-derived RTP value would be about 5292
+	// samples short; the captured source position remains exact.
+	const elapsedSamples = uint32(10 * 60 * audioSampleRate)
+	nominalWall := 10 * time.Minute
+	elapsedWall := time.Duration(float64(nominalWall) / 1.0002)
+	lastPosition := audioPCMFramePosition{
+		PTS:          base.Add(elapsedWall),
+		SourceRTP:    firstPosition.SourceRTP + elapsedSamples,
+		HasSourceRTP: true,
+	}
+	last, reset := clock.mapFramePosition(lastPosition, 352)
+	if want := epoch + elapsedSamples; last != want || reset {
+		t.Fatalf("ten-minute map = %#x reset=%t, want exact sample position %#x false", last, reset, want)
+	}
+	if wallDerived := epoch + uint32(durationToAudioSamples(elapsedWall)); wallDerived == last {
+		t.Fatal("test clock did not create a measurable wall/sample-rate difference")
+	}
+	latestRTP, latestPTS, ok := clock.latestBoundary()
+	wantBoundaryRTP := last + 352
+	wantBoundaryPTS := lastPosition.PTS.Add(audioSamplesDuration(352))
+	if !ok || latestRTP != wantBoundaryRTP || !latestPTS.Equal(wantBoundaryPTS) {
+		t.Fatalf("latest correlation = rtp %#x pts %v ok=%t, want %#x %v true",
+			latestRTP, latestPTS, ok, wantBoundaryRTP, wantBoundaryPTS)
+	}
+}
+
+func TestAudioRTPClockPreservesCapturedGapsAndResetsBackwardSampleClock(t *testing.T) {
+	epoch := uint32(0x40000000)
+	base := time.Unix(1787357060, 0)
+	clock := newAudioRTPClock(epoch)
+	position := audioPCMFramePosition{PTS: base, SourceRTP: 5000, HasSourceRTP: true}
+	first, _ := clock.mapFramePosition(position, 352)
+
+	position.PTS = position.PTS.Add(audioSamplesDuration(352 + 4410))
+	position.SourceRTP += 352 + 4410
+	afterGap, reset := clock.mapFramePosition(position, 352)
+	if want := first + 352 + 4410; afterGap != want || reset {
+		t.Fatalf("gap map = %#x reset=%t, want %#x false", afterGap, reset, want)
+	}
+
+	position.PTS = position.PTS.Add(audioSamplesDuration(352))
+	position.SourceRTP = 100 // capture RTP epoch restarted
+	afterReset, reset := clock.mapFramePosition(position, 352)
+	if want := afterGap + 352; afterReset != want || !reset {
+		t.Fatalf("reset map = %#x reset=%t, want continuous outgoing %#x true", afterReset, reset, want)
 	}
 }
 

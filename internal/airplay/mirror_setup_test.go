@@ -360,7 +360,9 @@ func TestAudioVolumeBody(t *testing.T) {
 
 func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	SetTargetLatency(0)
-	t.Cleanup(func() { SetTargetLatency(0) })
+	t.Cleanup(func() {
+		SetTargetLatency(0)
+	})
 
 	for _, test := range []struct {
 		name       string

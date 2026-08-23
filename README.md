@@ -13,7 +13,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 - mDNS device discovery
 - Daemon mode with multi-target streaming control (`doubletake-ctl`)
 - In-process test receiver for hardware-free pairing and media-flow tests
-- Configurable latency target (`-target-latency-ms`, default 100ms)
+- Automatic AirPlay screen/audio latency policy with an optional `-target-latency-ms` override
 - KDE Plasma widget for quick access (see [plasmoid/](plasmoid/))
 
 ## Requirements
@@ -126,9 +126,10 @@ Receiver-initiated NTP sessions probe the timing port during SETUP; PTP and
 sender-initiated NTP sessions do not require that inbound timing traffic. The
 event and video data channels are outbound TCP connections from doubletake to
 ports returned by the receiver, so they do not require inbound firewall rules.
-The NTP timing path uses a 500 ms minimum playout lead to absorb its
-request/response and userspace scheduling jitter; PTP retains the configured
-`-target-latency-ms` value.
+NTP and PTP use the same presentation policy; the timing protocol only changes
+how timestamps are represented. In automatic mode, an ordinary connection uses
+the AirPlay defaults observed in the checked-in sender artifacts: 75 ms for
+video and 85 ms for screen audio.
 
 By default the OS assigns ephemeral ports. Use `-port-range MIN-MAX` to confine
 the UDP ports to a small window you can open in your firewall (needs at least 3
@@ -313,7 +314,7 @@ doubletake -target 192.168.1.77 -fps 30 -bitrate 0
 # Force a lower bitrate on weaker Wi-Fi
 doubletake -target 192.168.1.77 -bitrate 4500
 
-# Set a target playout latency (default is 100ms)
+# Override the automatic audio/video playout latencies with one joint value
 doubletake -target 192.168.1.77 -target-latency-ms 100
 
 # Hardware encoding
@@ -348,7 +349,7 @@ doubletake-ctl disconnect
 | `-pair` | false | Force new pairing |
 | `-fps` | 30 | Frames per second |
 | `-bitrate` | 0 | Video bitrate in kbps (`0` = auto) |
-| `-target-latency-ms` | 100 | Target end-to-end latency in milliseconds (audio + video timing) |
+| `-target-latency-ms` | 0 | Joint audio/video playout latency override in milliseconds (`0` = automatic AirPlay policy with separate defaults) |
 | `-hwaccel` | auto | H.264 encoder: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
 | `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
 | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
