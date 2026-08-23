@@ -65,6 +65,7 @@ const (
 type ScreenCapture struct {
 	cmd      *exec.Cmd // gst-launch-1.0 process
 	stdout   io.ReadCloser
+	frames   videoAccessUnitReader
 	cancel   context.CancelFunc
 	pwNodeID uint32
 	dbusConn *dbus.Conn    // portal session D-Bus connection (must stay open for Wayland)
@@ -95,6 +96,8 @@ type CapturePreparation struct {
 	cfg  CaptureConfig
 	kind capturePreparationKind
 	used bool
+
+	timestampedOutput bool
 
 	pwNodeID   uint32
 	pwFd       *os.File
@@ -137,7 +140,15 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	if _, err := selectGstEncoderWithProbe(cfg, hasGstElement, false); err != nil {
 		return nil, err
 	}
-	preparation := &CapturePreparation{ctx: ctx, cfg: cfg, kind: kind}
+	preparation := &CapturePreparation{
+		ctx:               ctx,
+		cfg:               cfg,
+		kind:              kind,
+		timestampedOutput: supportsTimestampedVideoOutput(),
+	}
+	if !preparation.timestampedOutput {
+		log.Printf("[CAPTURE] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; video will use output-time timestamps")
+	}
 	if kind == capturePreparationX11 {
 		if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
 			return nil, fmt.Errorf("GStreamer 'ximagesrc' plugin not found; install gst-plugins-good")
@@ -174,7 +185,12 @@ func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePrepara
 	if _, err := selectGstEncoderWithProbe(cfg, hasGstElement, false); err != nil {
 		return nil, err
 	}
-	return &CapturePreparation{ctx: ctx, cfg: cfg, kind: capturePreparationTest}, nil
+	return &CapturePreparation{
+		ctx:               ctx,
+		cfg:               cfg,
+		kind:              capturePreparationTest,
+		timestampedOutput: supportsTimestampedVideoOutput(),
+	}, nil
 }
 
 // Start launches the prepared encoder using the supplied nominal receiver
@@ -209,6 +225,7 @@ func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, h
 	pwFd := p.pwFd
 	dbusConn := p.dbusConn
 	streamSize := p.streamSize
+	timestampedOutput := p.timestampedOutput
 	p.pwFd = nil
 	p.dbusConn = nil
 	p.mu.Unlock()
@@ -225,11 +242,11 @@ func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, h
 
 	switch kind {
 	case capturePreparationWayland:
-		return startPreparedWaylandCapture(ctx, cfg, encoder, nodeID, pwFd, dbusConn, streamSize)
+		return startPreparedWaylandCapture(ctx, cfg, encoder, nodeID, pwFd, dbusConn, streamSize, timestampedOutput)
 	case capturePreparationX11:
-		return startPreparedX11Capture(ctx, cfg, encoder)
+		return startPreparedX11Capture(ctx, cfg, encoder, timestampedOutput)
 	case capturePreparationTest:
-		return startPreparedTestCapture(ctx, cfg, encoder)
+		return startPreparedTestCapture(ctx, cfg, encoder, timestampedOutput)
 	default:
 		return nil, fmt.Errorf("invalid capture preparation kind %d", kind)
 	}
@@ -262,6 +279,15 @@ func (p *CapturePreparation) Close() {
 
 func hasGstElement(name string) bool {
 	return exec.Command("gst-inspect-1.0", name).Run() == nil
+}
+
+func supportsTimestampedVideoOutput() bool {
+	for _, element := range []string{"rtph264pay", "rtponviftimestamp", "rtpstreampay"} {
+		if !hasGstElement(element) {
+			return false
+		}
+	}
+	return true
 }
 
 // startGStreamerCommand starts a capture child whose lifetime cannot outlive
@@ -378,7 +404,7 @@ func receiverScaleStages(maxWidth, maxHeight int) []gstStage {
 // encoding, and Annex-B output path used by Wayland, X11, and synthetic test
 // capture. beforeConvert and afterScale preserve the few ordering requirements
 // that genuinely differ between capture sources.
-func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage, encoder encoderResult, maxWidth, maxHeight int) []string {
+func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
 	args := append([]string{"--quiet"}, source...)
 	for _, stage := range beforeConvert {
 		args = appendGstStage(args, stage)
@@ -398,10 +424,23 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
 	args = appendGstStage(args, encoder.parts)
 	args = appendGstStage(args, gstStage{"h264parse", "config-interval=-1"})
 	args = appendGstStage(args, gstStage{"video/x-h264,stream-format=byte-stream,alignment=au"})
+	if timestampedOutput {
+		// RTP marker bits retain access-unit boundaries, while the ONVIF header
+		// extension serializes each encoded buffer's absolute capture PTS. The
+		// RFC4571 length prefix makes the packet stream safe to carry over stdout.
+		args = appendGstStage(args, gstStage{
+			"rtph264pay", "pt=96", "mtu=60000", "aggregate-mode=none",
+			"timestamp-offset=0", "seqnum-offset=0",
+		})
+		args = appendGstStage(args, gstStage{
+			"rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false",
+		})
+		args = appendGstStage(args, gstStage{"rtpstreampay"})
+	}
 	return appendGstStage(args, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
 }
 
-func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int) (*ScreenCapture, error) {
+func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int, timestampedOutput bool) (*ScreenCapture, error) {
 	if pwFd == nil || dbusConn == nil {
 		if pwFd != nil {
 			_ = pwFd.Close()
@@ -456,7 +495,7 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 			lowLatencyVideoQueueStage(),
 		)
 	}
-	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterScale, encoderParts, cfg.MaxWidth, cfg.MaxHeight)
+	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterScale, encoderParts, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
 
 	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -490,6 +529,9 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 		dbusConn: dbusConn,
 		waitCh:   make(chan struct{}),
 	}
+	if timestampedOutput {
+		capture.frames = newRTPVideoAccessUnitReader(stdout)
+	}
 	go func() {
 		capture.waitErr = <-waitResult
 		close(capture.waitCh)
@@ -498,7 +540,7 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 	return capture, nil
 }
 
-func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder encoderResult) (*ScreenCapture, error) {
+func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder encoderResult, timestampedOutput bool) (*ScreenCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
@@ -539,7 +581,7 @@ func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder enc
 	}
 
 	beforeConvert := []gstStage{frameRateStage(fps), lowLatencyVideoQueueStage()}
-	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight)
+	gstArgs := buildGstVideoPipeline(ximageSrcArgs, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
 
 	dbg("[CAPTURE] gst-launch-1.0 (x11) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -565,6 +607,9 @@ func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder enc
 		cancel: cancel,
 		waitCh: make(chan struct{}),
 	}
+	if timestampedOutput {
+		capture.frames = newRTPVideoAccessUnitReader(stdout)
+	}
 	go func() {
 		capture.waitErr = <-waitResult
 		close(capture.waitCh)
@@ -583,6 +628,24 @@ func (sc *ScreenCapture) Read(buf []byte) (int, error) {
 	default:
 	}
 	return sc.stdout.Read(buf)
+}
+
+// ReadVideoAccessUnit returns one complete encoded frame with its source PTS.
+// It is available when the capture pipeline uses the timestamped RTP/ONVIF
+// output suffix. Callers must treat the returned AnnexB slice as immutable.
+func (sc *ScreenCapture) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	if sc == nil || sc.frames == nil {
+		return VideoAccessUnit{}, fmt.Errorf("capture does not provide timestamped access units")
+	}
+	select {
+	case <-sc.waitCh:
+		if sc.waitErr != nil {
+			return VideoAccessUnit{}, fmt.Errorf("capture exited: %w", sc.waitErr)
+		}
+		return VideoAccessUnit{}, io.EOF
+	default:
+	}
+	return sc.frames.ReadVideoAccessUnit()
 }
 
 func (sc *ScreenCapture) Stop() {
@@ -860,7 +923,7 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 	return capture, nil
 }
 
-func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder encoderResult) (*ScreenCapture, error) {
+func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder encoderResult, timestampedOutput bool) (*ScreenCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
@@ -877,7 +940,7 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 		{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps)},
 		{"timeoverlay"},
 	}
-	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight)
+	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
 
 	dbg("[CAPTURE] launching gst-launch-1.0 (test mode) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -906,6 +969,9 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 		stdout: stdout,
 		cancel: cancel,
 		waitCh: make(chan struct{}),
+	}
+	if timestampedOutput {
+		capture.frames = newRTPVideoAccessUnitReader(stdout)
 	}
 	go func() {
 		capture.waitErr = <-waitResult
@@ -976,7 +1042,11 @@ func keyframeIntervalFrames(fps int) int {
 	if fps <= 0 {
 		fps = 30
 	}
-	return fps * 4
+	// Capture starts before the receiver's media SETUP completes so Wayland's
+	// portal prompt stays outside the first-frame deadline. A receiver (or a
+	// later daemon sink) can therefore miss the encoder's initial IDR. Keep the
+	// next random-access point comfortably inside that deadline.
+	return fps * 2
 }
 
 // vbvBufferKbit returns the x264 VBV buffer size in kbit for the given bitrate

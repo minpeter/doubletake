@@ -34,8 +34,9 @@ its absence selects
 An explicit descriptor rejection permits one alternate-shape retry.
 .PP
 Encrypted HAP sessions use descriptor-only FairPlay keys. Plaintext/raw sessions
-use available root FairPlay keys on control and media SETUP. NTP sessions use a
-500 ms minimum playout lead, while PTP retains the configured target latency.
+use available root FairPlay keys on control and media SETUP. NTP and PTP use the
+same presentation-latency policy; only their network-clock representation
+differs.
 A nonzero screen-audio mask advertising neither ALAC nor AAC-ELD is rejected
 when audio is enabled;
 .B \-no-audio
@@ -83,8 +84,10 @@ and a distinct 3840x2160 maximum.
 Advertise third-party/HKP HAP, feature-41 PTP with a working implementation
 version, feature 59 absent, and ALAC. It verifies encrypted control with
 one rejected control SETUP followed by media-first SETUP, a ChaCha key alongside
-the legacy audio control port, and a receiver ClockID anchored locally when
-Apple's private PTP headers are absent.
+the legacy audio control port, and the compatibility fallback which anchors a
+receiver ClockID locally when Apple's private PTP headers are absent. That
+fallback assumes the receiver uses the sender's numeric boot-clock phase; it is
+not equivalent to participating in a PTP clock domain.
 .TP
 .B appletv3
 Advertise raw pairing with feature 27, FPSAP, ALAC, and no PTP or feature 59. It

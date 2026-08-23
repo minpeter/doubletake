@@ -6,24 +6,41 @@ import (
 	"time"
 )
 
-const defaultTargetLatency = 1 * time.Millisecond
+type connectionLatencyHint int8
 
-// ntpPlayoutLatencyFloor gives the older request/response clock path enough
-// lead to schedule RTP packets despite network and userspace jitter. PTP uses a
-// shared network timeline and retains the configured low-latency target. This
-// is selected by the timing protocol actually negotiated during SETUP, not by
-// an unrelated receiver feature or identity.
-const ntpPlayoutLatencyFloor = 500 * time.Millisecond
+const (
+	connectionLatencyLow    connectionLatencyHint = -1
+	connectionLatencyNormal connectionLatencyHint = 0
+	connectionLatencyHigh   connectionLatencyHint = 1
+
+	// Apple's ordinary screen path selects separate video and audio leads from
+	// the same semantic connection hint. These are APSScreenLatencyMs and
+	// APSAudioLatencyForScreenMs defaults in the AirPlaySupport artifacts.
+	defaultVideoLatencyLow    = 40 * time.Millisecond
+	defaultVideoLatencyNormal = 75 * time.Millisecond
+	defaultVideoLatencyHigh   = 100 * time.Millisecond
+	defaultAudioLatencyLow    = 50 * time.Millisecond
+	defaultAudioLatencyNormal = 85 * time.Millisecond
+	defaultAudioLatencyHigh   = 170 * time.Millisecond
+)
+
+type screenLatencyTargets struct {
+	video time.Duration
+	audio time.Duration
+}
 
 var targetLatencyNS atomic.Int64
 
-func init() {
-	targetLatencyNS.Store(int64(defaultTargetLatency))
-}
-
-// SetTargetLatency sets the desired end-to-end playout latency target.
-// Values are clamped to a sane operational range.
+// SetTargetLatency sets the application's explicit joint playout lead. Apple's
+// own screen and audio overrides are independent, but doubletake historically
+// exposed one flag for both; applying the same explicit value preserves that
+// contract without inventing a relationship between Apple's two settings. A
+// non-positive value restores the artifact-derived automatic policy.
 func SetTargetLatency(d time.Duration) {
+	if d <= 0 {
+		targetLatencyNS.Store(0)
+		return
+	}
 	if d < 5*time.Millisecond {
 		d = 5 * time.Millisecond
 	}
@@ -33,21 +50,40 @@ func SetTargetLatency(d time.Duration) {
 	targetLatencyNS.Store(int64(d))
 }
 
-// TargetLatency returns the configured playout latency target.
+// TargetLatency returns the video lead for an ordinary connection. It remains
+// the compatibility accessor for callers that only need the video timestamp
+// bias; new session setup should use screenLatenciesForHint.
 func TargetLatency() time.Duration {
-	d := time.Duration(targetLatencyNS.Load())
-	if d <= 0 {
-		return defaultTargetLatency
+	return screenLatenciesForHint(connectionLatencyNormal).video
+}
+
+func screenLatenciesForHint(hint connectionLatencyHint) screenLatencyTargets {
+	var targets screenLatencyTargets
+	switch hint {
+	case connectionLatencyLow:
+		targets = screenLatencyTargets{video: defaultVideoLatencyLow, audio: defaultAudioLatencyLow}
+	case connectionLatencyHigh:
+		targets = screenLatencyTargets{video: defaultVideoLatencyHigh, audio: defaultAudioLatencyHigh}
+	default:
+		targets = screenLatencyTargets{video: defaultVideoLatencyNormal, audio: defaultAudioLatencyNormal}
 	}
-	return d
+
+	if override := time.Duration(targetLatencyNS.Load()); override > 0 {
+		targets.video = override
+		targets.audio = override
+	}
+	return targets
 }
 
 func targetLatencySamples44k1() uint32 {
-	return samplesFor44k1(TargetLatency())
+	return samplesFor44k1(screenLatenciesForHint(connectionLatencyNormal).audio)
 }
 
 func samplesFor44k1(d time.Duration) uint32 {
-	samples := int64(math.Round(float64(d) * 44100.0 / float64(time.Second)))
+	// Apple's sender converts its millisecond latency to the integral SETUP and
+	// RTP-timebase value by truncation. Keep that byte-exact behavior: 85 ms is
+	// 3748.5 samples and is advertised as 3748, not rounded to 3749.
+	samples := int64(d/time.Second)*44100 + int64(d%time.Second)*44100/int64(time.Second)
 	if samples < 1 {
 		samples = 1
 	}

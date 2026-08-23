@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os/exec"
 	"strings"
@@ -94,15 +95,56 @@ func randomRTPTime(reader io.Reader) (uint32, error) {
 
 // AudioCapture manages audio capture via GStreamer and local ALAC encoding.
 type AudioCapture struct {
-	gstCmd  *exec.Cmd
-	pcmPipe io.ReadCloser
-	cancel  context.CancelFunc
-	waitCh  chan struct{}
-	waitErr error
-	stopped bool
-	codec   AudioCodec
-	eldMu   sync.Mutex
-	eld     *eldEncoder
+	gstCmd    *exec.Cmd
+	pcmPipe   io.ReadCloser
+	pcmFrames audioPCMFrameReader
+	cancel    context.CancelFunc
+	waitCh    chan struct{}
+	waitErr   error
+	stopped   bool
+	codec     AudioCodec
+	eldMu     sync.Mutex
+	eld       *eldEncoder
+}
+
+var audioTimestampFallbackWarning sync.Once
+
+func supportsTimestampedAudioOutput() bool {
+	for _, element := range []string{"rtpL16pay", "rtponviftimestamp", "rtpstreampay"} {
+		if !hasGstElement(element) {
+			return false
+		}
+	}
+	return true
+}
+
+func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bool) []string {
+	_, codecSPF, _, _, _, _ := codec.Info()
+	format := "S16LE"
+	if timestamped {
+		// RTP L16 is network byte order. The framed reader restores S16LE before
+		// handing samples to either local AirPlay encoder.
+		format = "S16BE"
+	}
+	args := append([]string{"--quiet"}, srcArgs...)
+	args = append(args,
+		"!", "audioconvert",
+		"!", "audioresample",
+		"!", fmt.Sprintf("audio/x-raw,rate=%d,channels=%d,format=%s,layout=interleaved", audioSampleRate, audioChannels, format),
+		"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+	)
+	if timestamped {
+		// ceil(SPF / sampleRate) keeps a normal codec frame within one packet,
+		// while the Go reader remains correct if GStreamer splits or combines it.
+		maxPacketTime := (codecSPF*int64(time.Second) + audioSampleRate - 1) / audioSampleRate
+		args = append(args,
+			"!", "rtpL16pay", "pt=96", "mtu=60000", "timestamp-offset=0", "seqnum-offset=0",
+			"perfect-rtptime=false", fmt.Sprintf("max-ptime=%d", maxPacketTime),
+			"!", "rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false",
+			"!", "rtpstreampay",
+		)
+	}
+	return append(args, "!", "fdsink", "fd=1", "sync=false", "async=false")
 }
 
 // StartAudioCapture launches a pipeline that captures system audio (monitor source)
@@ -152,15 +194,13 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		}
 	}
 
-	gstArgs := []string{"--quiet"}
-	gstArgs = append(gstArgs, srcArgs...)
-	gstArgs = append(gstArgs,
-		"!", "audioconvert",
-		"!", "audioresample",
-		"!", "audio/x-raw,rate=44100,channels=2,format=S16LE",
-		"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-		"!", "fdsink", "fd=1", "sync=false", "async=false",
-	)
+	timestamped := supportsTimestampedAudioOutput()
+	if !timestamped {
+		audioTimestampFallbackWarning.Do(func() {
+			log.Printf("[AUDIO] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; using read-time audio clock fallback")
+		})
+	}
+	gstArgs := audioCapturePipelineArgs(srcArgs, codec, timestamped)
 	dbg("[AUDIO] PCM capture pipeline: gst-launch-1.0 %s", strings.Join(gstArgs, " "))
 
 	gstCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -188,6 +228,9 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 
 	ac.gstCmd = gstCmd
 	ac.pcmPipe = gstStdout
+	if timestamped {
+		ac.pcmFrames = newRTPL16PCMFrameReader(gstStdout)
+	}
 	go func() {
 		ac.waitErr = <-waitResult
 		close(ac.waitCh)
@@ -196,14 +239,22 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 	return ac, nil
 }
 
-// ReadFrame reads one encoded audio frame.
+// ReadFrame reads one encoded audio frame. Timestamp-aware callers should use
+// ReadFrameAt so the sample's capture time remains attached to its RTP epoch.
 func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
+	n, _, err := ac.ReadFrameAt(buf)
+	return n, err
+}
+
+// ReadFrameAt reads one encoded audio frame and returns the source PTS of its
+// first sample. PTS is zero only for the transparent unframed fallback.
+func (ac *AudioCapture) ReadFrameAt(buf []byte) (int, time.Time, error) {
 	select {
 	case <-ac.waitCh:
 		if ac.waitErr != nil {
-			return 0, fmt.Errorf("audio capture exited: %w", ac.waitErr)
+			return 0, time.Time{}, fmt.Errorf("audio capture exited: %w", ac.waitErr)
 		}
-		return 0, io.EOF
+		return 0, time.Time{}, io.EOF
 	default:
 	}
 
@@ -213,19 +264,27 @@ func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 	const bytesPerSample = 2
 	pcmSize := spf * channels * bytesPerSample // 1408 bytes
 	pcm := make([]byte, pcmSize)
-	if _, err := io.ReadFull(ac.pcmPipe, pcm); err != nil {
-		return 0, err
+	var pts time.Time
+	var err error
+	if ac.pcmFrames != nil {
+		pts, err = ac.pcmFrames.ReadPCMFrame(pcm)
+	} else {
+		_, err = io.ReadFull(ac.pcmPipe, pcm)
+	}
+	if err != nil {
+		return 0, time.Time{}, err
 	}
 	if ac.codec == AudioCodecAACELD {
 		ac.eldMu.Lock()
 		defer ac.eldMu.Unlock()
 		if ac.eld == nil {
-			return 0, io.EOF
+			return 0, time.Time{}, io.EOF
 		}
-		return ac.eld.Encode(pcm, buf)
+		n, err := ac.eld.Encode(pcm, buf)
+		return n, pts, err
 	}
 	n := encodeALACVerbatim(buf, pcm, spf, channels, 16)
-	return n, nil
+	return n, pts, nil
 }
 
 // DrainStale discards any PCM that buffered in the OS pipe between capture
@@ -237,6 +296,11 @@ func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 // from the freshest sample. It removes whatever backlog actually accumulated —
 // no fixed latency value is assumed.
 func (ac *AudioCapture) DrainStale() {
+	if ac.pcmFrames != nil {
+		// RFC4571 is a framed stream; arbitrary byte reads would corrupt it. The
+		// timestamp-aware media loop catches up by discarding whole codec frames.
+		return
+	}
 	type deadlineReader interface {
 		SetReadDeadline(t time.Time) error
 	}
@@ -691,11 +755,19 @@ func aesEncryptAudioPayload(block cipher.Block, iv, data []byte) []byte {
 	return out
 }
 
-// sendSyncPacket sends the current RTP-to-network-clock mapping on the control
-// port. PTP and NTP sessions use different packet formats.
+// sendSyncPacket sends the last transmitted RTP position. It remains the
+// fallback for un-timestamped capture and focused packet-format tests.
 func (as *AudioStream) sendSyncPacket(timingProtocol string, networkTime, timelineID uint64, isFirst bool) error {
 	as.mu.Lock()
 	rtpNow := as.rtpTime
+	as.mu.Unlock()
+	return as.sendSyncPacketAt(timingProtocol, networkTime, timelineID, rtpNow, isFirst)
+}
+
+// sendSyncPacketAt publishes an RTP and network-time pair describing the same
+// source-clock instant. Official senders derive both values from one host tick.
+func (as *AudioStream) sendSyncPacketAt(timingProtocol string, networkTime, timelineID uint64, rtpNow uint32, isFirst bool) error {
+	as.mu.Lock()
 	latencySamples := as.latencySamples
 	as.mu.Unlock()
 
@@ -752,6 +824,40 @@ func ptpNanoseconds(timestamp uint64) uint64 {
 	return seconds*uint64(time.Second) + (fraction * uint64(time.Second) >> 32)
 }
 
+// audioClockAt converts a source PTS through the same session clock used by
+// video. The NTP fallback keeps the monotonic component of the source time and
+// adds the protocol's 1900 epoch to the sender's boot-relative clock.
+func (s *MirrorSession) audioClockAt(local time.Time) (timestamp, timelineID uint64) {
+	if local.IsZero() {
+		return s.audioClockNow()
+	}
+	if s.mediaClock != nil {
+		if timestamp, timelineID, ok := s.mediaClock.at(local, 0); ok {
+			return timestamp, timelineID
+		}
+	}
+	if presentation, ok := addDurationToBootTime(local.Sub(time.Now())); ok {
+		return compactTimestamp(presentation) + (uint64(secondsFrom1900To1970) << 32), 0
+	}
+	return s.audioClockNow()
+}
+
+const (
+	minimumAudioSendLead        = 5 * time.Millisecond
+	maximumInitialCatchupFrames = 128
+)
+
+func audioLatencyDuration(samples uint32) time.Duration {
+	return audioSamplesDuration(uint64(samples))
+}
+
+func audioFrameIsStale(pts, now time.Time, latencySamples uint32) bool {
+	if pts.IsZero() || now.IsZero() {
+		return false
+	}
+	return !pts.Add(audioLatencyDuration(latencySamples)).After(now.Add(minimumAudioSendLead))
+}
+
 func (as *AudioStream) Close() {
 	if as.conn != nil && as.conn != as.ctrlConn {
 		as.conn.Close()
@@ -794,7 +900,7 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 		default:
 		}
 
-		if _, err := capture.ReadFrame(prewarmBuf); err != nil {
+		if _, _, err := capture.ReadFrameAt(prewarmBuf); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -817,8 +923,8 @@ videoReady:
 	audioStream.rtpTime = nextRtp
 	audioStream.mu.Unlock()
 
-	// Discard any partial pipe backlog between the final prewarm read and the
-	// video-ready signal, then wait until one complete, fresh audio frame is in hand.
+	// Discard any partial unframed pipe backlog between the final prewarm read and
+	// the video-ready signal, then wait until one complete, fresh audio frame is in hand.
 	// The RTP/network-clock mapping must be established at this point, not when
 	// the capture process was merely started: GStreamer and the sound server can
 	// take hundreds of milliseconds to deliver their first sample, which would
@@ -826,24 +932,48 @@ videoReady:
 	capture.DrainStale()
 	frameBuf := make([]byte, 8192)
 	firstFrameSize := 0
+	var firstFramePTS time.Time
+	catchupFrames := 0
 	for firstFrameSize == 0 {
-		firstFrameSize, err = capture.ReadFrame(frameBuf)
+		firstFrameSize, firstFramePTS, err = capture.ReadFrameAt(frameBuf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return fmt.Errorf("audio read first frame: %w", err)
 		}
+		if firstFrameSize > 0 && audioFrameIsStale(firstFramePTS, time.Now(), audioStream.latencySamples) {
+			catchupFrames++
+			if catchupFrames >= maximumInitialCatchupFrames {
+				age := time.Since(firstFramePTS)
+				return fmt.Errorf("audio capture cannot meet %v playout lead after discarding %d stale frames (source age %v)",
+					audioLatencyDuration(audioStream.latencySamples), catchupFrames, age)
+			}
+			firstFrameSize = 0
+		}
 	}
+	if catchupFrames > 0 {
+		dbg("[AUDIO] discarded %d timestamped startup frames to restore positive playout lead", catchupFrames)
+	}
+	timestampedAudio := !firstFramePTS.IsZero()
+	if firstFramePTS.IsZero() {
+		// Transparent raw fallback: preserve the historical read-time anchor.
+		firstFramePTS = time.Now()
+	}
+	rtpClock := newAudioRTPClock(nextRtp)
+	firstFrameRTP, _ := rtpClock.mapFrame(firstFramePTS, spf)
+	var announceMu sync.Mutex
 
-	// Establish the initial clock mapping immediately before the first media
-	// packet. The reset bit is set only on this announce; subsequent 1 Hz
-	// announces update the same mapping.
+	// Establish the initial mapping at the first sample's source PTS. The reset
+	// bit is also used if the source clock later jumps backwards and is re-anchored.
 	clockNow, timelineID := s.audioClockNow()
-	if err := audioStream.sendSyncPacket(s.timingProtocol, clockNow, timelineID, true); err != nil {
+	if timestampedAudio {
+		clockNow, timelineID = s.audioClockAt(firstFramePTS)
+	}
+	if err := audioStream.sendSyncPacketAt(s.timingProtocol, clockNow, timelineID, firstFrameRTP, true); err != nil {
 		return fmt.Errorf("audio initial clock mapping: %w", err)
 	}
-	dbg("[AUDIO] sent initial clock mapping with first frame ready, starting audio at rtp=%d", nextRtp)
+	dbg("[AUDIO] sent initial source clock mapping pts=%v rtp=%d", firstFramePTS, firstFrameRTP)
 
 	// Apple senders refresh TimeAnnounce once per second.
 	workers.Add(1)
@@ -856,8 +986,24 @@ videoReady:
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				clockNow, timelineID := s.audioClockNow()
-				if err := audioStream.sendSyncPacket(s.timingProtocol, clockNow, timelineID, false); err != nil {
+				if !timestampedAudio {
+					clockNow, timelineID := s.audioClockNow()
+					if err := audioStream.sendSyncPacket(s.timingProtocol, clockNow, timelineID, false); err != nil {
+						dbg("[AUDIO] sync error: %v", err)
+					}
+					continue
+				}
+				announcedAt := time.Now()
+				announceMu.Lock()
+				rtpNow, ok := rtpClock.rtpAt(announcedAt)
+				if !ok {
+					announceMu.Unlock()
+					continue
+				}
+				clockNow, timelineID := s.audioClockAt(announcedAt)
+				err := audioStream.sendSyncPacketAt(s.timingProtocol, clockNow, timelineID, rtpNow, false)
+				announceMu.Unlock()
+				if err != nil {
 					dbg("[AUDIO] sync error: %v", err)
 				}
 			}
@@ -904,6 +1050,9 @@ videoReady:
 	retransmitIdx := 0
 	burstDone := false
 	useFirstFrame := true
+	framePTS := firstFramePTS
+	frameRTP := firstFrameRTP
+	staleFrames := 0
 
 	for {
 		select {
@@ -913,10 +1062,11 @@ videoReady:
 		}
 
 		n := firstFrameSize
-		if useFirstFrame {
+		usingFirstFrame := useFirstFrame
+		if usingFirstFrame {
 			useFirstFrame = false
 		} else {
-			n, err = capture.ReadFrame(frameBuf)
+			n, framePTS, err = capture.ReadFrameAt(frameBuf)
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -927,6 +1077,43 @@ videoReady:
 		if n == 0 {
 			continue
 		}
+		if framePTS.IsZero() {
+			// Unframed fallback has no source clock. Preserve its historical fixed
+			// SPF progression instead of turning read-scheduling jitter into RTP jitter.
+			framePTS = firstFramePTS.Add(audioSamplesDuration(uint64(frameCount) * uint64(spf)))
+		}
+		if !usingFirstFrame && timestampedAudio && audioFrameIsStale(framePTS, time.Now(), audioStream.latencySamples) {
+			staleFrames++
+			if staleFrames == 1 || staleFrames%100 == 0 {
+				dbg("[AUDIO] dropping stale source frame %v old (latency=%v, dropped=%d)",
+					time.Since(framePTS), audioLatencyDuration(audioStream.latencySamples), staleFrames)
+			}
+			continue
+		}
+		if staleFrames > 0 {
+			dbg("[AUDIO] source caught up after dropping %d stale frames", staleFrames)
+			staleFrames = 0
+		}
+		if frameCount > 0 {
+			if timestampedAudio {
+				announceMu.Lock()
+				var reset bool
+				frameRTP, reset = rtpClock.mapFrame(framePTS, spf)
+				if reset {
+					clockNow, timelineID := s.audioClockAt(framePTS)
+					err := audioStream.sendSyncPacketAt(s.timingProtocol, clockNow, timelineID, frameRTP, true)
+					announceMu.Unlock()
+					if err != nil {
+						return fmt.Errorf("audio reset clock mapping: %w", err)
+					}
+					dbg("[AUDIO] reset source clock mapping pts=%v rtp=%d", framePTS, frameRTP)
+				} else {
+					announceMu.Unlock()
+				}
+			} else {
+				frameRTP += spf
+			}
+		}
 
 		payload := make([]byte, n)
 		copy(payload, frameBuf[:n])
@@ -934,16 +1121,16 @@ videoReady:
 		frameCount++
 		if !useFEC {
 			// Single-send: send each frame once
-			if _, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, nextRtp, frameSeq, nil); err != nil {
+			if _, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, frameRTP, frameSeq, nil); err != nil {
 				return fmt.Errorf("audio send: %w", err)
 			}
 		} else if !burstDone {
 			// Initial burst phase: send frames immediately, fill retransmit buffer
-			nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, nextRtp, frameSeq, nil)
+			nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, frameRTP, frameSeq, nil)
 			if err != nil {
 				return fmt.Errorf("audio send: %w", err)
 			}
-			retransmitBuf[retransmitIdx] = audioFrame{payload: payload, rtpTime: nextRtp, seq: frameSeq, nonce: nonce}
+			retransmitBuf[retransmitIdx] = audioFrame{payload: payload, rtpTime: frameRTP, seq: frameSeq, nonce: nonce}
 			retransmitIdx++
 			if retransmitIdx >= retransmitDepth {
 				burstDone = true
@@ -958,16 +1145,15 @@ videoReady:
 			}
 
 			// Store and send new frame
-			nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, nextRtp, frameSeq, nil)
+			nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, frameRTP, frameSeq, nil)
 			if err != nil {
 				return fmt.Errorf("audio send: %w", err)
 			}
-			retransmitBuf[retransmitIdx] = audioFrame{payload: payload, rtpTime: nextRtp, seq: frameSeq, nonce: nonce}
+			retransmitBuf[retransmitIdx] = audioFrame{payload: payload, rtpTime: frameRTP, seq: frameSeq, nonce: nonce}
 			retransmitIdx = (retransmitIdx + 1) % retransmitDepth
 		}
 
 		frameSeq++
-		nextRtp += spf
 
 		if frameCount <= 10 || frameCount%100 == 0 {
 			hexStart := n
@@ -975,7 +1161,7 @@ videoReady:
 				hexStart = 16
 			}
 			dbg("[AUDIO] sent frame %d: seq=%d payload=%d rtp=%d hex=%02x",
-				frameCount, frameSeq-1, n, nextRtp-spf, payload[:hexStart])
+				frameCount, frameSeq-1, n, frameRTP, payload[:hexStart])
 		}
 	}
 }

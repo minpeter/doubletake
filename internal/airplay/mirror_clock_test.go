@@ -1,13 +1,285 @@
 package airplay
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestFrameTimeAtPreservesPTPSourcePTS(t *testing.T) {
+	const timeline = uint64(0x48e15caa8da00008)
+	anchorLocal := time.Now().Add(-time.Second)
+	clock := &mediaClock{
+		anchorLocal:     anchorLocal,
+		anchorTimestamp: compactTimestamp(10 * time.Second),
+		timelineID:      timeline,
+	}
+	session := &MirrorSession{mediaClock: clock, timestampBias: 500 * time.Millisecond}
+	capturedAt := anchorLocal.Add(800 * time.Millisecond)
+	got, gotTimeline, timely := session.frameTimeAtNow(capturedAt, anchorLocal.Add(time.Second))
+	if !timely {
+		t.Fatal("fresh capture PTS was rejected")
+	}
+	want := compactTimestamp(11*time.Second + 300*time.Millisecond)
+	if got != want {
+		t.Fatalf("timestamp = 0x%016x, want 0x%016x", got, want)
+	}
+	if gotTimeline != timeline {
+		t.Fatalf("timeline = 0x%016x, want 0x%016x", gotTimeline, timeline)
+	}
+}
+
+func TestFrameTimeAtRejectsSourcePTSThatWouldAlreadyBeLate(t *testing.T) {
+	const timeline = uint64(0x48e15caa8da00008)
+	now := time.Unix(1700000000, 0)
+	clock := &mediaClock{
+		anchorLocal:     now.Add(-time.Second),
+		anchorTimestamp: compactTimestamp(10 * time.Second),
+		timelineID:      timeline,
+	}
+	session := &MirrorSession{mediaClock: clock, timestampBias: 100 * time.Millisecond}
+	got, gotTimeline, timely := session.frameTimeAtNow(now.Add(-500*time.Millisecond), now)
+	if timely {
+		t.Fatalf("stale capture PTS was accepted with timestamp 0x%016x timeline 0x%016x", got, gotTimeline)
+	}
+	if got != 0 || gotTimeline != 0 {
+		t.Fatalf("rejected timestamp = (0x%016x, 0x%016x), want zero values", got, gotTimeline)
+	}
+	if !session.stalePTSReported {
+		t.Fatal("stale capture PTS was not reported")
+	}
+}
+
+func TestFrameTimeAtFallsBackForZeroSourcePTS(t *testing.T) {
+	const timeline = uint64(0x48e15caa8da00008)
+	now := time.Unix(1700000000, 0)
+	want := compactTimestamp(11*time.Second + 100*time.Millisecond)
+	clock := &mediaClock{
+		anchorLocal:     now.Add(-time.Second),
+		anchorTimestamp: compactTimestamp(10 * time.Second),
+		timelineID:      timeline,
+	}
+	session := &MirrorSession{mediaClock: clock, timestampBias: 100 * time.Millisecond}
+	got, gotTimeline, timely := session.frameTimeAtNow(time.Time{}, now)
+	if !timely {
+		t.Fatal("zero source PTS did not use output-time fallback")
+	}
+	if got != want || gotTimeline != timeline {
+		t.Fatalf("fallback = (0x%016x, 0x%016x), want (0x%016x, 0x%016x)", got, gotTimeline, want, timeline)
+	}
+}
+
+func TestFrameTimeAtRejectsImplausibleNonzeroPTS(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	for _, test := range []struct {
+		name string
+		pts  time.Time
+	}{
+		{name: "future", pts: now.Add(2 * time.Second)},
+		{name: "old", pts: now.Add(-31 * time.Second)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := &MirrorSession{timestampBias: 100 * time.Millisecond}
+			got, gotTimeline, timely := session.frameTimeAtNow(test.pts, now)
+			if timely || got != 0 || gotTimeline != 0 {
+				t.Fatalf("invalid nonzero PTS returned (0x%016x, 0x%016x, %t), want rejection", got, gotTimeline, timely)
+			}
+		})
+	}
+}
+
+func TestStreamFramesUsesAccessUnitPTSWithoutLookahead(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	firstPTS := now.Add(-300 * time.Millisecond)
+	frames := []VideoAccessUnit{
+		{AnnexB: joinAnnexBNALs(
+			[]byte{0x67, 0x42, 0x00, 0x1f, 0xf8, 0x0a, 0x00, 0xb7, 0x20},
+			[]byte{0x68, 0xce, 0x06, 0xe2},
+			[]byte{0x65, 0x80, 0x01},
+		), PTS: firstPTS},
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x02}), PTS: firstPTS.Add(100 * time.Millisecond)},
+	}
+	capture := &ScreenCapture{
+		frames: &sliceVideoAccessUnitReader{frames: frames},
+		waitCh: make(chan struct{}),
+	}
+	sender, receiver := net.Pipe()
+	defer sender.Close()
+	defer receiver.Close()
+	session := &MirrorSession{
+		dataConn:       sender,
+		firstFrameSent: make(chan struct{}),
+		timestampBias:  500 * time.Millisecond,
+		frameClockNow:  func() time.Time { return now },
+		mediaClock: &mediaClock{
+			anchorLocal:     now.Add(-time.Second),
+			anchorTimestamp: compactTimestamp(10 * time.Second),
+			timelineID:      1,
+		},
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- session.StreamFrames(context.Background(), capture, 0) }()
+
+	readPacket := func() []byte {
+		t.Helper()
+		header := make([]byte, 128)
+		if _, err := io.ReadFull(receiver, header); err != nil {
+			t.Fatal(err)
+		}
+		payload := make([]byte, binary.LittleEndian.Uint32(header[:4]))
+		if _, err := io.ReadFull(receiver, payload); err != nil {
+			t.Fatal(err)
+		}
+		return append(header, payload...)
+	}
+	codec := readPacket()
+	if codec[4] != 1 {
+		t.Fatalf("first packet type = %d, want codec", codec[4])
+	}
+	first := readPacket()
+	second := readPacket()
+	firstTimestamp := binary.LittleEndian.Uint64(first[8:16])
+	secondTimestamp := binary.LittleEndian.Uint64(second[8:16])
+	gotDelta := time.Duration(((secondTimestamp - firstTimestamp) * uint64(time.Second)) >> 32)
+	if difference := gotDelta - 100*time.Millisecond; difference < -2*time.Millisecond || difference > 2*time.Millisecond {
+		t.Fatalf("frame timestamp delta = %v, want 100ms", gotDelta)
+	}
+	if !bytes.Equal(first[132:], []byte{0x65, 0x80, 0x01}) {
+		t.Fatalf("first VCL payload = %x", first[128:])
+	}
+	if err := <-errCh; err == nil || !strings.Contains(err.Error(), "unexpectedly") {
+		t.Fatalf("StreamFrames error = %v, want capture EOF", err)
+	}
+}
+
+func TestStreamFramesDropsStaleGOPUntilLiveIDR(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	frames := []VideoAccessUnit{
+		{AnnexB: joinAnnexBNALs(
+			[]byte{0x67, 0x42, 0x00, 0x1f, 0xf8, 0x0a, 0x00, 0xb7, 0x20},
+			[]byte{0x68, 0xce, 0x06, 0xe2},
+			[]byte{0x65, 0x80, 0x01},
+		), PTS: now.Add(-100 * time.Millisecond)},
+		// Dropping this reference picture invalidates the rest of its GOP.
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x02}), PTS: now.Add(-800 * time.Millisecond)},
+		// This picture is timely, but may depend on the discarded picture.
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x03}), PTS: now.Add(-50 * time.Millisecond)},
+		// A live IDR is the first safe recovery point.
+		{AnnexB: joinAnnexBNALs([]byte{0x65, 0x80, 0x04}), PTS: now.Add(-40 * time.Millisecond)},
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x05}), PTS: now.Add(-30 * time.Millisecond)},
+	}
+	capture := &ScreenCapture{
+		frames: &sliceVideoAccessUnitReader{frames: frames},
+		waitCh: make(chan struct{}),
+	}
+	sender, receiver := net.Pipe()
+	var output bytes.Buffer
+	copyDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(&output, receiver)
+		copyDone <- err
+	}()
+
+	session := &MirrorSession{
+		dataConn:       sender,
+		firstFrameSent: make(chan struct{}),
+		timestampBias:  500 * time.Millisecond,
+		frameClockNow:  func() time.Time { return now },
+		mediaClock: &mediaClock{
+			anchorLocal:     now.Add(-time.Second),
+			anchorTimestamp: compactTimestamp(10 * time.Second),
+			timelineID:      1,
+		},
+	}
+	err := session.StreamFrames(context.Background(), capture, 0)
+	_ = sender.Close()
+	if copyErr := <-copyDone; copyErr != nil {
+		t.Fatalf("copy packets: %v", copyErr)
+	}
+	_ = receiver.Close()
+	if err == nil || !strings.Contains(err.Error(), "unexpectedly") {
+		t.Fatalf("StreamFrames error = %v, want capture EOF", err)
+	}
+	if !session.stalePTSReported {
+		t.Fatal("stale access unit was not detected")
+	}
+
+	packets := splitMirrorPackets(t, output.Bytes())
+	if len(packets) != 4 {
+		t.Fatalf("sent %d packets, want codec + initial IDR + recovery IDR + following P-frame", len(packets))
+	}
+	if packets[0].header[4] != 1 {
+		t.Fatalf("packet 0 type = %d, want codec", packets[0].header[4])
+	}
+	for index, wantNAL := range [][]byte{
+		{0x65, 0x80, 0x01},
+		{0x65, 0x80, 0x04},
+		{0x61, 0x80, 0x05},
+	} {
+		packet := packets[index+1]
+		if packet.header[4] != 0 {
+			t.Fatalf("packet %d type = %d, want VCL", index+1, packet.header[4])
+		}
+		if got := firstAVCCNAL(t, packet.payload); !bytes.Equal(got, wantNAL) {
+			t.Fatalf("packet %d NAL = %x, want %x", index+1, got, wantNAL)
+		}
+	}
+	if packets[1].header[5] != 0x10 || packets[2].header[5] != 0x10 || packets[3].header[5] != 0 {
+		t.Fatalf("VCL keyframe flags = [%02x %02x %02x], want [10 10 00]",
+			packets[1].header[5], packets[2].header[5], packets[3].header[5])
+	}
+}
+
+type mirrorPacket struct {
+	header  []byte
+	payload []byte
+}
+
+func splitMirrorPackets(t *testing.T, stream []byte) []mirrorPacket {
+	t.Helper()
+	var packets []mirrorPacket
+	for len(stream) != 0 {
+		if len(stream) < 128 {
+			t.Fatalf("truncated mirror header: %d bytes", len(stream))
+		}
+		payloadSize := int(binary.LittleEndian.Uint32(stream[:4]))
+		if payloadSize > len(stream)-128 {
+			t.Fatalf("truncated mirror payload: have %d, want %d", len(stream)-128, payloadSize)
+		}
+		packets = append(packets, mirrorPacket{
+			header:  append([]byte(nil), stream[:128]...),
+			payload: append([]byte(nil), stream[128:128+payloadSize]...),
+		})
+		stream = stream[128+payloadSize:]
+	}
+	return packets
+}
+
+func firstAVCCNAL(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	if len(payload) < 4 {
+		t.Fatalf("AVCC payload is only %d bytes", len(payload))
+	}
+	nalSize := int(binary.BigEndian.Uint32(payload[:4]))
+	if nalSize <= 0 || nalSize > len(payload)-4 {
+		t.Fatalf("invalid AVCC NAL size %d for %d-byte payload", nalSize, len(payload))
+	}
+	return payload[4 : 4+nalSize]
+}
+
+func joinAnnexBNALs(nals ...[]byte) []byte {
+	var out []byte
+	for _, nal := range nals {
+		out = append(out, 0, 0, 0, 1)
+		out = append(out, nal...)
+	}
+	return out
+}
 
 func TestSendFrameWritesNTPTimeAndZeroTimeline(t *testing.T) {
 	sender, receiver := net.Pipe()

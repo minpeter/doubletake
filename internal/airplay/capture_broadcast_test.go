@@ -8,6 +8,57 @@ import (
 	"time"
 )
 
+type sliceVideoAccessUnitReader struct {
+	frames []VideoAccessUnit
+	index  int
+}
+
+func (r *sliceVideoAccessUnitReader) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	if r.index == len(r.frames) {
+		return VideoAccessUnit{}, io.EOF
+	}
+	frame := r.frames[r.index]
+	r.index++
+	return frame, nil
+}
+
+func TestBroadcastCapturePreservesTimestampedAccessUnits(t *testing.T) {
+	firstPTS := time.Now().Add(-200 * time.Millisecond)
+	frames := []VideoAccessUnit{
+		{AnnexB: []byte{0, 0, 0, 1, 0x65, 1}, PTS: firstPTS},
+		{AnnexB: []byte{0, 0, 0, 1, 0x61, 2}, PTS: firstPTS.Add(time.Second / 30)},
+	}
+	capture := &ScreenCapture{
+		frames: &sliceVideoAccessUnitReader{frames: frames},
+		waitCh: make(chan struct{}),
+	}
+	broadcast := NewBroadcastCapture(capture)
+	firstSink := broadcast.AddSink().AsCapture()
+	secondSink := broadcast.AddSink().AsCapture()
+	runDone := make(chan error, 1)
+	go func() { runDone <- broadcast.Run() }()
+
+	for i, want := range frames {
+		for sinkIndex, sink := range []*ScreenCapture{firstSink, secondSink} {
+			got, err := sink.ReadVideoAccessUnit()
+			if err != nil && !(err == io.EOF && i == len(frames)-1) {
+				t.Fatalf("sink %d frame %d: %v", sinkIndex, i, err)
+			}
+			if !bytes.Equal(got.AnnexB, want.AnnexB) || got.PTS != want.PTS {
+				t.Fatalf("sink %d frame %d = {%x %v}, want {%x %v}", sinkIndex, i, got.AnnexB, got.PTS, want.AnnexB, want.PTS)
+			}
+		}
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("broadcast run = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timestamped broadcast did not finish after both sinks drained")
+	}
+}
+
 func TestBroadcastCaptureCanAttachSinkAfterRunStarts(t *testing.T) {
 	sourceReader, sourceWriter := io.Pipe()
 	capture := &ScreenCapture{stdout: sourceReader, waitCh: make(chan struct{})}

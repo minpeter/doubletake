@@ -170,6 +170,36 @@ func (c *mediaClock) now(bias time.Duration) (timestamp, timelineID uint64, ok b
 	return anchorTimestamp + compactTimestamp(time.Since(anchorLocal)+bias), timelineID, true
 }
 
+// at maps a local monotonic capture time onto the receiver's PTP timeline.
+// Unlike now, it preserves time spent in capture, scaling, and encoding.
+func (c *mediaClock) at(local time.Time, bias time.Duration) (timestamp, timelineID uint64, ok bool) {
+	c.mu.RLock()
+	anchorLocal := c.anchorLocal
+	anchorTimestamp := c.anchorTimestamp
+	timelineID = c.timelineID
+	c.mu.RUnlock()
+	if local.IsZero() || anchorLocal.IsZero() || timelineID == 0 {
+		return 0, 0, false
+	}
+	timestamp, ok = addTimestampDuration(anchorTimestamp, local.Sub(anchorLocal)+bias)
+	return timestamp, timelineID, ok
+}
+
+func addTimestampDuration(timestamp uint64, delta time.Duration) (uint64, bool) {
+	if delta >= 0 {
+		addition := compactTimestamp(delta)
+		if addition > ^uint64(0)-timestamp {
+			return 0, false
+		}
+		return timestamp + addition, true
+	}
+	subtraction := compactTimestamp(-delta)
+	if subtraction > timestamp {
+		return 0, false
+	}
+	return timestamp - subtraction, true
+}
+
 // MirrorSession manages an active screen mirroring session.
 type MirrorSession struct {
 	client      *AirPlayClient
@@ -192,7 +222,9 @@ type MirrorSession struct {
 	frameSeq           uint32
 	lastFrameTimestamp uint64
 	firstFrameSent     chan struct{} // closed after first video frame is sent
+	stalePTSReported   bool
 	timestampBias      time.Duration
+	frameClockNow      func() time.Time
 	timingProtocol     string
 	mediaClock         *mediaClock
 
@@ -425,14 +457,11 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		go ntpTimingResponder(sessionCtx, timingConn)
 	}
 
-	sessionLatency := TargetLatency()
-	// Audio and video share this latency so they stay in sync. The NTP path needs
-	// enough packet lead to absorb request/response and userspace scheduling
-	// jitter; PTP retains the explicitly configured low-latency target.
-	if timingProtocol == timingProtocolNTP && sessionLatency < ntpPlayoutLatencyFloor {
-		dbg("[SETUP] raising NTP session latency to %v", ntpPlayoutLatencyFloor)
-		sessionLatency = ntpPlayoutLatencyFloor
-	}
+	// The transport currently exposes no semantic connection-latency hint, so
+	// use Apple's ordinary connection policy. Timing protocol only changes the
+	// clock conversion; it does not select a different playout lead.
+	latencies := screenLatenciesForHint(connectionLatencyNormal)
+	dbg("[SETUP] screen latency policy: video=%v audio=%v", latencies.video, latencies.audio)
 
 	// Apple's sender prepares the receiver with a control-only SETUP before it
 	// creates media streams. Older protocol implementations can explicitly
@@ -470,7 +499,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	var receiverEventPort int
 	var attemptedEventPort int
 	audioControlLPort := audioCtrlConn.LocalAddr().(*net.UDPAddr).Port
-	audioLatencySamples := samplesFor44k1(sessionLatency)
+	audioLatencySamples := samplesFor44k1(latencies.audio)
 	skipRecord := false
 
 	firstSetup := true
@@ -511,9 +540,8 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			if parseErr != nil {
 				dbg("[SETUP] invalid Audio-Latency header %q: %v", value, parseErr)
 			} else if parsed > 0 {
-				audioLatencySamples = uint32(parsed)
-				sessionLatency = time.Duration(audioLatencySamples) * time.Second / 44100
-				dbg("[SETUP] receiver audio latency: %d samples (%v); using for audio+video", audioLatencySamples, sessionLatency)
+				receiverLatency := time.Duration(parsed) * time.Second / 44100
+				dbg("[SETUP] receiver Audio-Latency telemetry: %d samples (%v)", parsed, receiverLatency)
 			}
 		}
 		return nil
@@ -800,6 +828,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	videoStreamDesc := map[string]interface{}{
 		"type":               int64(110),
 		"streamConnectionID": videoStreamConnectionID,
+		"latencyMs":          latencies.video.Milliseconds(),
 		"timestampInfo": []interface{}{
 			map[string]interface{}{"name": "SubSu"},
 			map[string]interface{}{"name": "BePxT"},
@@ -914,7 +943,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		noAudio:        cfg.NoAudio,
 		sessionURI:     audioURI,
 		timingConn:     timingConn,
-		timestampBias:  sessionLatency,
+		timestampBias:  latencies.video,
 		timingProtocol: timingProtocol,
 		mediaClock:     clock,
 	}
@@ -1089,12 +1118,23 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 	var latestSPS, latestPPS []byte // raw NAL data WITHOUT start code
 	var sentSPS, sentPPS []byte     // most recently advertised decoder configuration
 	var vclBuf []byte               // AVCC-formatted data accumulating for current access unit
+	var vclPTS time.Time            // capture PTS for the access unit in vclBuf
 	var pendingKeyframe bool        // true if vclBuf contains IDR slice(s)
 	var codecSent bool              // true if codec frame sent for current keyframe
 	var streamPrimed bool           // true after first SPS/PPS+IDR has been sent
+	var awaitingRecoveryIDR bool    // true after dropping a stale reference chain
+	var droppedForCatchUp int
 	var frameCount int
 	var lastProgressLog time.Time
 	var nalLog strings.Builder
+
+	resetVCL := func() {
+		vclBuf = vclBuf[:0]
+		vclPTS = time.Time{}
+		pendingKeyframe = false
+		codecSent = false
+		nalLog.Reset()
+	}
 
 	// flushVCL sends the accumulated VCL data as a single encrypted frame.
 	// This handles multi-slice frames by combining all slices of one access unit.
@@ -1108,13 +1148,27 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		// undecodable non-IDR frames that may cause receivers to close the stream.
 		if !streamPrimed {
 			if !pendingKeyframe || latestSPS == nil || latestPPS == nil {
-				vclBuf = vclBuf[:0]
-				nalLog.Reset()
+				resetVCL()
 				return nil
 			}
 		}
 
-		packetTimestamp, packetTimeline := s.frameTimeNow()
+		// Once a VCL access unit is discarded, later inter-predicted pictures may
+		// reference data the receiver never saw. Catch up at the next IDR rather
+		// than forwarding an otherwise timely but undecodable suffix of that GOP.
+		if awaitingRecoveryIDR && !pendingKeyframe {
+			droppedForCatchUp++
+			resetVCL()
+			return nil
+		}
+
+		packetTimestamp, packetTimeline, timely := s.frameTimeAt(vclPTS)
+		if !timely {
+			awaitingRecoveryIDR = true
+			droppedForCatchUp++
+			resetVCL()
+			return nil
+		}
 
 		// Send SPS+PPS as an unencrypted avcC codec frame initially and whenever
 		// the encoder changes them. Repeating an identical configuration before
@@ -1166,6 +1220,11 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
 		}
+		if pendingKeyframe && awaitingRecoveryIDR {
+			dbg("[STREAM] caught up at a live IDR after dropping %d access units", droppedForCatchUp)
+			awaitingRecoveryIDR = false
+			droppedForCatchUp = 0
+		}
 		// Codec configuration alone is not a displayed picture. Start audio and
 		// data heartbeats only after the receiver has a successfully written VCL
 		// frame to present against the shared media clock.
@@ -1176,15 +1235,112 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 				close(s.firstFrameSent)
 			}
 		}
-		vclBuf = vclBuf[:0]
-		pendingKeyframe = false
-		codecSent = false
+		resetVCL()
 		frameCount++
 		if time.Since(lastProgressLog) >= 5*time.Second {
 			dbg("[STREAM] video progress: sent frame %d (%s, %d bytes)", frameCount, keyframeStr, len(frameData))
 			lastProgressLog = time.Now()
 		}
 		return nil
+	}
+
+	processNAL := func(nal []byte, capturedAt time.Time) error {
+		nt := nalType(nal)
+		raw := stripStartCode(nal)
+
+		if frameCount < 20 {
+			fmt.Fprintf(&nalLog, "NAL type=%d len=%d ", nt, len(raw))
+			if len(raw) > 0 {
+				fmt.Fprintf(&nalLog, "hdr=%02x", raw[0])
+			}
+			nalLog.WriteByte('|')
+		}
+
+		setPTS := func() {
+			if len(vclBuf) == 0 {
+				vclPTS = capturedAt
+			}
+		}
+		switch nt {
+		case 9: // AUD — access unit delimiter, flush previous frame
+			return flushVCL()
+		case 7: // SPS — flush before keyframe
+			if err := flushVCL(); err != nil {
+				return err
+			}
+			latestSPS = raw
+		case 8: // PPS
+			latestPPS = raw
+		case 6: // SEI — skip, don't include in VCL data
+		case 5: // IDR VCL slice — accumulate (may be multi-slice)
+			if len(vclBuf) > 0 && !pendingKeyframe {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			if len(vclBuf) > 0 && pendingKeyframe && isFirstSlice(raw) {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			setPTS()
+			pendingKeyframe = true
+			vclBuf = append(vclBuf, avccWrap(raw)...)
+		case 1, 2, 3, 4: // non-IDR VCL slice — accumulate
+			if len(vclBuf) > 0 && pendingKeyframe {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			if len(vclBuf) > 0 && !pendingKeyframe && isFirstSlice(raw) {
+				if err := flushVCL(); err != nil {
+					return err
+				}
+			}
+			setPTS()
+			vclBuf = append(vclBuf, avccWrap(raw)...)
+		default:
+			if frameCount < 20 {
+				dbg("[STREAM] ignoring NAL type=%d len=%d", nt, len(raw))
+			}
+		}
+		return nil
+	}
+
+	if capture.frames != nil {
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			accessUnit, err := capture.ReadVideoAccessUnit()
+			if len(accessUnit.AnnexB) > 0 {
+				if frameCount == 0 {
+					dbg("[CAPTURE] read timestamped access unit: %d bytes pts=%v", len(accessUnit.AnnexB), accessUnit.PTS)
+				}
+				for _, nal := range splitAnnexBAccessUnit(accessUnit.AnnexB) {
+					if processErr := processNAL(nal, accessUnit.PTS); processErr != nil {
+						return processErr
+					}
+				}
+				// RTP's marker bit gives us the exact end of this access unit, so
+				// there is no one-frame lookahead before its timestamp is sent.
+				if flushErr := flushVCL(); flushErr != nil {
+					return flushErr
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return fmt.Errorf("capture process exited unexpectedly (EOF)")
+				}
+				return fmt.Errorf("read timestamped capture: %w", err)
+			}
+		}
 	}
 
 	for {
@@ -1217,66 +1373,8 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 
 		nals := parser.Push(buf[:n])
 		for _, nal := range nals {
-			nt := nalType(nal)
-			raw := stripStartCode(nal)
-
-			// Log first 20 AU sequences in detail
-			if frameCount < 20 {
-				fmt.Fprintf(&nalLog, "NAL type=%d len=%d ", nt, len(raw))
-				if len(raw) > 0 {
-					fmt.Fprintf(&nalLog, "hdr=%02x", raw[0])
-				}
-				nalLog.WriteByte('|')
-			}
-
-			switch nt {
-			case 9: // AUD — access unit delimiter, flush previous frame
-				if err := flushVCL(); err != nil {
-					return err
-				}
-			case 7: // SPS — flush before keyframe
-				if err := flushVCL(); err != nil {
-					return err
-				}
-				latestSPS = raw
-			case 8: // PPS
-				latestPPS = raw
-			case 6: // SEI — skip, don't include in VCL data
-			case 5: // IDR VCL slice — accumulate (may be multi-slice)
-				// If IDR appears while non-IDR data is buffered, close previous AU first.
-				if len(vclBuf) > 0 && !pendingKeyframe {
-					if err := flushVCL(); err != nil {
-						return err
-					}
-				}
-				// New AU (first slice) within an IDR sequence → flush previous IDR AU.
-				if len(vclBuf) > 0 && pendingKeyframe && isFirstSlice(raw) {
-					if err := flushVCL(); err != nil {
-						return err
-					}
-				}
-				pendingKeyframe = true
-				vclBuf = append(vclBuf, avccWrap(raw)...)
-			case 1, 2, 3, 4: // non-IDR VCL slice — accumulate
-				// Flush when transitioning from keyframe AU to non-IDR AU.
-				if len(vclBuf) > 0 && pendingKeyframe {
-					if err := flushVCL(); err != nil {
-						return err
-					}
-				}
-				// New AU (first slice) — flush the previous P-frame.
-				// Without this, consecutive P-frames accumulate if AUDs
-				// are absent (some encoders/h264parse versions).
-				if len(vclBuf) > 0 && !pendingKeyframe && isFirstSlice(raw) {
-					if err := flushVCL(); err != nil {
-						return err
-					}
-				}
-				vclBuf = append(vclBuf, avccWrap(raw)...)
-			default:
-				if frameCount < 20 {
-					dbg("[STREAM] ignoring NAL type=%d len=%d", nt, len(raw))
-				}
+			if err := processNAL(nal, time.Time{}); err != nil {
+				return err
 			}
 		}
 	}
@@ -1386,6 +1484,27 @@ func findStartCode(b []byte, from int) int {
 		}
 	}
 	return -1
+}
+
+// splitAnnexBAccessUnit splits a complete, marker-delimited access unit. Unlike
+// h264Parser it can return the final NAL immediately because the RTP marker has
+// already established the end of the frame.
+func splitAnnexBAccessUnit(data []byte) [][]byte {
+	start := findStartCode(data, 0)
+	if start < 0 {
+		return nil
+	}
+	var nals [][]byte
+	for start >= 0 {
+		next := findStartCode(data, start+3)
+		if next < 0 {
+			nals = append(nals, data[start:])
+			break
+		}
+		nals = append(nals, data[start:next])
+		start = next
+	}
+	return nals
 }
 
 // stripStartCode removes the Annex-B start code prefix (00 00 01 or 00 00 00 01).
@@ -2175,16 +2294,80 @@ func ntpTimeNow() uint64 {
 
 // frameTimeNow returns one atomic timestamp/timeline pair for a VCL header.
 func (s *MirrorSession) frameTimeNow() (timestamp, timelineID uint64) {
+	timestamp, timelineID, _ = s.frameTimeAt(time.Time{})
+	return timestamp, timelineID
+}
+
+// frameTimeAt converts an encoded access unit's original local capture PTS to
+// the receiver's media timeline, then adds this session's negotiated playout
+// lead. Apple's sbpd sender path reads CMSampleBuffer's output presentation
+// timestamp and adds its screen lead before network-clock conversion; an
+// expired PTS therefore cannot be repaired by assigning old content a new
+// output-time timestamp. A false result tells StreamFrames to discard that
+// access unit and catch up at an IDR.
+// Only a zero PTS, used by the legacy unframed capture path, intentionally
+// retains the historical output-time fallback. A malformed nonzero PTS is not
+// safe to relabel and is discarded too.
+func (s *MirrorSession) frameTimeAt(capturedAt time.Time) (timestamp, timelineID uint64, timely bool) {
+	now := time.Now()
+	if s.frameClockNow != nil {
+		now = s.frameClockNow()
+	}
+	return s.frameTimeAtNow(capturedAt, now)
+}
+
+func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, timelineID uint64, timely bool) {
 	bias := s.timestampBias
 	if bias <= 0 {
 		bias = videoTimestampBias()
 	}
-	if s.mediaClock != nil {
-		if timestamp, timelineID, ok := s.mediaClock.now(bias); ok {
-			return s.monotonicFrameTime(timestamp), timelineID
+	if !capturedAt.IsZero() {
+		age := now.Sub(capturedAt)
+		if age >= -time.Second && age <= 30*time.Second {
+			// Leave a small delivery margin. If the original presentation deadline
+			// has expired, preserve its meaning by dropping the picture; restamping
+			// it as current would permanently turn transient congestion into A/V lag.
+			if age > bias-5*time.Millisecond {
+				if !s.stalePTSReported {
+					dbg("[STREAM] capture PTS is %v old with %v playout lead; dropping stale GOP", age, bias)
+				}
+				s.stalePTSReported = true
+				return 0, 0, false
+			}
+			if s.mediaClock != nil {
+				if timestamp, timelineID, ok := s.mediaClock.at(capturedAt, bias); ok {
+					return s.monotonicFrameTime(timestamp), timelineID, true
+				}
+			} else if presentation, ok := addDurationToBootTime(capturedAt.Sub(now) + bias); ok {
+				return s.monotonicFrameTime(compactTimestamp(presentation)), 0, true
+			}
+			if !s.stalePTSReported {
+				dbg("[STREAM] could not map nonzero capture PTS; dropping stale GOP")
+			}
+			s.stalePTSReported = true
+			return 0, 0, false
+		} else {
+			if !s.stalePTSReported {
+				dbg("[STREAM] capture PTS has implausible age %v; dropping stale GOP", age)
+			}
+			s.stalePTSReported = true
+			return 0, 0, false
 		}
 	}
-	return s.monotonicFrameTime(ntpTimeWithBias(bias)), 0
+	if s.mediaClock != nil {
+		if timestamp, timelineID, ok := s.mediaClock.at(now, bias); ok {
+			return s.monotonicFrameTime(timestamp), timelineID, true
+		}
+	}
+	return s.monotonicFrameTime(ntpTimeWithBias(bias)), 0, true
+}
+
+func addDurationToBootTime(delta time.Duration) (time.Duration, bool) {
+	presentation := bootRelativeNow() + delta
+	if presentation < 0 {
+		return 0, false
+	}
+	return presentation, true
 }
 
 func (s *MirrorSession) monotonicFrameTime(timestamp uint64) uint64 {

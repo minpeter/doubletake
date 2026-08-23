@@ -40,6 +40,7 @@ var errBroadcastSinkBacklog = errors.New("broadcast sink backlog limit exceeded"
 //	go session2.StreamFrames(ctx, sink2.AsCapture(), 0)
 type BroadcastCapture struct {
 	src     *ScreenCapture
+	frames  bool
 	mu      sync.Mutex
 	done    chan struct{}
 	err     error // set before done is closed
@@ -64,6 +65,7 @@ type BroadcastSink struct {
 	cond *sync.Cond
 
 	queue       [][]byte
+	frameQueue  []VideoAccessUnit
 	headOffset  int
 	queuedBytes int
 
@@ -94,6 +96,7 @@ func newBroadcastSink(owner *BroadcastCapture) *BroadcastSink {
 func NewBroadcastCapture(src *ScreenCapture) *BroadcastCapture {
 	return &BroadcastCapture{
 		src:          src,
+		frames:       src != nil && src.frames != nil,
 		done:         make(chan struct{}),
 		drainTimeout: broadcastSinkDrainTimeout,
 	}
@@ -139,6 +142,9 @@ func (bc *BroadcastCapture) RemoveSink(s *BroadcastSink) {
 // should run this in a dedicated goroutine; an empty sink list is intentionally
 // not terminal.
 func (bc *BroadcastCapture) Run() error {
+	if bc.frames {
+		return bc.runFrames()
+	}
 	buf := make([]byte, 256*1024)
 	for {
 		// Reserve this read's sequence before blocking in the source. A sink added
@@ -170,6 +176,40 @@ func (bc *BroadcastCapture) Run() error {
 						// backlog is detached without delaying healthy peers.
 						bc.RemoveSink(s)
 					}
+				}
+			}
+		}
+		if readErr != nil {
+			bc.finish(readErr)
+			return readErr
+		}
+	}
+}
+
+// runFrames preserves access-unit boundaries and capture PTS while sharing one
+// encoder between receivers. Reserving the sequence before the blocking read
+// gives late sinks the same clean next-frame cutover as the byte path.
+func (bc *BroadcastCapture) runFrames() error {
+	for {
+		bc.mu.Lock()
+		bc.sequence++
+		sequence := bc.sequence
+		bc.mu.Unlock()
+
+		frame, readErr := bc.src.ReadVideoAccessUnit()
+		if len(frame.AnnexB) > 0 {
+			bc.mu.Lock()
+			sinks := make([]*BroadcastSink, 0, len(bc.sinks))
+			for _, sink := range bc.sinks {
+				if sink.startSequence <= sequence {
+					sinks = append(sinks, sink)
+				}
+			}
+			bc.mu.Unlock()
+
+			for _, sink := range sinks {
+				if err := sink.enqueueFrame(frame); err != nil {
+					bc.RemoveSink(sink)
 				}
 			}
 		}
@@ -257,12 +297,37 @@ func (s *BroadcastSink) enqueue(p []byte) error {
 	return nil
 }
 
+// enqueueFrame appends an immutable complete access unit without copying it.
+// The same backing bytes can safely be referenced by every receiver queue.
+func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
+	if len(frame.AnnexB) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.inputClosed {
+		return io.ErrClosedPipe
+	}
+	if len(s.frameQueue) >= s.maxQueuedChunks || len(frame.AnnexB) > s.maxQueuedBytes-s.queuedBytes {
+		return errBroadcastSinkBacklog
+	}
+	s.frameQueue = append(s.frameQueue, frame)
+	s.queuedBytes += len(frame.AnnexB)
+	s.cond.Signal()
+	return nil
+}
+
+func (s *BroadcastSink) queueEmptyLocked() bool {
+	return len(s.queue) == 0 && len(s.frameQueue) == 0
+}
+
 // finish marks source EOF without discarding data already queued.
 func (s *BroadcastSink) finish() {
 	s.mu.Lock()
 	if !s.closed && !s.inputClosed {
 		s.inputClosed = true
-		if len(s.queue) == 0 {
+		if s.queueEmptyLocked() {
 			s.closeDoneLocked()
 		}
 		s.cond.Broadcast()
@@ -280,6 +345,10 @@ func (s *BroadcastSink) abort() {
 			s.queue[i] = nil
 		}
 		s.queue = nil
+		for i := range s.frameQueue {
+			s.frameQueue[i].AnnexB = nil
+		}
+		s.frameQueue = nil
 		s.headOffset = 0
 		s.queuedBytes = 0
 		s.closeDoneLocked()
@@ -334,6 +403,36 @@ func (s *BroadcastSink) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ReadVideoAccessUnit returns the next complete timestamped frame. It blocks
+// until a frame arrives, the source ends, or this sink is removed.
+func (s *BroadcastSink) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.frameQueue) == 0 && !s.inputClosed && !s.closed {
+		s.cond.Wait()
+	}
+	if s.closed {
+		return VideoAccessUnit{}, io.EOF
+	}
+	if len(s.frameQueue) == 0 {
+		s.closeDoneLocked()
+		return VideoAccessUnit{}, io.EOF
+	}
+
+	frame := s.frameQueue[0]
+	s.frameQueue[0].AnnexB = nil
+	s.frameQueue = s.frameQueue[1:]
+	s.queuedBytes -= len(frame.AnnexB)
+	if len(s.frameQueue) == 0 {
+		s.frameQueue = nil
+		if s.inputClosed && len(s.queue) == 0 {
+			s.closeDoneLocked()
+			return frame, io.EOF
+		}
+	}
+	return frame, nil
+}
+
 type broadcastSinkReadCloser struct {
 	sink *BroadcastSink
 }
@@ -350,10 +449,14 @@ func (r broadcastSinkReadCloser) Close() error {
 // AsCapture wraps this sink in a synthetic ScreenCapture so it can be passed
 // directly to MirrorSession.StreamFrames.
 func (s *BroadcastSink) AsCapture() *ScreenCapture {
-	return &ScreenCapture{
+	capture := &ScreenCapture{
 		stdout: broadcastSinkReadCloser{sink: s},
 		waitCh: s.done,
 	}
+	if s.owner != nil && s.owner.frames {
+		capture.frames = s
+	}
+	return capture
 }
 
 // Close closes this sink, discarding queued data and signalling EOF to its

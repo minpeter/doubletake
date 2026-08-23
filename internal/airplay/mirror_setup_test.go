@@ -359,6 +359,9 @@ func TestAudioVolumeBody(t *testing.T) {
 }
 
 func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
+	SetTargetLatency(0)
+	t.Cleanup(func() { SetTargetLatency(0) })
+
 	for _, test := range []struct {
 		name       string
 		skipRecord bool
@@ -536,7 +539,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 						serverErr <- fmt.Errorf("audio latencyMin = %d, want 0", got)
 						return
 					}
-					if got, want := plistInt(stream["latencyMax"]), int(samplesFor44k1(ntpPlayoutLatencyFloor)); got != want {
+					if got, want := plistInt(stream["latencyMax"]), int(samplesFor44k1(defaultAudioLatencyNormal)); got != want {
 						serverErr <- fmt.Errorf("audio latencyMax = %d, want %d", got, want)
 						return
 					}
@@ -553,6 +556,10 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 					}, plist.BinaryFormat)
 					waitForEvent = true
 				case 110:
+					if got := plistInt(stream["latencyMs"]); got != int(defaultVideoLatencyNormal/time.Millisecond) {
+						serverErr <- fmt.Errorf("video latencyMs = %d, want %d", got, defaultVideoLatencyNormal/time.Millisecond)
+						return
+					}
 					if got, _ := setup["timingProtocol"].(string); got != timingProtocolNTP {
 						serverErr <- fmt.Errorf("expected timingProtocol NTP in video setup, got %q", got)
 						return
@@ -652,8 +659,11 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 	if !session.HasAudio() {
 		t.Fatal("expected no-audio session setup to keep the negotiated audio stream state")
 	}
-	if !skipRecord && session.timestampBias != 250*time.Millisecond {
-		t.Fatalf("session timestamp bias = %v, want RECORD Audio-Latency of 250ms", session.timestampBias)
+	if session.timestampBias != defaultVideoLatencyNormal {
+		t.Fatalf("session timestamp bias = %v, want %v", session.timestampBias, defaultVideoLatencyNormal)
+	}
+	if got, want := session.audioStream.latencySamples, samplesFor44k1(defaultAudioLatencyNormal); got != want {
+		t.Fatalf("TimeAnnounce lead = %d samples, want %d", got, want)
 	}
 
 	select {

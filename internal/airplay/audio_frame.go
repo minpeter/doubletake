@@ -1,0 +1,319 @@
+package airplay
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+)
+
+const (
+	audioSampleRate             = 44100
+	audioChannels               = 2
+	audioBytesPerSample         = 2
+	audioBytesPerSampleFrame    = audioChannels * audioBytesPerSample
+	audioCapturePayloadType     = 96
+	audioONVIFRTPHeaderProfile  = 0xabac
+	maxAudioCapturePacketBytes  = 65535
+	audioTimestampSlopInSamples = 1
+)
+
+// audioPCMFrameReader is the timestamp-preserving boundary between the
+// GStreamer capture process and the AirPlay audio encoder. The destination is
+// always interleaved stereo S16LE PCM and PTS identifies its first sample.
+type audioPCMFrameReader interface {
+	ReadPCMFrame(dst []byte) (pts time.Time, err error)
+}
+
+// rtpL16PCMFrameReader consumes RFC4571-framed RTP/L16 produced by GStreamer.
+// RTP packet boundaries do not need to match AirPlay codec-frame boundaries.
+type rtpL16PCMFrameReader struct {
+	reader io.Reader
+	now    func() time.Time
+	packet []byte
+	pcm    []byte
+
+	haveTimeline    bool
+	timelinePTS     time.Time
+	timelineRTP     uint32
+	receivedSamples uint64
+	consumedSamples uint64
+	havePacket      bool
+	sequence        uint16
+	ssrc            uint32
+
+	discontinuities uint64
+}
+
+func newRTPL16PCMFrameReader(reader io.Reader) audioPCMFrameReader {
+	return newRTPL16PCMFrameReaderWithNow(reader, time.Now)
+}
+
+func newRTPL16PCMFrameReaderWithNow(reader io.Reader, now func() time.Time) *rtpL16PCMFrameReader {
+	if now == nil {
+		now = time.Now
+	}
+	return &rtpL16PCMFrameReader{reader: reader, now: now}
+}
+
+func (r *rtpL16PCMFrameReader) ReadPCMFrame(dst []byte) (time.Time, error) {
+	if r.reader == nil {
+		return time.Time{}, fmt.Errorf("RTP audio: nil capture reader")
+	}
+	if len(dst) == 0 || len(dst)%audioBytesPerSampleFrame != 0 {
+		return time.Time{}, fmt.Errorf("RTP audio: PCM frame size %d is not whole stereo S16 samples", len(dst))
+	}
+
+	for len(r.pcm) < len(dst) {
+		if err := r.readPacket(); err != nil {
+			if err == io.EOF && len(r.pcm) != 0 {
+				return time.Time{}, io.ErrUnexpectedEOF
+			}
+			return time.Time{}, err
+		}
+	}
+
+	pts := r.timelinePTS.Add(audioSamplesDuration(r.consumedSamples))
+	copy(dst, r.pcm[:len(dst)])
+	r.pcm = r.pcm[len(dst):]
+	r.consumedSamples += uint64(len(dst) / audioBytesPerSampleFrame)
+	return pts, nil
+}
+
+func (r *rtpL16PCMFrameReader) readPacket() error {
+	packet, err := r.readRFC4571Packet()
+	if err != nil {
+		return err
+	}
+	header, payload, err := parseTimestampedL16RTPPacket(packet)
+	if err != nil {
+		return err
+	}
+	if len(payload)%audioBytesPerSampleFrame != 0 {
+		return fmt.Errorf("RTP audio: L16 payload size %d is not whole stereo samples", len(payload))
+	}
+	packetSamples := uint64(len(payload) / audioBytesPerSampleFrame)
+	if packetSamples == 0 {
+		return fmt.Errorf("RTP audio: empty L16 payload")
+	}
+
+	wallPTS := timeFromNTP(header.onvifTimestamp)
+	now := r.now()
+	packetPTS := now.Add(wallPTS.Sub(now))
+	discontinuous := !r.haveTimeline
+	if r.haveTimeline {
+		expectedRTP := r.timelineRTP + uint32(r.receivedSamples)
+		expectedPTS := r.timelinePTS.Add(audioSamplesDuration(r.receivedSamples))
+		ptsDeltaSamples := durationToAudioSamples(packetPTS.Sub(expectedPTS))
+		discontinuous = !r.havePacket || header.sequence != r.sequence+1 || header.ssrc != r.ssrc ||
+			header.timestamp != expectedRTP || absInt64(ptsDeltaSamples) > audioTimestampSlopInSamples
+		if discontinuous {
+			r.discontinuities++
+			dbg("[AUDIO] capture discontinuity: seq=%d->%d rtp=%d->%d pts-delta=%d samples; dropping %d partial PCM bytes",
+				r.sequence, header.sequence, expectedRTP, header.timestamp, ptsDeltaSamples, len(r.pcm))
+		}
+	}
+	if discontinuous {
+		r.pcm = r.pcm[:0]
+		r.timelinePTS = packetPTS
+		r.timelineRTP = header.timestamp
+		r.receivedSamples = 0
+		r.consumedSamples = 0
+		r.haveTimeline = true
+	}
+
+	// RTP L16 is network byte order. Both built-in ALAC and optional FDK-AAC
+	// encoders consume the original interleaved S16LE representation.
+	for i := 0; i < len(payload); i += audioBytesPerSample {
+		r.pcm = append(r.pcm, payload[i+1], payload[i])
+	}
+	r.receivedSamples += packetSamples
+	r.havePacket = true
+	r.sequence = header.sequence
+	r.ssrc = header.ssrc
+	return nil
+}
+
+func (r *rtpL16PCMFrameReader) readRFC4571Packet() ([]byte, error) {
+	var lengthBytes [2]byte
+	if _, err := io.ReadFull(r.reader, lengthBytes[:]); err != nil {
+		if err == io.ErrUnexpectedEOF {
+			return nil, fmt.Errorf("RTP audio: truncated RFC4571 length: %w", err)
+		}
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(lengthBytes[:]))
+	if length == 0 {
+		return nil, fmt.Errorf("RTP audio: zero-length RFC4571 packet")
+	}
+	if length > maxAudioCapturePacketBytes {
+		return nil, fmt.Errorf("RTP audio: packet length %d exceeds %d", length, maxAudioCapturePacketBytes)
+	}
+	if cap(r.packet) < length {
+		r.packet = make([]byte, length)
+	} else {
+		r.packet = r.packet[:length]
+	}
+	if _, err := io.ReadFull(r.reader, r.packet); err != nil {
+		return nil, fmt.Errorf("RTP audio: truncated RFC4571 packet: %w", err)
+	}
+	return r.packet, nil
+}
+
+type timestampedL16RTPHeader struct {
+	sequence       uint16
+	timestamp      uint32
+	ssrc           uint32
+	onvifTimestamp uint64
+}
+
+func parseTimestampedL16RTPPacket(packet []byte) (timestampedL16RTPHeader, []byte, error) {
+	var header timestampedL16RTPHeader
+	if len(packet) < 12 {
+		return header, nil, fmt.Errorf("RTP audio: packet is shorter than the RTP header")
+	}
+	if packet[0]>>6 != 2 {
+		return header, nil, fmt.Errorf("RTP audio: unsupported RTP version %d", packet[0]>>6)
+	}
+	if packet[1]&0x7f != audioCapturePayloadType {
+		return header, nil, fmt.Errorf("RTP audio: unexpected payload type %d", packet[1]&0x7f)
+	}
+
+	padding := packet[0]&0x20 != 0
+	hasExtension := packet[0]&0x10 != 0
+	csrcCount := int(packet[0] & 0x0f)
+	offset := 12 + 4*csrcCount
+	if offset > len(packet) {
+		return header, nil, fmt.Errorf("RTP audio: truncated CSRC list")
+	}
+	if !hasExtension {
+		return header, nil, fmt.Errorf("RTP audio: ONVIF timestamp extension is absent")
+	}
+	if len(packet)-offset < 4 {
+		return header, nil, fmt.Errorf("RTP audio: truncated header extension")
+	}
+	profile := binary.BigEndian.Uint16(packet[offset : offset+2])
+	if profile != audioONVIFRTPHeaderProfile {
+		return header, nil, fmt.Errorf("RTP audio: unexpected header extension profile 0x%04x", profile)
+	}
+	extensionBytes := int(binary.BigEndian.Uint16(packet[offset+2:offset+4])) * 4
+	offset += 4
+	if extensionBytes < 12 || extensionBytes > len(packet)-offset {
+		return header, nil, fmt.Errorf("RTP audio: invalid ONVIF extension size %d", extensionBytes)
+	}
+	onvifTimestamp := binary.BigEndian.Uint64(packet[offset : offset+8])
+	if onvifTimestamp == 0 {
+		return header, nil, fmt.Errorf("RTP audio: zero ONVIF timestamp")
+	}
+	offset += extensionBytes
+
+	payloadEnd := len(packet)
+	if padding {
+		paddingBytes := int(packet[len(packet)-1])
+		if paddingBytes == 0 || paddingBytes > payloadEnd-offset {
+			return header, nil, fmt.Errorf("RTP audio: invalid padding length %d", paddingBytes)
+		}
+		payloadEnd -= paddingBytes
+	}
+	if payloadEnd <= offset {
+		return header, nil, fmt.Errorf("RTP audio: packet has no L16 payload")
+	}
+
+	header = timestampedL16RTPHeader{
+		sequence:       binary.BigEndian.Uint16(packet[2:4]),
+		timestamp:      binary.BigEndian.Uint32(packet[4:8]),
+		ssrc:           binary.BigEndian.Uint32(packet[8:12]),
+		onvifTimestamp: onvifTimestamp,
+	}
+	return header, packet[offset:payloadEnd], nil
+}
+
+func audioSamplesDuration(samples uint64) time.Duration {
+	seconds := samples / audioSampleRate
+	remainder := samples % audioSampleRate
+	return time.Duration(seconds)*time.Second +
+		time.Duration((remainder*uint64(time.Second)+audioSampleRate/2)/audioSampleRate)
+}
+
+func durationToAudioSamples(delta time.Duration) int64 {
+	seconds := int64(delta / time.Second)
+	remainder := int64(delta % time.Second)
+	whole := seconds * audioSampleRate
+	if remainder >= 0 {
+		return whole + (remainder*audioSampleRate+int64(time.Second)/2)/int64(time.Second)
+	}
+	return whole - ((-remainder)*audioSampleRate+int64(time.Second)/2)/int64(time.Second)
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+// audioRTPClock maps the source sample timebase onto the sender's random RTP
+// epoch. It is safe for the media loop and periodic TimeAnnounce loop to share.
+type audioRTPClock struct {
+	mu sync.RWMutex
+
+	valid          bool
+	anchorPTS      time.Time
+	anchorRTP      uint32
+	lastFramePTS   time.Time
+	lastFrameRTP   uint32
+	lastFrameCount uint32
+}
+
+func newAudioRTPClock(epoch uint32) *audioRTPClock {
+	return &audioRTPClock{anchorRTP: epoch}
+}
+
+// mapFrame returns the outgoing timestamp for a source frame. Forward source
+// gaps remain RTP gaps. A backward source-clock reset starts a new linear map
+// after the previous frame and asks the caller to publish a reset announce.
+func (c *audioRTPClock) mapFrame(pts time.Time, samples uint32) (rtp uint32, reset bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.valid {
+		c.valid = true
+		c.anchorPTS = pts
+		c.lastFramePTS = pts
+		c.lastFrameRTP = c.anchorRTP
+		c.lastFrameCount = samples
+		return c.anchorRTP, false
+	}
+
+	if pts.Before(c.lastFramePTS) {
+		c.anchorRTP = c.lastFrameRTP + c.lastFrameCount
+		c.anchorPTS = pts
+		rtp = c.anchorRTP
+		reset = true
+	} else {
+		deltaSamples := durationToAudioSamples(pts.Sub(c.anchorPTS))
+		rtp = c.anchorRTP + uint32(deltaSamples)
+		minimum := c.lastFrameRTP + c.lastFrameCount
+		if int32(rtp-minimum) < 0 {
+			// Sub-sample PTS jitter must not overlap already-sent media.
+			rtp = minimum
+			c.anchorRTP = rtp
+			c.anchorPTS = pts
+		}
+	}
+	c.lastFramePTS = pts
+	c.lastFrameRTP = rtp
+	c.lastFrameCount = samples
+	return rtp, reset
+}
+
+func (c *audioRTPClock) rtpAt(localTime time.Time) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.valid || localTime.IsZero() {
+		return 0, false
+	}
+	deltaSamples := durationToAudioSamples(localTime.Sub(c.anchorPTS))
+	return c.anchorRTP + uint32(deltaSamples), true
+}

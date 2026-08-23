@@ -178,11 +178,11 @@ func TestCaptureBitrateUsesReceiverSize(t *testing.T) {
 }
 
 func TestKeyframeIntervalFrames(t *testing.T) {
-	if got := keyframeIntervalFrames(30); got != 120 {
-		t.Fatalf("keyframeIntervalFrames(30) = %d, want 120", got)
+	if got := keyframeIntervalFrames(30); got != 60 {
+		t.Fatalf("keyframeIntervalFrames(30) = %d, want 60", got)
 	}
-	if got := keyframeIntervalFrames(0); got != 120 {
-		t.Fatalf("keyframeIntervalFrames(0) = %d, want 120", got)
+	if got := keyframeIntervalFrames(0); got != 60 {
+		t.Fatalf("keyframeIntervalFrames(0) = %d, want 60", got)
 	}
 }
 
@@ -272,6 +272,7 @@ func TestBuildGstVideoPipeline(t *testing.T) {
 		encoder,
 		0,
 		0,
+		false,
 	)
 	want := []string{
 		"--quiet", "testsrc", "is-live=true",
@@ -291,6 +292,24 @@ func TestBuildGstVideoPipeline(t *testing.T) {
 	}
 }
 
+func TestBuildGstVideoPipelineTimestampedOutput(t *testing.T) {
+	encoder := encoderResult{parts: gstStage{"testh264enc"}, rawFormat: "I420"}
+	pipeline := buildGstVideoPipeline(
+		gstStage{"testsrc"}, nil, nil, encoder, 0, 0, true,
+	)
+	wantSuffix := []string{
+		"!", "h264parse", "config-interval=-1",
+		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
+		"!", "rtph264pay", "pt=96", "mtu=60000", "aggregate-mode=none", "timestamp-offset=0", "seqnum-offset=0",
+		"!", "rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false",
+		"!", "rtpstreampay",
+		"!", "fdsink", "fd=1", "sync=false", "async=false",
+	}
+	if got := pipeline[len(pipeline)-len(wantSuffix):]; !reflect.DeepEqual(got, wantSuffix) {
+		t.Fatalf("timestamped encoding suffix = %v, want %v", got, wantSuffix)
+	}
+}
+
 func TestBuildGstVideoPipelineSharesEncodingSuffix(t *testing.T) {
 	encoder := encoderResult{
 		parts:       gstStage{"vulkanh264enc", "bitrate=2500"},
@@ -304,6 +323,7 @@ func TestBuildGstVideoPipelineSharesEncodingSuffix(t *testing.T) {
 		encoder,
 		0,
 		0,
+		false,
 	)
 	x11 := buildGstVideoPipeline(
 		gstStage{"ximagesrc", "display-name=:0"},
@@ -312,6 +332,7 @@ func TestBuildGstVideoPipelineSharesEncodingSuffix(t *testing.T) {
 		encoder,
 		0,
 		0,
+		false,
 	)
 	wantSuffix := []string{
 		"!", "vulkanupload",
@@ -341,6 +362,7 @@ func TestBuildGstVideoPipelineSharesReceiverScaling(t *testing.T) {
 			encoder,
 			1280,
 			720,
+			false,
 		),
 		"X11": buildGstVideoPipeline(
 			gstStage{"ximagesrc", "display-name=:0"},
@@ -349,6 +371,7 @@ func TestBuildGstVideoPipelineSharesReceiverScaling(t *testing.T) {
 			encoder,
 			1280,
 			720,
+			false,
 		),
 		"test": buildGstVideoPipeline(
 			gstStage{"videotestsrc", "is-live=true"},
@@ -357,6 +380,7 @@ func TestBuildGstVideoPipelineSharesReceiverScaling(t *testing.T) {
 			encoder,
 			1280,
 			720,
+			false,
 		),
 	}
 
@@ -434,7 +458,7 @@ func TestDetectGstEncoderSelectsExplicitOpenH264(t *testing.T) {
 	wantParts := gstStage{
 		"openh264enc",
 		"bitrate=2500000",
-		"gop-size=100",
+		"gop-size=50",
 		"rate-control=bitrate",
 		"usage-type=screen",
 	}
