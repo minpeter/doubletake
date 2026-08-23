@@ -34,7 +34,7 @@ func TestFrameTimeAtPreservesPTPSourcePTS(t *testing.T) {
 	}
 }
 
-func TestFrameTimeAtRejectsSourcePTSThatWouldAlreadyBeLate(t *testing.T) {
+func TestFrameTimeAtPreservesLateSourcePTS(t *testing.T) {
 	const timeline = uint64(0x48e15caa8da00008)
 	now := time.Unix(1700000000, 0)
 	clock := &mediaClock{
@@ -43,15 +43,16 @@ func TestFrameTimeAtRejectsSourcePTSThatWouldAlreadyBeLate(t *testing.T) {
 		timelineID:      timeline,
 	}
 	session := &MirrorSession{mediaClock: clock, timestampBias: 100 * time.Millisecond}
-	got, gotTimeline, timely := session.frameTimeAtNow(now.Add(-500*time.Millisecond), now)
-	if timely {
-		t.Fatalf("stale capture PTS was accepted with timestamp 0x%016x timeline 0x%016x", got, gotTimeline)
+	got, gotTimeline, mapped := session.frameTimeAtNow(now.Add(-500*time.Millisecond), now)
+	if !mapped {
+		t.Fatal("late capture PTS was rejected")
 	}
-	if got != 0 || gotTimeline != 0 {
-		t.Fatalf("rejected timestamp = (0x%016x, 0x%016x), want zero values", got, gotTimeline)
+	want := compactTimestamp(10*time.Second + 600*time.Millisecond)
+	if got != want || gotTimeline != timeline {
+		t.Fatalf("late timestamp = (0x%016x, 0x%016x), want (0x%016x, 0x%016x)", got, gotTimeline, want, timeline)
 	}
-	if !session.stalePTSReported {
-		t.Fatal("stale capture PTS was not reported")
+	if !session.latePTSReported {
+		t.Fatal("late capture PTS was not reported")
 	}
 }
 
@@ -157,21 +158,18 @@ func TestStreamFramesUsesAccessUnitPTSWithoutLookahead(t *testing.T) {
 	}
 }
 
-func TestStreamFramesDropsStaleGOPUntilLiveIDR(t *testing.T) {
-	now := time.Unix(1700000000, 0)
+func TestStreamFramesForwardsLateReferenceChain(t *testing.T) {
+	base := time.Unix(1700000000, 0)
 	frames := []VideoAccessUnit{
 		{AnnexB: joinAnnexBNALs(
 			[]byte{0x67, 0x42, 0x00, 0x1f, 0xf8, 0x0a, 0x00, 0xb7, 0x20},
 			[]byte{0x68, 0xce, 0x06, 0xe2},
 			[]byte{0x65, 0x80, 0x01},
-		), PTS: now.Add(-100 * time.Millisecond)},
-		// Dropping this reference picture invalidates the rest of its GOP.
-		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x02}), PTS: now.Add(-800 * time.Millisecond)},
-		// This picture is timely, but may depend on the discarded picture.
-		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x03}), PTS: now.Add(-50 * time.Millisecond)},
-		// A live IDR is the first safe recovery point.
-		{AnnexB: joinAnnexBNALs([]byte{0x65, 0x80, 0x04}), PTS: now.Add(-40 * time.Millisecond)},
-		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x05}), PTS: now.Add(-30 * time.Millisecond)},
+		), PTS: base},
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x02}), PTS: base.Add(33 * time.Millisecond)},
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x03}), PTS: base.Add(66 * time.Millisecond)},
+		{AnnexB: joinAnnexBNALs([]byte{0x65, 0x80, 0x04}), PTS: base.Add(99 * time.Millisecond)},
+		{AnnexB: joinAnnexBNALs([]byte{0x61, 0x80, 0x05}), PTS: base.Add(132 * time.Millisecond)},
 	}
 	capture := &ScreenCapture{
 		frames: &sliceVideoAccessUnitReader{frames: frames},
@@ -185,13 +183,28 @@ func TestStreamFramesDropsStaleGOPUntilLiveIDR(t *testing.T) {
 		copyDone <- err
 	}()
 
+	nowValues := []time.Time{
+		base.Add(50 * time.Millisecond),
+		base.Add(110 * time.Millisecond), // The second AU has missed its 75 ms deadline.
+		base.Add(120 * time.Millisecond),
+		base.Add(130 * time.Millisecond),
+		base.Add(140 * time.Millisecond),
+	}
+	nowIndex := 0
 	session := &MirrorSession{
 		dataConn:       sender,
 		firstFrameSent: make(chan struct{}),
-		timestampBias:  500 * time.Millisecond,
-		frameClockNow:  func() time.Time { return now },
+		timestampBias:  75 * time.Millisecond,
+		frameClockNow: func() time.Time {
+			if nowIndex >= len(nowValues) {
+				t.Fatalf("frame clock read %d exceeds %d access units", nowIndex+1, len(nowValues))
+			}
+			now := nowValues[nowIndex]
+			nowIndex++
+			return now
+		},
 		mediaClock: &mediaClock{
-			anchorLocal:     now.Add(-time.Second),
+			anchorLocal:     base,
 			anchorTimestamp: compactTimestamp(10 * time.Second),
 			timelineID:      1,
 		},
@@ -205,22 +218,25 @@ func TestStreamFramesDropsStaleGOPUntilLiveIDR(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unexpectedly") {
 		t.Fatalf("StreamFrames error = %v, want capture EOF", err)
 	}
-	if !session.stalePTSReported {
-		t.Fatal("stale access unit was not detected")
+	if !session.latePTSReported {
+		t.Fatal("late access unit was not detected")
 	}
 
 	packets := splitMirrorPackets(t, output.Bytes())
-	if len(packets) != 4 {
-		t.Fatalf("sent %d packets, want codec + initial IDR + recovery IDR + following P-frame", len(packets))
+	if len(packets) != 6 {
+		t.Fatalf("sent %d packets, want codec plus all five VCL access units", len(packets))
 	}
 	if packets[0].header[4] != 1 {
 		t.Fatalf("packet 0 type = %d, want codec", packets[0].header[4])
 	}
-	for index, wantNAL := range [][]byte{
+	wantNALs := [][]byte{
 		{0x65, 0x80, 0x01},
+		{0x61, 0x80, 0x02},
+		{0x61, 0x80, 0x03},
 		{0x65, 0x80, 0x04},
 		{0x61, 0x80, 0x05},
-	} {
+	}
+	for index, wantNAL := range wantNALs {
 		packet := packets[index+1]
 		if packet.header[4] != 0 {
 			t.Fatalf("packet %d type = %d, want VCL", index+1, packet.header[4])
@@ -228,10 +244,20 @@ func TestStreamFramesDropsStaleGOPUntilLiveIDR(t *testing.T) {
 		if got := firstAVCCNAL(t, packet.payload); !bytes.Equal(got, wantNAL) {
 			t.Fatalf("packet %d NAL = %x, want %x", index+1, got, wantNAL)
 		}
+		if index > 0 {
+			previous := binary.LittleEndian.Uint64(packets[index].header[8:16])
+			current := binary.LittleEndian.Uint64(packet.header[8:16])
+			delta := time.Duration(((current - previous) * uint64(time.Second)) >> 32)
+			if difference := delta - 33*time.Millisecond; difference < -2*time.Millisecond || difference > 2*time.Millisecond {
+				t.Fatalf("packet %d timestamp delta = %v, want 33ms", index+1, delta)
+			}
+		}
 	}
-	if packets[1].header[5] != 0x10 || packets[2].header[5] != 0x10 || packets[3].header[5] != 0 {
-		t.Fatalf("VCL keyframe flags = [%02x %02x %02x], want [10 10 00]",
-			packets[1].header[5], packets[2].header[5], packets[3].header[5])
+	wantFlags := []byte{0x10, 0, 0, 0x10, 0}
+	for index, want := range wantFlags {
+		if got := packets[index+1].header[5]; got != want {
+			t.Fatalf("VCL packet %d keyframe flag = %02x, want %02x", index+1, got, want)
+		}
 	}
 }
 

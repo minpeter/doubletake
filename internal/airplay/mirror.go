@@ -222,7 +222,7 @@ type MirrorSession struct {
 	frameSeq           uint32
 	lastFrameTimestamp uint64
 	firstFrameSent     chan struct{} // closed after first video frame is sent
-	stalePTSReported   bool
+	latePTSReported    bool
 	timestampBias      time.Duration
 	frameClockNow      func() time.Time
 	timingProtocol     string
@@ -1122,8 +1122,6 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 	var pendingKeyframe bool        // true if vclBuf contains IDR slice(s)
 	var codecSent bool              // true if codec frame sent for current keyframe
 	var streamPrimed bool           // true after first SPS/PPS+IDR has been sent
-	var awaitingRecoveryIDR bool    // true after dropping a stale reference chain
-	var droppedForCatchUp int
 	var frameCount int
 	var lastProgressLog time.Time
 	var nalLog strings.Builder
@@ -1153,21 +1151,9 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			}
 		}
 
-		// Once a VCL access unit is discarded, later inter-predicted pictures may
-		// reference data the receiver never saw. Catch up at the next IDR rather
-		// than forwarding an otherwise timely but undecodable suffix of that GOP.
-		if awaitingRecoveryIDR && !pendingKeyframe {
-			droppedForCatchUp++
-			resetVCL()
-			return nil
-		}
-
-		packetTimestamp, packetTimeline, timely := s.frameTimeAt(vclPTS)
-		if !timely {
-			awaitingRecoveryIDR = true
-			droppedForCatchUp++
-			resetVCL()
-			return nil
+		packetTimestamp, packetTimeline, mapped := s.frameTimeAt(vclPTS)
+		if !mapped {
+			return fmt.Errorf("map capture PTS %v to receiver clock", vclPTS)
 		}
 
 		// Send SPS+PPS as an unencrypted avcC codec frame initially and whenever
@@ -1219,11 +1205,6 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 
 		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
-		}
-		if pendingKeyframe && awaitingRecoveryIDR {
-			dbg("[STREAM] caught up at a live IDR after dropping %d access units", droppedForCatchUp)
-			awaitingRecoveryIDR = false
-			droppedForCatchUp = 0
 		}
 		// Codec configuration alone is not a displayed picture. Start audio and
 		// data heartbeats only after the receiver has a successfully written VCL
@@ -2303,12 +2284,15 @@ func (s *MirrorSession) frameTimeNow() (timestamp, timelineID uint64) {
 // lead. Apple's sbpd sender path reads CMSampleBuffer's output presentation
 // timestamp and adds its screen lead before network-clock conversion; an
 // expired PTS therefore cannot be repaired by assigning old content a new
-// output-time timestamp. A false result tells StreamFrames to discard that
-// access unit and catch up at an IDR.
+// output-time timestamp. Plausible late frames keep their original timestamp:
+// dropping an encoded reference picture would invalidate the rest of its GOP,
+// while Apple's receiver records lateness and still enqueues the frame. A false
+// result is reserved for an invalid or unmappable timestamp and terminates the
+// stream rather than silently poisoning the decoder reference chain.
 // Only a zero PTS, used by the legacy unframed capture path, intentionally
 // retains the historical output-time fallback. A malformed nonzero PTS is not
-// safe to relabel and is discarded too.
-func (s *MirrorSession) frameTimeAt(capturedAt time.Time) (timestamp, timelineID uint64, timely bool) {
+// safe to relabel and is rejected.
+func (s *MirrorSession) frameTimeAt(capturedAt time.Time) (timestamp, timelineID uint64, mapped bool) {
 	now := time.Now()
 	if s.frameClockNow != nil {
 		now = s.frameClockNow()
@@ -2316,7 +2300,7 @@ func (s *MirrorSession) frameTimeAt(capturedAt time.Time) (timestamp, timelineID
 	return s.frameTimeAtNow(capturedAt, now)
 }
 
-func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, timelineID uint64, timely bool) {
+func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, timelineID uint64, mapped bool) {
 	bias := s.timestampBias
 	if bias <= 0 {
 		bias = videoTimestampBias()
@@ -2324,15 +2308,14 @@ func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, ti
 	if !capturedAt.IsZero() {
 		age := now.Sub(capturedAt)
 		if age >= -time.Second && age <= 30*time.Second {
-			// Leave a small delivery margin. If the original presentation deadline
-			// has expired, preserve its meaning by dropping the picture; restamping
-			// it as current would permanently turn transient congestion into A/V lag.
+			// Leave a small delivery margin for diagnostics. A late encoded frame must
+			// still be sent at its original deadline so H.264 reference continuity is
+			// preserved; the receiver decides whether its presentation is too late.
 			if age > bias-5*time.Millisecond {
-				if !s.stalePTSReported {
-					dbg("[STREAM] capture PTS is %v old with %v playout lead; dropping stale GOP", age, bias)
+				if !s.latePTSReported {
+					dbg("[STREAM] capture PTS is %v old with %v playout lead; forwarding late frame with original timestamp", age, bias)
 				}
-				s.stalePTSReported = true
-				return 0, 0, false
+				s.latePTSReported = true
 			}
 			if s.mediaClock != nil {
 				if timestamp, timelineID, ok := s.mediaClock.at(capturedAt, bias); ok {
@@ -2341,16 +2324,16 @@ func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, ti
 			} else if presentation, ok := addDurationToBootTime(capturedAt.Sub(now) + bias); ok {
 				return s.monotonicFrameTime(compactTimestamp(presentation)), 0, true
 			}
-			if !s.stalePTSReported {
-				dbg("[STREAM] could not map nonzero capture PTS; dropping stale GOP")
+			if !s.latePTSReported {
+				dbg("[STREAM] could not map nonzero capture PTS")
 			}
-			s.stalePTSReported = true
+			s.latePTSReported = true
 			return 0, 0, false
 		} else {
-			if !s.stalePTSReported {
-				dbg("[STREAM] capture PTS has implausible age %v; dropping stale GOP", age)
+			if !s.latePTSReported {
+				dbg("[STREAM] capture PTS has implausible age %v", age)
 			}
-			s.stalePTSReported = true
+			s.latePTSReported = true
 			return 0, 0, false
 		}
 	}
