@@ -29,6 +29,20 @@ type screenLatencyTargets struct {
 	audio time.Duration
 }
 
+// withMinimumVideoLead gives a locally measured capture pipeline enough room
+// while preserving the relative audio/video policy selected by Apple for the
+// connection hint. This is sender scheduling compensation, not a receiver or
+// codec-specific clock offset.
+func (targets screenLatencyTargets) withMinimumVideoLead(minimum time.Duration) screenLatencyTargets {
+	if minimum <= targets.video {
+		return targets
+	}
+	delta := minimum - targets.video
+	targets.video += delta
+	targets.audio += delta
+	return targets
+}
+
 var targetLatencyNS atomic.Int64
 
 // SetTargetLatency sets the application's explicit joint playout lead. Apple's
@@ -55,6 +69,10 @@ func SetTargetLatency(d time.Duration) {
 // bias; new session setup should use screenLatenciesForHint.
 func TargetLatency() time.Duration {
 	return screenLatenciesForHint(connectionLatencyNormal).video
+}
+
+func targetLatencyIsExplicit() bool {
+	return targetLatencyNS.Load() > 0
 }
 
 func screenLatenciesForHint(hint connectionLatencyHint) screenLatencyTargets {

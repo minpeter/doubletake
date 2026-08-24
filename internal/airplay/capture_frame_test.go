@@ -73,6 +73,39 @@ func TestRTPVideoAccessUnitReaderReassemblesFUA(t *testing.T) {
 	}
 }
 
+func TestRTPVideoAccessUnitReaderReassemblesHEVCFU(t *testing.T) {
+	pts := time.Unix(1787276300, 0)
+	stream := joinTestRTPPackets(
+		testRTPPacket{20, 12000, ntpFromTime(pts), false, []byte{0x62, 0x01, 0x93, 0x11, 0x22}},
+		testRTPPacket{21, 12000, ntpFromTime(pts), false, []byte{0x62, 0x01, 0x13, 0x33, 0x44}},
+		testRTPPacket{22, 12000, ntpFromTime(pts), true, []byte{0x62, 0x01, 0x53, 0x55}},
+	)
+	reader := newRTPVideoAccessUnitReaderForCodecWithNow(bytes.NewReader(stream), VideoCodecHEVC, time.Now)
+	unit, err := reader.ReadVideoAccessUnit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0, 0, 0, 1, 0x26, 0x01, 0x11, 0x22, 0x33, 0x44, 0x55}
+	if !bytes.Equal(unit.AnnexB, want) {
+		t.Fatalf("reassembled HEVC FU = %x, want %x", unit.AnnexB, want)
+	}
+}
+
+func TestRTPVideoAccessUnitReaderAcceptsHEVCAP(t *testing.T) {
+	pts := ntpFromTime(time.Unix(1787276300, 0))
+	ap := []byte{0x60, 0x01, 0, 3, 0x40, 0x01, 0xaa, 0, 4, 0x42, 0x01, 0xbb, 0xcc}
+	stream := joinTestRTPPackets(testRTPPacket{1, 1, pts, true, ap})
+	reader := newRTPVideoAccessUnitReaderForCodecWithNow(bytes.NewReader(stream), VideoCodecHEVC, time.Now)
+	unit, err := reader.ReadVideoAccessUnit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0, 0, 0, 1, 0x40, 0x01, 0xaa, 0, 0, 0, 1, 0x42, 0x01, 0xbb, 0xcc}
+	if !bytes.Equal(unit.AnnexB, want) {
+		t.Fatalf("HEVC AP access unit = %x, want %x", unit.AnnexB, want)
+	}
+}
+
 func TestRTPVideoAccessUnitReaderAcceptsSTAPA(t *testing.T) {
 	pts := ntpFromTime(time.Unix(1787276300, 0))
 	stap := []byte{0x78, 0, 2, 0x67, 0x01, 0, 3, 0x68, 0x02, 0x03}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -50,7 +51,7 @@ func TestCapturePreparationFailedStartReleasesTransferredResources(t *testing.T)
 		kind: capturePreparationWayland,
 		pwFd: portalFD,
 	}
-	if _, err := preparation.Start(1920, 1080); err == nil || !strings.Contains(err.Error(), "unknown H.264 encoder") {
+	if _, err := preparation.Start(1920, 1080); err == nil || !strings.Contains(err.Error(), "unknown encoder") {
 		t.Fatalf("failed Start error = %v, want deterministic encoder validation error", err)
 	}
 	if _, err := portalFD.Stat(); !errors.Is(err, os.ErrClosed) {
@@ -62,6 +63,71 @@ func TestCapturePreparationFailedStartReleasesTransferredResources(t *testing.T)
 	preparation.Close() // Start owns cleanup after the ownership transfer.
 	if _, err := preparation.Start(1280, 720); err == nil || !strings.Contains(err.Error(), "already been used") {
 		t.Fatalf("second Start error = %v, want single-use rejection", err)
+	}
+}
+
+func TestAutomaticCapturePreparationRequiresResolvedCodec(t *testing.T) {
+	preparation := &CapturePreparation{cfg: CaptureConfig{VideoCodec: VideoCodecAuto}}
+	if _, err := preparation.Start(1920, 1080); err == nil || !strings.Contains(err.Error(), "has not been resolved") {
+		t.Fatalf("unresolved automatic Start error = %v", err)
+	}
+	if preparation.used {
+		t.Fatal("unresolved automatic Start consumed the preparation")
+	}
+}
+
+func TestAutomaticCodecRejectsUnresolvedConvenienceCapture(t *testing.T) {
+	if _, err := StartTestCapture(context.Background(), CaptureConfig{VideoCodec: VideoCodecAuto}); err == nil || !strings.Contains(err.Error(), "StartWithCodec") {
+		t.Fatalf("StartTestCapture(auto) error = %v", err)
+	}
+}
+
+func TestAutomaticHEVCAvailabilityRequiresHardwareAndFullTimestampStack(t *testing.T) {
+	elements := map[string]bool{
+		"nvh265enc":         true,
+		"h265parse":         true,
+		"rtph265pay":        true,
+		"rtponviftimestamp": true,
+		"rtpstreampay":      true,
+	}
+	probe := func(name string) bool { return elements[name] }
+	for _, hwaccel := range []string{"", "auto", "nvenc"} {
+		if !automaticHEVCAvailableWithProbe(hwaccel, probe) {
+			t.Errorf("automatic HEVC unavailable for hwaccel %q with complete hardware stack", hwaccel)
+		}
+	}
+	for _, hwaccel := range []string{"none", "vaapi", "openh264"} {
+		if automaticHEVCAvailableWithProbe(hwaccel, probe) {
+			t.Errorf("automatic HEVC accepted non-hardware-HEVC hwaccel %q", hwaccel)
+		}
+	}
+	for _, missing := range []string{"nvh265enc", "h265parse", "rtph265pay", "rtponviftimestamp", "rtpstreampay"} {
+		elements[missing] = false
+		if automaticHEVCAvailableWithProbe("auto", probe) {
+			t.Errorf("automatic HEVC accepted stack missing %s", missing)
+		}
+		elements[missing] = true
+	}
+}
+
+func TestRecommendedAutomaticVideoLatencyUsesP95AndDeliveryMargin(t *testing.T) {
+	if _, ok := recommendedAutomaticVideoLatency(nil); ok {
+		t.Fatal("empty latency sample set was accepted")
+	}
+	if got, ok := recommendedAutomaticVideoLatency([]time.Duration{20 * time.Millisecond}); !ok || got != defaultVideoLatencyNormal {
+		t.Fatalf("fast pipeline recommendation = (%v, %t), want (%v, true)", got, ok, defaultVideoLatencyNormal)
+	}
+	ages := make([]time.Duration, 20)
+	for i := range ages {
+		ages[i] = time.Duration(80+i) * time.Millisecond
+	}
+	got, ok := recommendedAutomaticVideoLatency(ages)
+	// p95 is the nineteenth value (98 ms); reserve the 50 ms delivery margin.
+	if !ok || got != 148*time.Millisecond {
+		t.Fatalf("measured recommendation = (%v, %t), want (148ms, true)", got, ok)
+	}
+	if _, ok := recommendedAutomaticVideoLatency([]time.Duration{460 * time.Millisecond}); ok {
+		t.Fatal("pipeline exceeding the bounded automatic lead was accepted")
 	}
 }
 
@@ -103,7 +169,7 @@ func TestStartTestCaptureRejectsUnknownHWAccel(t *testing.T) {
 		}
 		t.Fatal("StartTestCapture accepted an unknown hwaccel value")
 	}
-	if !strings.Contains(err.Error(), "unknown H.264 encoder") {
+	if !strings.Contains(err.Error(), "unknown encoder") {
 		t.Fatalf("StartTestCapture error = %q", err)
 	}
 }
@@ -307,6 +373,71 @@ func TestBuildGstVideoPipelineTimestampedOutput(t *testing.T) {
 	}
 	if got := pipeline[len(pipeline)-len(wantSuffix):]; !reflect.DeepEqual(got, wantSuffix) {
 		t.Fatalf("timestamped encoding suffix = %v, want %v", got, wantSuffix)
+	}
+}
+
+func TestBuildGstHEVCVideoPipelineTimestampedOutput(t *testing.T) {
+	encoder := encoderResult{codec: VideoCodecHEVC, parts: gstStage{"testh265enc"}, rawFormat: "P010_10LE"}
+	pipeline := buildGstVideoPipeline(gstStage{"testsrc"}, nil, nil, encoder, 3840, 2160, true)
+	joined := strings.Join(pipeline, " ")
+	for _, want := range []string{
+		"video/x-raw,format=P010_10LE",
+		"video/x-raw,width=3840,height=2160,pixel-aspect-ratio=1/1",
+		"testh265enc ! h265parse config-interval=-1",
+		"video/x-h265,stream-format=byte-stream,alignment=au",
+		"rtph265pay pt=96",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("HEVC pipeline %q does not contain %q", joined, want)
+		}
+	}
+}
+
+func TestHEVCTestCaptureProducesUsableSampleDescription(t *testing.T) {
+	if !hasGstElement("x265enc") || !supportsTimestampedVideoOutput(VideoCodecHEVC) {
+		t.Skip("GStreamer HEVC timestamp pipeline is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	capture, err := StartTestCapture(ctx, CaptureConfig{
+		FPS: 5, Bitrate: 1000, HWAccel: "none", VideoCodec: VideoCodecHEVC,
+		MaxWidth: 320, MaxHeight: 180,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer capture.Stop()
+	var vps, sps, pps []byte
+	for len(vps) == 0 || len(sps) == 0 || len(pps) == 0 {
+		unit, readErr := capture.ReadVideoAccessUnit()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		for _, nal := range splitAnnexBAccessUnit(unit.AnnexB) {
+			raw := stripStartCode(nal)
+			switch hevcNALType(raw) {
+			case 32:
+				vps = append([]byte(nil), raw...)
+			case 33:
+				sps = append([]byte(nil), raw...)
+			case 34:
+				pps = append([]byte(nil), raw...)
+			}
+		}
+	}
+	description, err := buildHEVCSampleDescription(vps, sps, pps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(description[4:8]) != "hvc1" || string(description[90:94]) != "hvcC" {
+		t.Fatalf("HEVC sample description has invalid boxes: %x", description[:min(128, len(description))])
+	}
+	if description[117] != 0xa0 { // array_completeness + VPS NAL type 32
+		t.Fatalf("first hvcC parameter-set array starts with 0x%02x, want 0xa0", description[117])
+	}
+	info, ok := parseHEVCSPS(sps)
+	if !ok || info.width != 320 || info.height != 180 {
+		t.Fatalf("HEVC SPS size = %dx%d ok=%v, want 320x180", info.width, info.height, ok)
 	}
 }
 

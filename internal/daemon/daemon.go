@@ -94,6 +94,7 @@ type Config struct {
 	PortMin     int // inclusive local UDP port bound; zero with PortMax means ephemeral
 	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
 	HWAccel     string
+	VideoCodec  airplay.VideoCodec
 	Debug       bool
 	TestMode    bool
 	NoEncrypt   bool
@@ -105,13 +106,14 @@ type Config struct {
 
 func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
 	return airplay.StreamConfig{
-		FPS:       d.cfg.FPS,
-		Bitrate:   d.cfg.Bitrate,
-		NoEncrypt: d.cfg.NoEncrypt,
-		DirectKey: d.cfg.DirectKey,
-		NoAudio:   d.cfg.NoAudio,
-		PortMin:   d.cfg.PortMin,
-		PortMax:   d.cfg.PortMax,
+		FPS:        d.cfg.FPS,
+		Bitrate:    d.cfg.Bitrate,
+		VideoCodec: d.cfg.VideoCodec,
+		NoEncrypt:  d.cfg.NoEncrypt,
+		DirectKey:  d.cfg.DirectKey,
+		NoAudio:    d.cfg.NoAudio,
+		PortMin:    d.cfg.PortMin,
+		PortMax:    d.cfg.PortMax,
 	}
 }
 
@@ -213,12 +215,13 @@ type activeStream struct {
 	credentialKind CredentialKind
 }
 
-// videoCaptureKey identifies captures which can safely share one encoded H.264
+// videoCaptureKey identifies captures which can safely share one encoded
 // stream. Capture settings are daemon-wide, so only the receiver's nominal
-// canvas varies between concurrent targets.
+// canvas and codec vary between concurrent targets.
 type videoCaptureKey struct {
 	maxWidth  int
 	maxHeight int
+	codec     airplay.VideoCodec
 }
 
 // videoCaptureGroup owns one capture/encoder and its byte-stream fan-out. A
@@ -322,6 +325,12 @@ type Daemon struct {
 func New(cfg Config) (*Daemon, error) {
 	if err := airplay.ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, fmt.Errorf("hwaccel: %w", err)
+	}
+	if err := airplay.ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
+		return nil, fmt.Errorf("video codec: %w", err)
+	}
+	if cfg.VideoCodec == "" {
+		cfg.VideoCodec = airplay.VideoCodecAuto
 	}
 	if err := validatePortRange(cfg.PortMin, cfg.PortMax); err != nil {
 		return nil, fmt.Errorf("port range: %w", err)
@@ -1101,8 +1110,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		log.Printf("[daemon] FairPlay SAP unsupported (%v); continuing with pair-verify DataStream setup", err)
 	}
 
-	streamCfg := d.mirrorStreamConfig()
-
 	// Complete the potentially interactive portal request before SETUP, but do
 	// not start an encoder until control SETUP exposes session-time display info.
 	// This preserves the receiver deadline while avoiding the provisional 720p
@@ -1113,18 +1120,26 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		return
 	}
 	defer capturePreparation.Close()
+	streamCfg := d.mirrorStreamConfig()
+	streamCfg.AutomaticHEVCAvailable = capturePreparation.AutomaticHEVCAvailable()
+	streamCfg.MeasuredVideoLatency = capturePreparation.MeasuredVideoLatency()
 	var broadcast *airplay.BroadcastCapture
 	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
-	prepareVideo := func(width, height int) error {
-		key := normalizedVideoCaptureKey(width, height)
+	prepareVideo := func(width, height int, codec airplay.VideoCodec) error {
+		key := normalizedVideoCaptureKey(width, height, codec)
 		if broadcast != nil {
-			if key == selectedCaptureKey {
+			if key.codec == selectedCaptureKey.codec {
+				if key.maxWidth != selectedCaptureKey.maxWidth || key.maxHeight != selectedCaptureKey.maxHeight {
+					log.Printf("[daemon] receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session",
+						key.codec, key.maxWidth, key.maxHeight, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight)
+				}
 				return nil
 			}
-			return fmt.Errorf("receiver changed video canvas from %dx%d to %dx%d during setup",
-				selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight, key.maxWidth, key.maxHeight)
+			return fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup",
+				selectedCaptureKey.codec, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight,
+				key.codec, key.maxWidth, key.maxHeight)
 		}
-		resolved, startErr := d.getOrStartPreparedCaptureGroup(entry, capturePreparation, width, height)
+		resolved, startErr := d.getOrStartPreparedCaptureGroup(entry, capturePreparation, width, height, codec)
 		if startErr != nil {
 			return startErr
 		}
@@ -1133,7 +1148,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		return nil
 	}
 
-	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
 	err = retryMirrorSetupAfterDigestChallenge(
 		err,
 		func() (string, error) { return waitForCredential(CredentialKindPassword) },
@@ -1142,8 +1157,11 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			client.SetPassword(value)
 		},
 		func() error {
+			if selectedCaptureKey.codec != "" {
+				streamCfg.VideoCodec = selectedCaptureKey.codec
+			}
 			var setupErr error
-			session, setupErr = client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+			session, setupErr = client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
 			return setupErr
 		},
 	)
@@ -1179,7 +1197,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	current.audioMuted = false
 	d.mu.Unlock()
 
-	log.Printf("[daemon] streaming to %s (%s)", info.Name, target)
+	log.Printf("[daemon] streaming to %s (%s) at %dx%d using %s",
+		info.Name, target, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight, selectedCaptureKey.codec)
 	videoDone := make(chan error, 1)
 	go func() {
 		videoDone <- session.StreamFrames(ctx, sink.AsCapture(), 0)
@@ -1260,11 +1279,15 @@ func retryMirrorSetupAfterDigestChallenge(
 // normalizedVideoCaptureKey matches the even canvas which the capture pipeline
 // will actually encode. Invalid or incomplete dimensions share the unconstrained
 // group instead of accidentally constraining one axis only.
-func normalizedVideoCaptureKey(maxW, maxH int) videoCaptureKey {
-	if maxW <= 0 || maxH <= 0 {
-		return videoCaptureKey{}
+func normalizedVideoCaptureKey(maxW, maxH int, codecs ...airplay.VideoCodec) videoCaptureKey {
+	codec := airplay.VideoCodecH264
+	if len(codecs) > 0 && codecs[0] != "" {
+		codec = codecs[0]
 	}
-	return videoCaptureKey{maxWidth: maxW &^ 1, maxHeight: maxH &^ 1}
+	if maxW <= 0 || maxH <= 0 {
+		return videoCaptureKey{codec: codec}
+	}
+	return videoCaptureKey{maxWidth: maxW &^ 1, maxHeight: maxH &^ 1, codec: codec}
 }
 
 // prepareVideoCapture completes interactive capture authorization before the
@@ -1280,6 +1303,7 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
+		VideoCodec:   d.cfg.VideoCodec,
 		ShowCursor:   d.cfg.ShowCursor,
 		RestoreToken: restoreToken,
 	}
@@ -1298,11 +1322,11 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
 // only when no encoder exists for the resolved nominal canvas. Otherwise the
 // stream joins the existing group and the unused preparation is released.
 // Must NOT be called with d.mu held.
-func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation *airplay.CapturePreparation, width, height int) (*airplay.BroadcastCapture, error) {
+func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation *airplay.CapturePreparation, width, height int, codec airplay.VideoCodec) (*airplay.BroadcastCapture, error) {
 	d.captureStartMu.Lock()
 	defer d.captureStartMu.Unlock()
 
-	key := normalizedVideoCaptureKey(width, height)
+	key := normalizedVideoCaptureKey(width, height, codec)
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
@@ -1328,7 +1352,7 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation
 	entry.captureGroup = group
 	d.mu.Unlock()
 
-	capture, err := preparation.StartWithContext(captureCtx, key.maxWidth, key.maxHeight)
+	capture, err := preparation.StartWithContextAndCodec(captureCtx, key.maxWidth, key.maxHeight, key.codec)
 	if err != nil {
 		captureCancel()
 		d.mu.Lock()
@@ -1366,13 +1390,29 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation
 // requested encoded canvas. It deliberately does not add a sink: callers
 // attach only after SETUP succeeds, when they can immediately consume it without
 // stalling established streams. Must NOT be called with d.mu held.
-func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, deviceID string, maxW, maxH int) (*airplay.BroadcastCapture, error) {
+func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, deviceID string, maxW, maxH int, codecs ...airplay.VideoCodec) (*airplay.BroadcastCapture, error) {
 	// Serialize capture startup so two targets cannot race the group map and so
 	// Wayland portal requests are presented one at a time.
 	d.captureStartMu.Lock()
 	defer d.captureStartMu.Unlock()
 
-	key := normalizedVideoCaptureKey(maxW, maxH)
+	codec := d.cfg.VideoCodec
+	if len(codecs) > 0 {
+		codec = codecs[0]
+	}
+	if codec == "" {
+		codec = airplay.VideoCodecH264
+	}
+	if codec == airplay.VideoCodecAuto {
+		if len(codecs) > 0 {
+			return nil, fmt.Errorf("automatic video codec must be resolved before capture startup")
+		}
+		// This legacy helper has no receiver snapshot from which to resolve auto;
+		// retain its historical H.264 behavior. The production setup path passes
+		// a concrete per-session codec to getOrStartPreparedCaptureGroup instead.
+		codec = airplay.VideoCodecH264
+	}
+	key := normalizedVideoCaptureKey(maxW, maxH, codec)
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
@@ -1404,6 +1444,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
+		VideoCodec:   codec,
 		MaxWidth:     key.maxWidth,
 		MaxHeight:    key.maxHeight,
 		ShowCursor:   d.cfg.ShowCursor,

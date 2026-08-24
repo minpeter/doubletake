@@ -214,6 +214,7 @@ type MirrorSession struct {
 	DataPort    int
 	videoWidth  int
 	videoHeight int
+	videoCodec  VideoCodec
 	sessionURI  string // RTSP session URI for TEARDOWN
 
 	streamCipher       func([]byte) []byte // AES-CTR encryption
@@ -366,7 +367,10 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 }
 
 // setupMirrorSession negotiates the mirroring stream with the Apple TV.
-func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int) error) (*MirrorSession, error) {
+func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) error) (*MirrorSession, error) {
+	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
+		return nil, err
+	}
 	sessionUUID := generateUUID()
 	clientDeviceID := uuidToMAC(c.sessionID)
 	senderName := pairingClientName()
@@ -461,7 +465,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// use Apple's ordinary connection policy. Timing protocol only changes the
 	// clock conversion; it does not select a different playout lead.
 	latencies := screenLatenciesForHint(connectionLatencyNormal)
-	dbg("[SETUP] screen latency policy: video=%v audio=%v", latencies.video, latencies.audio)
+	dbg("[SETUP] base screen latency policy: video=%v audio=%v", latencies.video, latencies.audio)
 
 	// Apple's sender prepares the receiver with a control-only SETUP before it
 	// creates media streams. Older protocol implementations can explicitly
@@ -500,6 +504,25 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	var attemptedEventPort int
 	audioControlLPort := audioCtrlConn.LocalAddr().(*net.UDPAddr).Port
 	audioLatencySamples := samplesFor44k1(latencies.audio)
+	measuredLatencyApplied := false
+	audioSetupCommitted := false
+	applyMeasuredCaptureLatency := func(codec VideoCodec) {
+		if measuredLatencyApplied || codec != VideoCodecHEVC || targetLatencyIsExplicit() || cfg.MeasuredVideoLatency <= latencies.video {
+			return
+		}
+		if audioSetupCommitted {
+			// A legacy media-first receiver has already accepted latencyMax. Do not
+			// create a descriptor/TimeAnnounce mismatch after that protocol boundary.
+			dbg("[SETUP] local HEVC capture budget became known after audio SETUP; retaining negotiated leads")
+			return
+		}
+		before := latencies
+		latencies = latencies.withMinimumVideoLead(cfg.MeasuredVideoLatency)
+		audioLatencySamples = samplesFor44k1(latencies.audio)
+		measuredLatencyApplied = true
+		dbg("[SETUP] local capture budget raised playout leads: video=%v->%v audio=%v->%v",
+			before.video, latencies.video, before.audio, latencies.audio)
+	}
 	skipRecord := false
 
 	firstSetup := true
@@ -605,18 +628,37 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 	controlResp, controlHeaders, receivedAt, err := sendSetup(audioURI, "control", controlPlist)
 	videoPrepared := false
+	videoCodec := VideoCodecH264
 	prepareVideo := func(info *ReceiverInfo) error {
 		if videoPrepared {
 			return nil
 		}
 		videoPrepared = true
-		canvasW, canvasH := info.MirrorSize()
+		selection, selectionErr := info.selectVideo(cfg.VideoCodec, cfg.AutomaticHEVCAvailable)
+		if selectionErr != nil {
+			return selectionErr
+		}
+		if selection.codec == VideoCodecHEVC && cfg.VideoCodec == VideoCodecAuto && audioSetupCommitted &&
+			!targetLatencyIsExplicit() && cfg.MeasuredVideoLatency > latencies.video {
+			// The legacy media-first flow exposes dynamic display metadata only after
+			// latencyMax has been accepted. Keep the descriptor and TimeAnnounce
+			// coherent by retaining the nominal H.264 path for this session rather
+			// than selecting a calibrated HEVC clock too late.
+			selection, selectionErr = info.selectVideo(VideoCodecH264, false)
+			if selectionErr != nil {
+				return selectionErr
+			}
+			selection.reason = "media-first audio latency was committed before HEVC calibration"
+		}
+		videoCodec = selection.codec
+		applyMeasuredCaptureLatency(videoCodec)
+		canvasW, canvasH := selection.width, selection.height
 		maxW, maxH := info.MaxVideoSize()
-		dbg("[SETUP] receiver video canvas: %dx%d (maximum %dx%d)", canvasW, canvasH, maxW, maxH)
+		dbg("[SETUP] receiver video canvas: %dx%d (maximum %dx%d, codec=%s, requested=%s: %s)", canvasW, canvasH, maxW, maxH, videoCodec, normalizeVideoCodec(cfg.VideoCodec), selection.reason)
 		if prepareVideoCapture == nil {
 			return nil
 		}
-		if err := prepareVideoCapture(canvasW, canvasH); err != nil {
+		if err := prepareVideoCapture(canvasW, canvasH, videoCodec); err != nil {
 			return fmt.Errorf("prepare %dx%d video capture: %w", canvasW, canvasH, err)
 		}
 		return nil
@@ -772,6 +814,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	if err != nil {
 		return nil, err
 	}
+	audioSetupCommitted = true
 	startReceiverTimingProbes(audioResp)
 	observeEventPort(audioResp)
 	if err := connectEvent(); err != nil {
@@ -939,6 +982,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		eventConn:      receiverEventConn,
 		cancel:         cancelSession,
 		DataPort:       dataPort,
+		videoCodec:     videoCodec,
 		firstFrameSent: make(chan struct{}),
 		noAudio:        cfg.NoAudio,
 		sessionURI:     audioURI,
@@ -1102,6 +1146,9 @@ func addFairPlayRootFields(request map[string]interface{}, ekey, eiv []byte, inc
 //   - IDR VCL: sent encrypted, header[4]=0x00 header[5]=0x00, AVCC payload
 //   - non-IDR VCL: sent encrypted, header[4]=0x00 header[5]=0x00, AVCC payload
 func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture, startDelay time.Duration) error {
+	if normalizeVideoCodec(s.videoCodec) == VideoCodecHEVC {
+		return s.streamHEVCFrames(ctx, capture, startDelay)
+	}
 	if startDelay > 0 {
 		dbg("[STREAM] waiting %v before sending first frame...", startDelay)
 		select {
@@ -1726,15 +1773,23 @@ func isFirstSlice(raw []byte) bool {
 	return raw[1]&0x80 != 0
 }
 
-// sendCodecFrame sends an unencrypted SPS+PPS codec packet (header type 0x01 0x00).
-// payload is an AVCDecoderConfigurationRecord (avcC format).
-func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64) error {
+// sendCodecFrame sends an unencrypted decoder-configuration packet (header
+// type 0x01 0x00). H.264 carries avcC with option 0x16; HEVC carries a complete
+// hvc1/hvcC sample description with option 0x1e.
+func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64, codecs ...VideoCodec) error {
 	s.frameSeq++
 	var header [128]byte
 	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload)))
 	header[4] = 0x01 // payload type = SPS+PPS codec packet (unencrypted)
 	header[5] = 0x00
-	header[6] = 0x16 // h264 SPS+PPS option
+	codec := normalizeVideoCodec(s.videoCodec)
+	if len(codecs) > 0 {
+		codec = normalizeVideoCodec(codecs[0])
+	}
+	header[6] = 0x16 // H.264 generic format description
+	if codec == VideoCodecHEVC {
+		header[6] = 0x1e // HEVC hvc1/hvcC generic format description
+	}
 	header[7] = 0x01
 	binary.LittleEndian.PutUint64(header[8:16], ntpTimestamp)
 	// APScreenProtocolHeader carries the encoded video size followed by source

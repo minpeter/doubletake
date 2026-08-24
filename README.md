@@ -9,6 +9,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 - SRP-6a pairing with PIN and persistent credential storage
 - Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture
 - H.264 encoding with NVENC, VA-API, OpenH264, and x264
+- Capability-gated HEVC Main10/high-resolution encoding with NVENC or x265
 - ChaCha20-Poly1305 stream encryption
 - mDNS device discovery
 - Daemon mode with multi-target streaming control (`doubletake-ctl`)
@@ -129,7 +130,10 @@ ports returned by the receiver, so they do not require inbound firewall rules.
 NTP and PTP use the same presentation policy; the timing protocol only changes
 how timestamps are represented. In automatic mode, an ordinary connection uses
 the AirPlay defaults observed in the checked-in sender artifacts: 75 ms for
-video and 85 ms for screen audio.
+video and 85 ms for screen audio. When the automatic high-resolution HEVC
+preflight measures a longer local capture-to-access-unit path, doubletake adds
+the same scheduling margin to both values. This keeps Apple's 10 ms relationship
+while ensuring video reaches the receiver before its presentation deadline.
 
 By default the OS assigns ephemeral ports. Use `-port-range MIN-MAX` to confine
 the UDP ports to a small window you can open in your firewall (needs at least 3
@@ -324,6 +328,13 @@ doubletake -target 192.168.1.77 -hwaccel vaapi   # Intel/AMD
 # OpenH264 software encoding
 doubletake -target 192.168.1.77 -hwaccel openh264
 
+# Automatic capability-gated HEVC Main10/high-resolution selection is the default
+doubletake -target 192.168.1.77
+
+# Force one codec (HEVC uses the receiver's maximum canvas)
+doubletake -target 192.168.1.77 -video-codec hevc
+doubletake -target 192.168.1.77 -video-codec h264
+
 # Debug mode (verbose protocol logging)
 doubletake -target 192.168.1.77 -debug
 
@@ -350,7 +361,8 @@ doubletake-ctl disconnect
 | `-fps` | 30 | Frames per second |
 | `-bitrate` | 0 | Video bitrate in kbps (`0` = auto) |
 | `-target-latency-ms` | 0 | Joint audio/video playout latency override in milliseconds (`0` = automatic AirPlay policy with separate defaults) |
-| `-hwaccel` | auto | H.264 encoder: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
+| `-hwaccel` | auto | Encoder preference: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
+| `-video-codec` | auto | Screen codec: capability-driven `auto`, forced `h264`, or forced `hevc` |
 | `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
 | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
 | `-no-audio` | false | Disable audio streaming |
@@ -361,7 +373,22 @@ doubletake-ctl disconnect
 
 Only `-hwaccel auto` tries fallback encoders, in the order `vulkanh264enc`,
 `nvh264enc`, `vah264enc`, `openh264enc`, then `x264enc`. Explicit selections
-fail if their required GStreamer encoder is unavailable; `none` forces x264.
+fail if their required GStreamer encoder is unavailable; `none` forces x264 for
+H.264 or x265 for explicitly requested HEVC.
+In the normal `-video-codec auto` path, HEVC is selected only when final
+session information advertises feature 42 and a maximum above 1920x1080, and
+the sender has the complete `nvh265enc` Main10/timestamp pipeline. Otherwise it
+uses H.264 at the nominal canvas. Explicit `-video-codec hevc` remains available
+with `nvh265enc` or `x265enc`; use `-hwaccel none` to force the software path.
+Preflight verifies the automatic path with a sustained, timestamped 4K P010
+sample through the same HEVC parser and RTP/ONVIF framing chain before receiver
+SETUP begins. It measures the source-PTS-to-access-unit p95 and reserves a
+bounded delivery margin; an unusable or excessively delayed hardware path falls
+back to H.264. The result is cached per requested frame rate.
+
+Main10 alone does not turn an SDR X11 or portal capture into HDR: doubletake
+preserves encoder-provided HDR SEI but does not invent PQ/HLG mastering metadata
+or relabel SDR colors as HDR.
 
 ### Daemon Control (`doubletake-ctl`)
 
@@ -384,12 +411,14 @@ doubletake-ctl unmute [target]
   targetless and therefore requires exactly one waiting receiver; use
   `connect <target> <PIN-or-password>` when multiple receivers are waiting.
 
-Daemon streams are grouped by the normalized even-sized nominal canvas resolved
-during each receiver's SETUP. Targets with the same canvas share one capture and
-H.264 encoder; targets with different nominal canvases use independent encoders,
+Daemon streams are grouped by codec and the normalized even-sized canvas resolved
+during each receiver's SETUP. Targets with the same key share one capture and
+encoder; targets with a different codec or canvas use independent encoders,
 so connection order does not determine another receiver's size. For example, a
 receiver reporting a 1920x1080 canvas and a 3840x2160 maximum joins the
-1920x1080 group. Fan-out uses a bounded queue per target within each group. A
+3840x2160 HEVC group when automatic HEVC is available, or the 1920x1080 H.264
+group when it is unavailable or H.264 is forced.
+Fan-out uses a bounded queue per target within each group. A
 stalled target is detached when its queue fills, without blocking peers that
 share the encoder. Other canvas groups continue independently as well.
 

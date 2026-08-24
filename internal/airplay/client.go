@@ -694,6 +694,9 @@ func (c *AirPlayClient) Pair(ctx context.Context, pin string) error {
 }
 
 func (c *AirPlayClient) SetupMirror(ctx context.Context, cfg StreamConfig) (*MirrorSession, error) {
+	if cfg.VideoCodec == VideoCodecAuto {
+		return nil, fmt.Errorf("automatic video codec requires SetupMirrorWithVideoCodecPreparation")
+	}
 	return c.setupMirrorSession(ctx, cfg, nil)
 }
 
@@ -702,6 +705,22 @@ func (c *AirPlayClient) SetupMirror(ctx context.Context, cfg StreamConfig) (*Mir
 // streams have not yet been configured. The hook should only launch an already
 // authorized capture source; interactive portal work belongs before this call.
 func (c *AirPlayClient) SetupMirrorWithVideoPreparation(ctx context.Context, cfg StreamConfig, prepare func(width, height int) error) (*MirrorSession, error) {
+	if cfg.VideoCodec == VideoCodecAuto {
+		return nil, fmt.Errorf("automatic video codec requires SetupMirrorWithVideoCodecPreparation")
+	}
+	if prepare == nil {
+		return c.setupMirrorSession(ctx, cfg, nil)
+	}
+	return c.setupMirrorSession(ctx, cfg, func(width, height int, _ VideoCodec) error {
+		return prepare(width, height)
+	})
+}
+
+// SetupMirrorWithVideoCodecPreparation is the automatic-codec variant of
+// SetupMirrorWithVideoPreparation. Its hook receives the concrete codec chosen
+// from final session-time receiver information, so capture and wire framing use
+// the same format.
+func (c *AirPlayClient) SetupMirrorWithVideoCodecPreparation(ctx context.Context, cfg StreamConfig, prepare func(width, height int, codec VideoCodec) error) (*MirrorSession, error) {
 	return c.setupMirrorSession(ctx, cfg, prepare)
 }
 
@@ -1158,11 +1177,14 @@ func (c *AirPlayClient) readDecryptedBytes(n int) ([]byte, error) {
 
 // StreamConfig holds the configuration for a mirroring session.
 type StreamConfig struct {
-	FPS       int
-	Bitrate   int  // Video bitrate in kbps
-	NoEncrypt bool // Disable encryption for debugging
-	DirectKey bool // Use shk/shiv directly without SHA-512 derivation
-	NoAudio   bool // Disable audio streaming
+	FPS                    int
+	Bitrate                int           // Video bitrate in kbps
+	VideoCodec             VideoCodec    // empty/h264, auto, or capability-gated hevc
+	AutomaticHEVCAvailable bool          // capture preflight found the hardware HEVC-4K path
+	MeasuredVideoLatency   time.Duration // measured minimum lead for the local HEVC capture path
+	NoEncrypt              bool          // Disable encryption for debugging
+	DirectKey              bool          // Use shk/shiv directly without SHA-512 derivation
+	NoAudio                bool          // Disable audio streaming
 
 	// PortMin/PortMax bound the local ports used for the audio UDP triple
 	// (timing/control/data, 3 consecutive ports). The receiver's event channel

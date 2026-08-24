@@ -76,8 +76,18 @@ func TestNewRejectsUnknownHWAccel(t *testing.T) {
 		}
 		t.Fatal("New accepted an unknown hwaccel value")
 	}
-	if !strings.Contains(err.Error(), `unknown H.264 encoder "bogus"`) {
+	if !strings.Contains(err.Error(), `unknown encoder "bogus"`) {
 		t.Fatalf("New error = %q", err)
+	}
+}
+
+func TestNewDefaultsVideoCodecToAuto(t *testing.T) {
+	d, err := New(Config{CredFile: filepath.Join(t.TempDir(), "credentials.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.cfg.VideoCodec != airplay.VideoCodecAuto {
+		t.Fatalf("default video codec = %s, want auto", d.cfg.VideoCodec)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,9 +21,10 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
-	FPS     int
-	Bitrate int    // Video bitrate in kbps (0 = auto)
-	HWAccel string // "auto", "nvenc", "vaapi", "openh264", or "none" (x264)
+	FPS        int
+	Bitrate    int        // Video bitrate in kbps (0 = auto)
+	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
+	VideoCodec VideoCodec // empty/h264, auto (resolved before Start), or hevc
 
 	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
 	// The captured image is aspect-fitted into it. Zero leaves the capture at
@@ -46,7 +48,7 @@ func ValidateHWAccel(method string) error {
 	case "", "auto", "nvenc", "vaapi", "openh264", "none":
 		return nil
 	default:
-		return fmt.Errorf("unknown H.264 encoder %q (want auto, nvenc, vaapi, openh264, or none)", method)
+		return fmt.Errorf("unknown encoder %q (want auto, nvenc, vaapi, openh264, or none)", method)
 	}
 }
 
@@ -97,7 +99,11 @@ type CapturePreparation struct {
 	kind capturePreparationKind
 	used bool
 
-	timestampedOutput bool
+	timestampedOutput  bool
+	automaticHEVCAvail bool
+	// measuredVideoLatency is the minimum screen lead measured by the local 4K
+	// HEVC preflight. It is zero for H.264 and unmeasured software fallback.
+	measuredVideoLatency time.Duration
 
 	pwNodeID   uint32
 	pwFd       *os.File
@@ -107,8 +113,11 @@ type CapturePreparation struct {
 
 // StartCapture detects the display server (Wayland or X11) and initiates screen
 // capture accordingly. On Wayland it uses xdg-desktop-portal + PipeWire for
-// capture; on X11 it uses ximagesrc. Both use GStreamer for H.264 encoding.
+// capture; on X11 it uses ximagesrc. Both use the selected GStreamer encoder.
 func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if cfg.VideoCodec == VideoCodecAuto {
+		return nil, fmt.Errorf("automatic video codec requires PrepareCapture followed by StartWithCodec")
+	}
 	preparation, err := PrepareCapture(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -125,6 +134,9 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 // is acquired immediately; X11 needs no external session and is merely
 // validated until Start is called.
 func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
+		return nil, err
+	}
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, err
 	}
@@ -137,14 +149,34 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 		return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
 	}
 
-	if _, err := selectGstEncoderWithProbe(cfg, hasGstElement, false); err != nil {
+	validationCfg := cfg
+	if validationCfg.VideoCodec == VideoCodecAuto {
+		// Auto always retains a working H.264 fallback. HEVC is selected only
+		// after SETUP supplies final display metadata.
+		validationCfg.VideoCodec = VideoCodecH264
+	}
+	if _, err := selectGstEncoderWithProbe(validationCfg, hasGstElement, false); err != nil {
 		return nil, err
 	}
 	preparation := &CapturePreparation{
 		ctx:               ctx,
 		cfg:               cfg,
 		kind:              kind,
-		timestampedOutput: supportsTimestampedVideoOutput(),
+		timestampedOutput: supportsTimestampedVideoOutput(normalizeVideoCodec(validationCfg.VideoCodec)),
+	}
+	if cfg.VideoCodec == VideoCodecAuto {
+		preparation.automaticHEVCAvail, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
+	} else if cfg.VideoCodec == VideoCodecHEVC {
+		// Forced NVENC HEVC uses the same local pipeline and benefits from the
+		// same scheduling calibration. Explicit software x265 remains a deliberate
+		// opt-in and can be tuned with the joint latency override.
+		_, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
+	}
+	if cfg.VideoCodec == VideoCodecHEVC && !preparation.timestampedOutput {
+		return nil, fmt.Errorf("HEVC capture requires GStreamer rtph265pay, rtponviftimestamp, and rtpstreampay")
+	}
+	if cfg.VideoCodec == VideoCodecHEVC && !hasGstElement("h265parse") {
+		return nil, fmt.Errorf("HEVC capture requires GStreamer h265parse")
 	}
 	if !preparation.timestampedOutput {
 		log.Printf("[CAPTURE] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; video will use output-time timestamps")
@@ -179,24 +211,43 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 // GStreamer process. It mirrors PrepareCapture for callers that negotiate the
 // receiver canvas between preparation and encoder startup.
 func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
+		return nil, err
+	}
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, err
 	}
-	if _, err := selectGstEncoderWithProbe(cfg, hasGstElement, false); err != nil {
+	validationCfg := cfg
+	if validationCfg.VideoCodec == VideoCodecAuto {
+		validationCfg.VideoCodec = VideoCodecH264
+	}
+	if _, err := selectGstEncoderWithProbe(validationCfg, hasGstElement, false); err != nil {
 		return nil, err
 	}
-	return &CapturePreparation{
+	preparation := &CapturePreparation{
 		ctx:               ctx,
 		cfg:               cfg,
 		kind:              capturePreparationTest,
-		timestampedOutput: supportsTimestampedVideoOutput(),
-	}, nil
+		timestampedOutput: supportsTimestampedVideoOutput(normalizeVideoCodec(validationCfg.VideoCodec)),
+	}
+	if cfg.VideoCodec == VideoCodecAuto {
+		preparation.automaticHEVCAvail, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
+	} else if cfg.VideoCodec == VideoCodecHEVC {
+		_, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
+	}
+	if cfg.VideoCodec == VideoCodecHEVC && !preparation.timestampedOutput {
+		return nil, fmt.Errorf("HEVC capture requires GStreamer rtph265pay, rtponviftimestamp, and rtpstreampay")
+	}
+	if cfg.VideoCodec == VideoCodecHEVC && !hasGstElement("h265parse") {
+		return nil, fmt.Errorf("HEVC capture requires GStreamer h265parse")
+	}
+	return preparation, nil
 }
 
 // Start launches the prepared encoder using the supplied nominal receiver
 // canvas. Zero dimensions leave the captured source at its native size.
 func (p *CapturePreparation) Start(width, height int) (*ScreenCapture, error) {
-	return p.StartWithContext(nil, width, height)
+	return p.startWithContextAndCodec(nil, width, height, "")
 }
 
 // StartWithContext is Start with an optional lifetime context for the launched
@@ -204,6 +255,23 @@ func (p *CapturePreparation) Start(width, height int) (*ScreenCapture, error) {
 // daemon capture groups use an independent context so the encoder can outlive
 // the receiver which happened to create that shared group.
 func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, height int) (*ScreenCapture, error) {
+	return p.startWithContextAndCodec(lifetime, width, height, "")
+}
+
+// StartWithCodec launches an automatic preparation after receiver negotiation
+// has selected one concrete codec. Explicit preparations accept only their
+// configured codec, preventing the capture and AirPlay framing from diverging.
+func (p *CapturePreparation) StartWithCodec(width, height int, codec VideoCodec) (*ScreenCapture, error) {
+	return p.startWithContextAndCodec(nil, width, height, codec)
+}
+
+// StartWithContextAndCodec combines StartWithContext and StartWithCodec for
+// daemon capture groups whose encoder may outlive the receiver that created it.
+func (p *CapturePreparation) StartWithContextAndCodec(lifetime context.Context, width, height int, codec VideoCodec) (*ScreenCapture, error) {
+	return p.startWithContextAndCodec(lifetime, width, height, codec)
+}
+
+func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, width, height int, selected VideoCodec) (*ScreenCapture, error) {
 	if p == nil {
 		return nil, fmt.Errorf("capture preparation is nil")
 	}
@@ -212,8 +280,36 @@ func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, h
 		p.mu.Unlock()
 		return nil, fmt.Errorf("capture preparation has already been used")
 	}
-	p.used = true
 	cfg := p.cfg
+	requested := cfg.VideoCodec
+	if requested == "" {
+		requested = VideoCodecH264
+	}
+	if requested == VideoCodecAuto {
+		if selected != VideoCodecH264 && selected != VideoCodecHEVC {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("automatic video codec has not been resolved")
+		}
+		if selected == VideoCodecHEVC && !p.automaticHEVCAvail {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("automatic HEVC selection exceeds the prepared local encoder capabilities")
+		}
+		cfg.VideoCodec = selected
+	} else {
+		if selected != "" && selected != requested {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("capture prepared for %s, not %s", requested, selected)
+		}
+		cfg.VideoCodec = requested
+	}
+	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil || cfg.VideoCodec == VideoCodecAuto {
+		p.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("automatic video codec has not been resolved")
+	}
+	p.used = true
 	cfg.MaxWidth = width
 	cfg.MaxHeight = height
 	kind := p.kind
@@ -225,10 +321,28 @@ func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, h
 	pwFd := p.pwFd
 	dbusConn := p.dbusConn
 	streamSize := p.streamSize
-	timestampedOutput := p.timestampedOutput
+	timestampedOutput := supportsTimestampedVideoOutput(cfg.VideoCodec)
 	p.pwFd = nil
 	p.dbusConn = nil
 	p.mu.Unlock()
+	if cfg.VideoCodec == VideoCodecHEVC && !timestampedOutput {
+		if pwFd != nil {
+			_ = pwFd.Close()
+		}
+		if dbusConn != nil {
+			_ = dbusConn.Close()
+		}
+		return nil, fmt.Errorf("HEVC capture requires GStreamer rtph265pay, rtponviftimestamp, and rtpstreampay")
+	}
+	if cfg.VideoCodec == VideoCodecHEVC && !hasGstElement("h265parse") {
+		if pwFd != nil {
+			_ = pwFd.Close()
+		}
+		if dbusConn != nil {
+			_ = dbusConn.Close()
+		}
+		return nil, fmt.Errorf("HEVC capture requires GStreamer h265parse")
+	}
 	encoder, err := detectGstEncoder(cfg)
 	if err != nil {
 		if pwFd != nil {
@@ -250,6 +364,31 @@ func (p *CapturePreparation) StartWithContext(lifetime context.Context, width, h
 	default:
 		return nil, fmt.Errorf("invalid capture preparation kind %d", kind)
 	}
+}
+
+// AutomaticHEVCAvailable reports whether preflight found the hardware encoder
+// and timestamp-preserving GStreamer elements required by the normal automatic
+// high-resolution path. Explicit HEVC may still use x265 software encoding.
+func (p *CapturePreparation) AutomaticHEVCAvailable() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.automaticHEVCAvail
+}
+
+// MeasuredVideoLatency returns the minimum video presentation lead measured by
+// the 4K HEVC preflight. Callers pass it into StreamConfig so the
+// audio and video timelines can receive the same additional scheduling room.
+// It is zero when the selected local encoder path was not measured.
+func (p *CapturePreparation) MeasuredVideoLatency() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.measuredVideoLatency
 }
 
 // Close releases an unconsumed portal preparation. Once Start has taken
@@ -281,13 +420,162 @@ func hasGstElement(name string) bool {
 	return exec.Command("gst-inspect-1.0", name).Run() == nil
 }
 
-func supportsTimestampedVideoOutput() bool {
-	for _, element := range []string{"rtph264pay", "rtponviftimestamp", "rtpstreampay"} {
-		if !hasGstElement(element) {
+func supportsTimestampedVideoOutput(codec VideoCodec) bool {
+	return supportsTimestampedVideoOutputWithProbe(codec, hasGstElement)
+}
+
+func supportsTimestampedVideoOutputWithProbe(codec VideoCodec, hasElement func(string) bool) bool {
+	payloader := "rtph264pay"
+	if normalizeVideoCodec(codec) == VideoCodecHEVC {
+		payloader = "rtph265pay"
+	}
+	for _, element := range []string{payloader, "rtponviftimestamp", "rtpstreampay"} {
+		if !hasElement(element) {
 			return false
 		}
 	}
 	return true
+}
+
+// automaticHEVCAvailableWithProbe is deliberately stricter than explicit
+// HEVC selection. Apple's automatic high-resolution gate asks whether the
+// sender has a hardware HEVC-4K path; merely finding x265 is not enough to make
+// 4K software encoding the normal default.
+func automaticHEVCAvailableWithProbe(hwaccel string, hasElement func(string) bool) bool {
+	if hwaccel == "" {
+		hwaccel = "auto"
+	}
+	if hwaccel != "auto" && hwaccel != "nvenc" {
+		return false
+	}
+	for _, element := range []string{"nvh265enc", "h265parse"} {
+		if !hasElement(element) {
+			return false
+		}
+	}
+	return supportsTimestampedVideoOutputWithProbe(VideoCodecHEVC, hasElement)
+}
+
+type automaticHEVCProbeResult struct {
+	once sync.Once
+	ok   bool
+	lead time.Duration
+}
+
+var automaticHEVCProbeResults sync.Map // map[int]*automaticHEVCProbeResult, keyed by FPS
+
+const (
+	automaticHEVCProbeFrames       = 45
+	automaticHEVCProbeWarmupFrames = 10
+	// Apple expects capture, encode, transport, and decoder work to fit inside
+	// the screen lead. Reserve receiver/network room after the local source-to-AU
+	// age instead of merely scheduling a frame at the instant it leaves Go.
+	automaticHEVCDeliveryMargin = 50 * time.Millisecond
+	maximumAutomaticVideoLead   = 500 * time.Millisecond
+)
+
+func recommendedAutomaticVideoLatency(ages []time.Duration) (time.Duration, bool) {
+	if len(ages) == 0 {
+		return 0, false
+	}
+	ages = append([]time.Duration(nil), ages...)
+	sort.Slice(ages, func(i, j int) bool { return ages[i] < ages[j] })
+	// Use p95 so one scheduler outlier does not permanently inflate latency, but
+	// normal encoder jitter still has delivery room. Round up to whole ms because
+	// RTSP advertises latencyMs and the audio descriptor uses integral samples.
+	index := (len(ages)*95 + 99) / 100
+	if index < 1 {
+		index = 1
+	}
+	p95 := ages[index-1]
+	lead := p95 + automaticHEVCDeliveryMargin
+	if lead < defaultVideoLatencyNormal {
+		lead = defaultVideoLatencyNormal
+	}
+	lead = (lead + time.Millisecond - 1) / time.Millisecond * time.Millisecond
+	if lead > maximumAutomaticVideoLead {
+		return 0, false
+	}
+	return lead, true
+}
+
+func probeAutomaticHEVC(fps int) (bool, time.Duration) {
+	if fps <= 0 {
+		fps = 30
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg := CaptureConfig{
+		FPS:        fps,
+		Bitrate:    maxVideoBitrateKbps,
+		HWAccel:    "nvenc",
+		VideoCodec: VideoCodecHEVC,
+		MaxWidth:   3840,
+		MaxHeight:  2160,
+	}
+	encoder, err := selectGstEncoderWithProbe(cfg, hasGstElement, false)
+	if err != nil {
+		dbg("[CAPTURE] automatic HEVC encoder probe failed: %v", err)
+		return false, 0
+	}
+	capture, err := startPreparedTestCapture(ctx, cfg, encoder, true)
+	if err != nil {
+		dbg("[CAPTURE] automatic HEVC pipeline probe failed: %v", err)
+		return false, 0
+	}
+	defer capture.Stop()
+
+	ages := make([]time.Duration, 0, automaticHEVCProbeFrames-automaticHEVCProbeWarmupFrames)
+	for frame := 0; frame < automaticHEVCProbeFrames; frame++ {
+		unit, readErr := capture.ReadVideoAccessUnit()
+		if readErr != nil {
+			dbg("[CAPTURE] automatic HEVC pipeline probe read failed: %v", readErr)
+			return false, 0
+		}
+		if frame < automaticHEVCProbeWarmupFrames || unit.PTS.IsZero() {
+			continue
+		}
+		age := time.Since(unit.PTS)
+		if age < 0 || age > maximumAutomaticVideoLead {
+			dbg("[CAPTURE] automatic HEVC pipeline produced implausible source age %v", age)
+			return false, 0
+		}
+		ages = append(ages, age)
+	}
+	lead, ok := recommendedAutomaticVideoLatency(ages)
+	if !ok {
+		dbg("[CAPTURE] automatic HEVC pipeline cannot satisfy the bounded presentation lead")
+		return false, 0
+	}
+	return true, lead
+}
+
+func automaticHEVCProfile(hwaccel string, fps int) (bool, time.Duration) {
+	if !automaticHEVCAvailableWithProbe(hwaccel, hasGstElement) {
+		return false, 0
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	value, _ := automaticHEVCProbeResults.LoadOrStore(fps, &automaticHEVCProbeResult{})
+	result := value.(*automaticHEVCProbeResult)
+	result.once.Do(func() {
+		// Factory presence alone does not prove that the installed NVIDIA stack
+		// can sustain timestamped 4K Main10 within a useful presentation budget.
+		// Exercise the actual capture suffix and retain its source-to-AU p95.
+		result.ok, result.lead = probeAutomaticHEVC(fps)
+		if result.ok {
+			dbg("[CAPTURE] automatic HEVC 4K Main10 %dfps probe passed (minimum video lead %v)", fps, result.lead)
+		} else {
+			dbg("[CAPTURE] automatic HEVC %dfps hardware probe failed; retaining H.264", fps)
+		}
+	})
+	return result.ok, result.lead
+}
+
+func automaticHEVCAvailable(hwaccel string) bool {
+	ok, _ := automaticHEVCProfile(hwaccel, 30)
+	return ok
 }
 
 // startGStreamerCommand starts a capture child whose lifetime cannot outlive
@@ -329,6 +617,7 @@ type encoderResult struct {
 	parts       gstStage
 	needsVulkan bool   // encoder needs vulkanupload immediately before it
 	rawFormat   string // system-memory format produced by videoconvert
+	codec       VideoCodec
 }
 
 func frameRateStage(fps int) gstStage {
@@ -359,7 +648,7 @@ func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int) gstStage {
 
 func lowLatencyVideoQueueStage() gstStage {
 	// Drop stale raw frames before encoding. Encoded P-frames may reference
-	// earlier frames, so dropping them downstream would corrupt the H.264 chain.
+	// earlier frames, so dropping them downstream would corrupt the codec chain.
 	return gstStage{
 		"queue",
 		"max-size-buffers=1",
@@ -422,14 +711,18 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
 		args = appendGstStage(args, gstStage{"vulkanupload"})
 	}
 	args = appendGstStage(args, encoder.parts)
-	args = appendGstStage(args, gstStage{"h264parse", "config-interval=-1"})
-	args = appendGstStage(args, gstStage{"video/x-h264,stream-format=byte-stream,alignment=au"})
+	parser, mediaType, payloader := "h264parse", "video/x-h264", "rtph264pay"
+	if encoder.codec == VideoCodecHEVC {
+		parser, mediaType, payloader = "h265parse", "video/x-h265", "rtph265pay"
+	}
+	args = appendGstStage(args, gstStage{parser, "config-interval=-1"})
+	args = appendGstStage(args, gstStage{mediaType + ",stream-format=byte-stream,alignment=au"})
 	if timestampedOutput {
 		// RTP marker bits retain access-unit boundaries, while the ONVIF header
 		// extension serializes each encoded buffer's absolute capture PTS. The
 		// RFC4571 length prefix makes the packet stream safe to carry over stdout.
 		args = appendGstStage(args, gstStage{
-			"rtph264pay", "pt=96", "mtu=60000", "aggregate-mode=none",
+			payloader, "pt=96", "mtu=60000", "aggregate-mode=none",
 			"timestamp-offset=0", "seqnum-offset=0",
 		})
 		args = appendGstStage(args, gstStage{
@@ -457,14 +750,14 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 		fps = 30
 	}
 
-	// Capture from the PipeWire portal and feed the shared H.264 pipeline.
+	// Capture from the PipeWire portal and feed the shared video pipeline.
 	//   - vapostproc imports the portal's DMA-BUF via VA-API when available
 	//     Systems without VA-API (such as Asahi Linux) fall back to videoconvert.
 	//   - Wayland compositors may stop publishing an undamaged screen. A forced-live
 	//     GStreamer compositor repeats its input pad's latest frame at a regular
 	//     rate, because AirPlay requires continuous video even for a static image.
 	// The encoded dimensions are capped to the receiver's advertised display size
-	// when available. The actual result is read back from the H.264 SPS downstream.
+	// when available. The actual result is read back from the codec SPS downstream.
 	const pwFdNum = 3
 	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
 
@@ -530,7 +823,7 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 		waitCh:   make(chan struct{}),
 	}
 	if timestampedOutput {
-		capture.frames = newRTPVideoAccessUnitReader(stdout)
+		capture.frames = newRTPVideoAccessUnitReader(stdout, encoderParts.codec)
 	}
 	go func() {
 		capture.waitErr = <-waitResult
@@ -608,7 +901,7 @@ func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder enc
 		waitCh: make(chan struct{}),
 	}
 	if timestampedOutput {
-		capture.frames = newRTPVideoAccessUnitReader(stdout)
+		capture.frames = newRTPVideoAccessUnitReader(stdout, encoder.codec)
 	}
 	go func() {
 		capture.waitErr = <-waitResult
@@ -769,7 +1062,7 @@ func parseXrandrGeometry(line string) (xOffset, yOffset, width, height int, ok b
 	return 0, 0, 0, 0, false
 }
 
-// detectGstEncoder selects an available GStreamer H.264 encoder. Only auto may
+// detectGstEncoder selects an available GStreamer video encoder. Only auto may
 // fall through the priority list; an explicit method either uses its own
 // encoder element (or elements, for NVENC) or returns an error.
 func detectGstEncoder(cfg CaptureConfig) (encoderResult, error) {
@@ -799,6 +1092,9 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 	if err := ValidateHWAccel(hwaccel); err != nil {
 		return encoderResult{}, err
 	}
+	if normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC {
+		return selectGstHEVCEncoder(cfg, hasElement, announce, hwaccel, bitrate, keyframeInterval)
+	}
 
 	vbvBuf := vbvBufferKbit(bitrate, fps)
 	maxrate := bitrate + bitrate/4 // allow 25% overshoot on peaks
@@ -821,14 +1117,14 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 					fmt.Sprintf("bitrate=%d", bitrate),
 				},
 				needsVulkan: true,
-				rawFormat:   "NV12",
+				rawFormat:   "NV12", codec: VideoCodecH264,
 			},
 		},
 		{
 			method:  "nvenc",
 			element: "nvh264enc",
 			label:   "NVENC hardware encoding (nvh264enc)",
-			result: encoderResult{rawFormat: "NV12", parts: []string{
+			result: encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: []string{
 				"nvh264enc",
 				fmt.Sprintf("bitrate=%d", bitrate),
 				fmt.Sprintf("gop-size=%d", keyframeInterval),
@@ -842,7 +1138,7 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 			method:  "vaapi",
 			element: "vah264enc",
 			label:   "VAAPI hardware encoding (vah264enc)",
-			result: encoderResult{rawFormat: "NV12", parts: []string{
+			result: encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: []string{
 				"vah264enc",
 				fmt.Sprintf("bitrate=%d", bitrate),
 				fmt.Sprintf("key-int-max=%d", keyframeInterval),
@@ -854,7 +1150,7 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 			method:  "openh264",
 			element: "openh264enc",
 			label:   "OpenH264 software encoding (openh264enc)",
-			result: encoderResult{rawFormat: "I420", parts: []string{
+			result: encoderResult{rawFormat: "I420", codec: VideoCodecH264, parts: []string{
 				"openh264enc",
 				fmt.Sprintf("bitrate=%d", bitrate*1000),
 				fmt.Sprintf("gop-size=%d", keyframeInterval),
@@ -866,7 +1162,7 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 			method:  "none",
 			element: "x264enc",
 			label:   "x264 software encoding (x264enc)",
-			result: encoderResult{rawFormat: "I420", parts: []string{
+			result: encoderResult{rawFormat: "I420", codec: VideoCodecH264, parts: []string{
 				"x264enc",
 				"tune=zerolatency",
 				"speed-preset=superfast",
@@ -909,8 +1205,49 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 	panic("validated H.264 encoder has no candidate")
 }
 
-// StartTestCapture creates a synthetic H.264 stream with the configured encoder.
+func selectGstHEVCEncoder(cfg CaptureConfig, hasElement func(string) bool, announce bool, hwaccel string, bitrate, keyframeInterval int) (encoderResult, error) {
+	type candidate struct {
+		method, element, label string
+		result                 encoderResult
+	}
+	candidates := []candidate{
+		{
+			method: "nvenc", element: "nvh265enc", label: "NVENC HEVC Main10 hardware encoding (nvh265enc)",
+			result: encoderResult{codec: VideoCodecHEVC, rawFormat: "P010_10LE", parts: gstStage{
+				"nvh265enc", fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("gop-size=%d", keyframeInterval),
+				"bframes=0", "rc-mode=cbr", "preset=p3", "tune=ultra-low-latency", "zerolatency=true", "aud=true",
+			}},
+		},
+		{
+			method: "none", element: "x265enc", label: "x265 HEVC Main10 software encoding (x265enc)",
+			result: encoderResult{codec: VideoCodecHEVC, rawFormat: "I420_10LE", parts: gstStage{
+				"x265enc", fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("key-int-max=%d", keyframeInterval),
+				"speed-preset=superfast", "tune=zerolatency", "option-string=bframes=0:repeat-headers=1:aud=1",
+			}},
+		},
+	}
+	for _, candidate := range candidates {
+		if hwaccel != "auto" && hwaccel != candidate.method {
+			continue
+		}
+		if hasElement(candidate.element) {
+			if announce {
+				log.Printf("[CAPTURE] using %s", candidate.label)
+			}
+			return candidate.result, nil
+		}
+	}
+	if hwaccel == "auto" {
+		return encoderResult{}, fmt.Errorf("HEVC requires GStreamer nvh265enc or x265enc; neither is available")
+	}
+	return encoderResult{}, fmt.Errorf("-video-codec hevc is unavailable with -hwaccel %s (use nvenc or none)", hwaccel)
+}
+
+// StartTestCapture creates a synthetic stream with the configured encoder.
 func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if cfg.VideoCodec == VideoCodecAuto {
+		return nil, fmt.Errorf("automatic video codec requires PrepareTestCapture followed by StartWithCodec")
+	}
 	preparation, err := PrepareTestCapture(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -939,7 +1276,11 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 	beforeConvert := []gstStage{
 		{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps)},
 		{"timeoverlay"},
+		lowLatencyVideoQueueStage(),
 	}
+	// Match the production capture paths: if conversion/encoding cannot keep up,
+	// keep the newest source frame instead of measuring or streaming a growing
+	// raw backlog.
 	gstArgs := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
 
 	dbg("[CAPTURE] launching gst-launch-1.0 (test mode) %s", strings.Join(gstArgs, " "))
@@ -971,7 +1312,7 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 		waitCh: make(chan struct{}),
 	}
 	if timestampedOutput {
-		capture.frames = newRTPVideoAccessUnitReader(stdout)
+		capture.frames = newRTPVideoAccessUnitReader(stdout, encoder.codec)
 	}
 	go func() {
 		capture.waitErr = <-waitResult
@@ -1007,12 +1348,13 @@ func captureBitrateKbps(cfg CaptureConfig) int {
 	}
 	width, height := 1920, 1080
 	if cfg.MaxWidth > 0 && cfg.MaxHeight > 0 {
-		// A decoder ceiling may force us below the normal 1080p budget, but it
-		// does not prove the captured source is large enough to justify raising
+		// A decoder ceiling may force H.264 below the normal 1080p budget. HEVC's
+		// high-resolution path deliberately budgets the selected maximum canvas.
+		// An H.264 ceiling does not prove the source is large enough to justify raising
 		// bitrate. Keep 1080p as the automatic upper budget; -bitrate remains the
 		// explicit way to allocate more for a genuinely high-resolution source.
 		if canvasWidth, canvasHeight := cfg.MaxWidth&^1, cfg.MaxHeight&^1; canvasWidth > 0 && canvasHeight > 0 {
-			if canvasWidth*canvasHeight < width*height {
+			if normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC || canvasWidth*canvasHeight < width*height {
 				width, height = canvasWidth, canvasHeight
 			}
 		}

@@ -67,7 +67,8 @@ func main() {
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
-	hwaccel := flag.String("hwaccel", "auto", "H.264 encoder: auto, nvenc, vaapi, openh264, none (x264)")
+	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
+	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses capability-gated hardware HEVC for high-resolution receivers)")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
@@ -82,6 +83,9 @@ func main() {
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
+	}
+	if err := airplay.ValidateVideoCodec(*videoCodec); err != nil {
+		log.Fatalf("invalid -video-codec: %v", err)
 	}
 	portMin, portMax, err := parsePortRange(*portRange)
 	if err != nil {
@@ -108,6 +112,7 @@ func main() {
 			PortMin:     portMin,
 			PortMax:     portMax,
 			HWAccel:     *hwaccel,
+			VideoCodec:  airplay.VideoCodec(*videoCodec),
 			Debug:       *debug,
 			TestMode:    *testMode,
 			NoEncrypt:   *noEncrypt,
@@ -320,13 +325,14 @@ func main() {
 	}
 
 	streamCfg := airplay.StreamConfig{
-		FPS:       *fps,
-		Bitrate:   *bitrate,
-		NoEncrypt: *noEncrypt,
-		DirectKey: *directKey,
-		NoAudio:   *noAudio,
-		PortMin:   portMin,
-		PortMax:   portMax,
+		FPS:        *fps,
+		Bitrate:    *bitrate,
+		VideoCodec: airplay.VideoCodec(*videoCodec),
+		NoEncrypt:  *noEncrypt,
+		DirectKey:  *directKey,
+		NoAudio:    *noAudio,
+		PortMin:    portMin,
+		PortMax:    portMax,
 	}
 	// Complete the potentially interactive Wayland portal request before SETUP,
 	// but delay encoder startup until control SETUP returns session-time display
@@ -336,6 +342,7 @@ func main() {
 		FPS:           *fps,
 		Bitrate:       *bitrate,
 		HWAccel:       *hwaccel,
+		VideoCodec:    airplay.VideoCodec(*videoCodec),
 		X11WindowID:   xid,
 		X11WindowName: *x11WindowName,
 		ShowCursor:    !*noCursor,
@@ -362,29 +369,36 @@ func main() {
 	if err != nil {
 		log.Fatalf("prepare screen capture: %v", err)
 	}
+	streamCfg.AutomaticHEVCAvailable = capturePreparation.AutomaticHEVCAvailable()
+	streamCfg.MeasuredVideoLatency = capturePreparation.MeasuredVideoLatency()
 
 	var capture *airplay.ScreenCapture
 	var broadcast *airplay.BroadcastCapture
 	var broadcastDone chan error
 	startedWidth, startedHeight := -1, -1
-	prepareVideo := func(width, height int) error {
+	startedCodec := airplay.VideoCodec("")
+	prepareVideo := func(width, height int, codec airplay.VideoCodec) error {
 		if capture != nil {
-			if width == startedWidth && height == startedHeight {
+			if codec == startedCodec {
+				if width != startedWidth || height != startedHeight {
+					log.Printf("receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session", codec, width, height, startedWidth, startedHeight)
+				}
 				return nil
 			}
-			return fmt.Errorf("receiver changed video canvas from %dx%d to %dx%d during setup", startedWidth, startedHeight, width, height)
+			return fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup", startedCodec, startedWidth, startedHeight, codec, width, height)
 		}
-		capture, err = capturePreparation.Start(width, height)
+		capture, err = capturePreparation.StartWithCodec(width, height, codec)
 		if err != nil {
 			return err
 		}
 		startedWidth, startedHeight = width, height
+		startedCodec = codec
 		broadcast = airplay.NewBroadcastCapture(capture)
 		broadcastDone = make(chan error, 1)
 		go func(active *airplay.BroadcastCapture, done chan<- error) {
 			done <- active.Run()
 		}(broadcast, broadcastDone)
-		log.Printf("screen capture started at %dx%d", width, height)
+		log.Printf("screen capture started at %dx%d using %s", width, height, codec)
 		return nil
 	}
 	defer func() {
@@ -395,7 +409,7 @@ func main() {
 		}
 	}()
 
-	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
 	if errors.Is(err, airplay.ErrCredentialsRequired) {
 		// Some legacy receivers do not advertise their configured password in
 		// /info. They reveal it only by challenging the first media SETUP. Keep
@@ -406,7 +420,13 @@ func main() {
 			log.Fatal("receiver code/password cannot be empty")
 		}
 		client.SetPassword(credential)
-		session, err = client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+		if startedCodec != "" {
+			// A late Digest challenge may expose richer authenticated display
+			// metadata on the retry. The running encoder is single-use, so pin
+			// the already safe concrete codec for the remainder of this session.
+			streamCfg.VideoCodec = startedCodec
+		}
+		session, err = client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
 	}
 	if err != nil {
 		log.Fatalf("mirror setup failed: %v", err)

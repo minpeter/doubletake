@@ -51,6 +51,25 @@ func TestCodecFrameUsesEncodedRasterForAllRects(t *testing.T) {
 	}
 }
 
+func TestCodecFrameUsesHEVCFormatOption(t *testing.T) {
+	sender, receiver := net.Pipe()
+	defer sender.Close()
+	defer receiver.Close()
+	session := &MirrorSession{dataConn: sender, videoCodec: VideoCodecHEVC}
+	done := make(chan error, 1)
+	go func() { done <- session.sendCodecFrame([]byte{1}, 0) }()
+	packet := make([]byte, 129)
+	if _, err := io.ReadFull(receiver, packet); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if packet[6] != 0x1e || packet[7] != 0x01 {
+		t.Fatalf("HEVC codec option = %02x %02x, want 1e 01", packet[6], packet[7])
+	}
+}
+
 func TestIsFirstSlice(t *testing.T) {
 	// NAL header 0x61 (type 1), slice header starts with bit 1 → first_mb_in_slice=0
 	if !isFirstSlice([]byte{0x61, 0x80}) {

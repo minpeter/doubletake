@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"doubletake/internal/airplay"
 )
 
 func TestNormalizedVideoCaptureKeyUsesEncodedEvenCanvas(t *testing.T) {
@@ -28,6 +30,17 @@ func TestNormalizedVideoCaptureKeyUsesEncodedEvenCanvas(t *testing.T) {
 				t.Fatalf("capture key = %dx%d, want %dx%d", got.maxWidth, got.maxHeight, test.wantWidth, test.wantHeight)
 			}
 		})
+	}
+}
+
+func TestNormalizedVideoCaptureKeySeparatesResolvedCodecs(t *testing.T) {
+	h264 := normalizedVideoCaptureKey(1920, 1080, airplay.VideoCodecH264)
+	hevc := normalizedVideoCaptureKey(1920, 1080, airplay.VideoCodecHEVC)
+	if h264 == hevc {
+		t.Fatalf("H.264 and HEVC capture keys unexpectedly match: %+v", h264)
+	}
+	if h264.codec != airplay.VideoCodecH264 || hevc.codec != airplay.VideoCodecHEVC {
+		t.Fatalf("capture key codecs = %s/%s", h264.codec, hevc.codec)
 	}
 }
 

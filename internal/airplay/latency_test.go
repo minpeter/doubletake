@@ -80,3 +80,17 @@ func TestSamplesFor44k1MatchesSenderTruncation(t *testing.T) {
 		t.Fatalf("85ms = %d samples, want artifact-compatible truncation to 3748", got)
 	}
 }
+
+func TestMinimumVideoLeadPreservesAutomaticAudioVideoDelta(t *testing.T) {
+	targets := screenLatencyTargets{
+		video: defaultVideoLatencyNormal,
+		audio: defaultAudioLatencyNormal,
+	}
+	if got := targets.withMinimumVideoLead(50 * time.Millisecond); got != targets {
+		t.Fatalf("unneeded minimum changed targets to %#v", got)
+	}
+	got := targets.withMinimumVideoLead(150 * time.Millisecond)
+	if got.video != 150*time.Millisecond || got.audio != 160*time.Millisecond {
+		t.Fatalf("calibrated targets = video %v audio %v, want 150ms/160ms", got.video, got.audio)
+	}
+}
