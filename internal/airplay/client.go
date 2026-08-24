@@ -697,7 +697,7 @@ func (c *AirPlayClient) SetupMirror(ctx context.Context, cfg StreamConfig) (*Mir
 	if cfg.VideoCodec == VideoCodecAuto {
 		return nil, fmt.Errorf("automatic video codec requires SetupMirrorWithVideoCodecPreparation")
 	}
-	return c.setupMirrorSession(ctx, cfg, nil)
+	return c.setupMirrorSession(ctx, cfg, nil, false)
 }
 
 // SetupMirrorWithVideoPreparation is SetupMirror with a hook at the protocol
@@ -709,11 +709,19 @@ func (c *AirPlayClient) SetupMirrorWithVideoPreparation(ctx context.Context, cfg
 		return nil, fmt.Errorf("automatic video codec requires SetupMirrorWithVideoCodecPreparation")
 	}
 	if prepare == nil {
-		return c.setupMirrorSession(ctx, cfg, nil)
+		return c.setupMirrorSession(ctx, cfg, nil, false)
 	}
-	return c.setupMirrorSession(ctx, cfg, func(width, height int, _ VideoCodec) error {
-		return prepare(width, height)
-	})
+	return c.setupMirrorSession(ctx, cfg, func(width, height int, _ VideoCodec) (VideoPreparationResult, error) {
+		return VideoPreparationResult{}, prepare(width, height)
+	}, false)
+}
+
+// VideoPreparationResult reports information which is only knowable after the
+// concrete receiver canvas and codec have launched the real capture pipeline.
+// MinimumVideoLead is a lower bound; it never reduces an earlier preflight
+// measurement or an explicit user-selected target.
+type VideoPreparationResult struct {
+	MinimumVideoLead time.Duration
 }
 
 // SetupMirrorWithVideoCodecPreparation is the automatic-codec variant of
@@ -721,7 +729,20 @@ func (c *AirPlayClient) SetupMirrorWithVideoPreparation(ctx context.Context, cfg
 // from final session-time receiver information, so capture and wire framing use
 // the same format.
 func (c *AirPlayClient) SetupMirrorWithVideoCodecPreparation(ctx context.Context, cfg StreamConfig, prepare func(width, height int, codec VideoCodec) error) (*MirrorSession, error) {
-	return c.setupMirrorSession(ctx, cfg, prepare)
+	if prepare == nil {
+		return c.setupMirrorSession(ctx, cfg, nil, false)
+	}
+	return c.setupMirrorSession(ctx, cfg, func(width, height int, codec VideoCodec) (VideoPreparationResult, error) {
+		return VideoPreparationResult{}, prepare(width, height, codec)
+	}, false)
+}
+
+// SetupMirrorWithCalibratedVideoPreparation is the result-bearing variant of
+// SetupMirrorWithVideoCodecPreparation. The hook runs before audio and video
+// SETUP commit their latency descriptors, allowing a timestamped production
+// capture to report its measured minimum video lead without a clock mismatch.
+func (c *AirPlayClient) SetupMirrorWithCalibratedVideoPreparation(ctx context.Context, cfg StreamConfig, prepare func(width, height int, codec VideoCodec) (VideoPreparationResult, error)) (*MirrorSession, error) {
+	return c.setupMirrorSession(ctx, cfg, prepare, prepare != nil)
 }
 
 // httpRequest sends an RTSP/1.0 request over the AirPlay connection and returns the response body.

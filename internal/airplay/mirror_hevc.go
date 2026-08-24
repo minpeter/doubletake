@@ -266,7 +266,13 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 			dbg("[STREAM] HEVC frame %d key=%v bytes=%d NALs=%s", frameCount, keyframe, len(frame), types.String())
 		}
 		if time.Since(lastProgress) >= 5*time.Second {
-			dbg("[STREAM] HEVC video progress: sent frame %d", frameCount)
+			if unit.PTS.IsZero() {
+				dbg("[STREAM] HEVC video progress: sent frame %d, source PTS unavailable", frameCount)
+			} else {
+				age := time.Since(unit.PTS)
+				dbg("[STREAM] HEVC video progress: sent frame %d, source age=%v local presentation slack=%v",
+					frameCount, age, s.timestampBias-age)
+			}
 			lastProgress = time.Now()
 		}
 	}

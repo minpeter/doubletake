@@ -222,6 +222,7 @@ type MirrorSession struct {
 	chachaNonce        uint64              // per-frame nonce counter
 	frameSeq           uint32
 	lastFrameTimestamp uint64
+	lastSlowWriteLog   time.Time
 	firstFrameSent     chan struct{} // closed after first video frame is sent
 	latePTSReported    bool
 	timestampBias      time.Duration
@@ -367,7 +368,7 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 }
 
 // setupMirrorSession negotiates the mirroring stream with the Apple TV.
-func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) error) (*MirrorSession, error) {
+func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) (VideoPreparationResult, error), captureMayReportMinimumLead bool) (*MirrorSession, error) {
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -506,22 +507,24 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	audioLatencySamples := samplesFor44k1(latencies.audio)
 	measuredLatencyApplied := false
 	audioSetupCommitted := false
-	applyMeasuredCaptureLatency := func(codec VideoCodec) {
-		if measuredLatencyApplied || codec != VideoCodecHEVC || targetLatencyIsExplicit() || cfg.MeasuredVideoLatency <= latencies.video {
-			return
+	applyMeasuredCaptureLatency := func(codec VideoCodec, minimumVideoLead time.Duration) error {
+		if measuredLatencyApplied || codec != VideoCodecHEVC || targetLatencyIsExplicit() || minimumVideoLead <= latencies.video {
+			return nil
 		}
 		if audioSetupCommitted {
-			// A legacy media-first receiver has already accepted latencyMax. Do not
-			// create a descriptor/TimeAnnounce mismatch after that protocol boundary.
-			dbg("[SETUP] local HEVC capture budget became known after audio SETUP; retaining negotiated leads")
-			return
+			// A legacy media-first receiver has already accepted latencyMax. Failing
+			// is safer than creating a descriptor/TimeAnnounce mismatch after that
+			// protocol boundary. Automatic selection avoids this path by choosing H.264
+			// before the production capture is launched.
+			return fmt.Errorf("production HEVC requires %v video lead, but media-first audio SETUP already committed %v; use automatic/H.264 or an explicit joint target of at least %v", minimumVideoLead, latencies.video, minimumVideoLead)
 		}
 		before := latencies
-		latencies = latencies.withMinimumVideoLead(cfg.MeasuredVideoLatency)
+		latencies = latencies.withMinimumVideoLead(minimumVideoLead)
 		audioLatencySamples = samplesFor44k1(latencies.audio)
 		measuredLatencyApplied = true
 		dbg("[SETUP] local capture budget raised playout leads: video=%v->%v audio=%v->%v",
 			before.video, latencies.video, before.audio, latencies.audio)
+		return nil
 	}
 	skipRecord := false
 
@@ -639,7 +642,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			return selectionErr
 		}
 		if selection.codec == VideoCodecHEVC && cfg.VideoCodec == VideoCodecAuto && audioSetupCommitted &&
-			!targetLatencyIsExplicit() && cfg.MeasuredVideoLatency > latencies.video {
+			!targetLatencyIsExplicit() && (cfg.MeasuredVideoLatency > latencies.video || captureMayReportMinimumLead) {
 			// The legacy media-first flow exposes dynamic display metadata only after
 			// latencyMax has been accepted. Keep the descriptor and TimeAnnounce
 			// coherent by retaining the nominal H.264 path for this session rather
@@ -651,17 +654,21 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			selection.reason = "media-first audio latency was committed before HEVC calibration"
 		}
 		videoCodec = selection.codec
-		applyMeasuredCaptureLatency(videoCodec)
 		canvasW, canvasH := selection.width, selection.height
 		maxW, maxH := info.MaxVideoSize()
 		dbg("[SETUP] receiver video canvas: %dx%d (maximum %dx%d, codec=%s, requested=%s: %s)", canvasW, canvasH, maxW, maxH, videoCodec, normalizeVideoCodec(cfg.VideoCodec), selection.reason)
+		minimumVideoLead := cfg.MeasuredVideoLatency
 		if prepareVideoCapture == nil {
-			return nil
+			return applyMeasuredCaptureLatency(videoCodec, minimumVideoLead)
 		}
-		if err := prepareVideoCapture(canvasW, canvasH, videoCodec); err != nil {
+		result, err := prepareVideoCapture(canvasW, canvasH, videoCodec)
+		if err != nil {
 			return fmt.Errorf("prepare %dx%d video capture: %w", canvasW, canvasH, err)
 		}
-		return nil
+		if result.MinimumVideoLead > minimumVideoLead {
+			minimumVideoLead = result.MinimumVideoLead
+		}
+		return applyMeasuredCaptureLatency(videoCodec, minimumVideoLead)
 	}
 	refreshSessionInfo := func(phase string) (*ReceiverInfo, error) {
 		refreshed, refreshErr := c.getInfoWithTimeout(sessionInfoFallbackTimeout)
@@ -1250,6 +1257,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		}
 		nalLog.Reset()
 
+		sentPTS := vclPTS
 		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
 		}
@@ -1266,7 +1274,14 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		resetVCL()
 		frameCount++
 		if time.Since(lastProgressLog) >= 5*time.Second {
-			dbg("[STREAM] video progress: sent frame %d (%s, %d bytes)", frameCount, keyframeStr, len(frameData))
+			if sentPTS.IsZero() {
+				dbg("[STREAM] video progress: sent frame %d (%s, %d bytes), source PTS unavailable",
+					frameCount, keyframeStr, len(frameData))
+			} else {
+				age := time.Since(sentPTS)
+				dbg("[STREAM] video progress: sent frame %d (%s, %d bytes), source age=%v local presentation slack=%v",
+					frameCount, keyframeStr, len(frameData), age, s.timestampBias-age)
+			}
 			lastProgressLog = time.Now()
 		}
 		return nil
@@ -1888,12 +1903,21 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 	// Use vectored I/O (writev) to send header + payload in a single syscall,
 	// avoiding a copy into a combined buffer.
 	bufs := net.Buffers{header[:], framePayload}
+	writeStarted := time.Now()
 	s.dataMu.Lock()
 	s.dataConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err := bufs.WriteTo(s.dataConn)
+	writeEnded := time.Now()
+	reportSlowWrite := writeEnded.Sub(writeStarted) >= 25*time.Millisecond &&
+		(s.lastSlowWriteLog.IsZero() || writeEnded.Sub(s.lastSlowWriteLog) >= 5*time.Second)
+	if reportSlowWrite {
+		s.lastSlowWriteLog = writeEnded
+	}
 	s.dataMu.Unlock()
 	if err != nil {
 		dbg("[SEND] write error on frame seq=%d: %v", s.frameSeq, err)
+	} else if reportSlowWrite {
+		dbg("[SEND] video frame seq=%d spent %v waiting for/local-writing to the TCP socket", s.frameSeq, writeEnded.Sub(writeStarted))
 	}
 	return err
 }

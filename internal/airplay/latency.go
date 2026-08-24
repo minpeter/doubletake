@@ -71,6 +71,12 @@ func TargetLatency() time.Duration {
 	return screenLatenciesForHint(connectionLatencyNormal).video
 }
 
+// HasExplicitTargetLatency reports whether SetTargetLatency currently replaces
+// automatic capture calibration with one joint audio/video lead.
+func HasExplicitTargetLatency() bool {
+	return targetLatencyIsExplicit()
+}
+
 func targetLatencyIsExplicit() bool {
 	return targetLatencyNS.Load() > 0
 }

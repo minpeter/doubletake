@@ -228,10 +228,11 @@ type videoCaptureKey struct {
 // receiver can join only the group matching its resolved nominal canvas, so a
 // lower-resolution receiver never inherits a larger first target's encoding.
 type videoCaptureGroup struct {
-	key       videoCaptureKey
-	broadcast *airplay.BroadcastCapture
-	capture   *airplay.ScreenCapture
-	cancel    context.CancelFunc
+	key              videoCaptureKey
+	broadcast        *airplay.BroadcastCapture
+	capture          *airplay.ScreenCapture
+	minimumVideoLead time.Duration
+	cancel           context.CancelFunc
 }
 
 // daemonCleanup owns resources detached from the daemon's state maps. Building
@@ -1125,7 +1126,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	streamCfg.MeasuredVideoLatency = capturePreparation.MeasuredVideoLatency()
 	var broadcast *airplay.BroadcastCapture
 	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
-	prepareVideo := func(width, height int, codec airplay.VideoCodec) error {
+	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
 		key := normalizedVideoCaptureKey(width, height, codec)
 		if broadcast != nil {
 			if key.codec == selectedCaptureKey.codec {
@@ -1133,22 +1134,28 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 					log.Printf("[daemon] receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session",
 						key.codec, key.maxWidth, key.maxHeight, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight)
 				}
-				return nil
+				d.mu.Lock()
+				lead := time.Duration(0)
+				if entry.captureGroup != nil {
+					lead = entry.captureGroup.minimumVideoLead
+				}
+				d.mu.Unlock()
+				return airplay.VideoPreparationResult{MinimumVideoLead: lead}, nil
 			}
-			return fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup",
+			return airplay.VideoPreparationResult{}, fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup",
 				selectedCaptureKey.codec, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight,
 				key.codec, key.maxWidth, key.maxHeight)
 		}
-		resolved, startErr := d.getOrStartPreparedCaptureGroup(entry, capturePreparation, width, height, codec)
+		resolved, minimumVideoLead, startErr := d.getOrStartPreparedCaptureGroup(ctx, entry, capturePreparation, width, height, codec)
 		if startErr != nil {
-			return startErr
+			return airplay.VideoPreparationResult{}, startErr
 		}
 		broadcast = resolved
 		selectedCaptureKey = key
-		return nil
+		return airplay.VideoPreparationResult{MinimumVideoLead: minimumVideoLead}, nil
 	}
 
-	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
+	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
 	err = retryMirrorSetupAfterDigestChallenge(
 		err,
 		func() (string, error) { return waitForCredential(CredentialKindPassword) },
@@ -1161,7 +1168,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 				streamCfg.VideoCodec = selectedCaptureKey.codec
 			}
 			var setupErr error
-			session, setupErr = client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
+			session, setupErr = client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
 			return setupErr
 		},
 	)
@@ -1322,7 +1329,7 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
 // only when no encoder exists for the resolved nominal canvas. Otherwise the
 // stream joins the existing group and the unused preparation is released.
 // Must NOT be called with d.mu held.
-func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation *airplay.CapturePreparation, width, height int, codec airplay.VideoCodec) (*airplay.BroadcastCapture, error) {
+func (d *Daemon) getOrStartPreparedCaptureGroup(ctx context.Context, entry *activeStream, preparation *airplay.CapturePreparation, width, height int, codec airplay.VideoCodec) (*airplay.BroadcastCapture, time.Duration, error) {
 	d.captureStartMu.Lock()
 	defer d.captureStartMu.Unlock()
 
@@ -1330,7 +1337,7 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
-		return nil, context.Canceled
+		return nil, 0, context.Canceled
 	}
 	if d.captureGroups == nil {
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
@@ -1341,9 +1348,9 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation
 		d.mu.Unlock()
 		preparation.Close()
 		if broadcast == nil {
-			return nil, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+			return nil, 0, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
 		}
-		return broadcast, nil
+		return broadcast, group.minimumVideoLead, nil
 	}
 
 	captureCtx, captureCancel := context.WithCancel(context.Background())
@@ -1363,19 +1370,39 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation
 			entry.captureGroup = nil
 		}
 		d.mu.Unlock()
-		return nil, err
+		return nil, 0, err
 	}
 
-	broadcast := airplay.NewBroadcastCapture(capture)
+	minimumVideoLead := time.Duration(0)
+	if key.codec == airplay.VideoCodecHEVC && !airplay.HasExplicitTargetLatency() {
+		minimumVideoLead, err = airplay.MeasureVideoCaptureLatency(ctx, capture, d.cfg.FPS)
+		if err != nil {
+			captureCancel()
+			capture.Stop()
+			d.mu.Lock()
+			if d.captureGroups[key] == group {
+				delete(d.captureGroups, key)
+			}
+			if entry.captureGroup == group {
+				entry.captureGroup = nil
+			}
+			d.mu.Unlock()
+			return nil, 0, fmt.Errorf("measure production HEVC timing: %w", err)
+		}
+		log.Printf("[daemon] production HEVC timing for %dx%d requires at least %v video lead", key.maxWidth, key.maxHeight, minimumVideoLead)
+	}
+
+	broadcast := airplay.NewBroadcastCaptureWithFrameRate(capture, d.cfg.FPS)
 	d.mu.Lock()
 	if d.captureGroups[key] != group || d.streams[entry.deviceIP] != entry || entry.captureGroup != group {
 		d.mu.Unlock()
 		captureCancel()
 		capture.Stop()
-		return nil, context.Canceled
+		return nil, 0, context.Canceled
 	}
 	group.broadcast = broadcast
 	group.capture = capture
+	group.minimumVideoLead = minimumVideoLead
 	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
@@ -1383,7 +1410,7 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(entry *activeStream, preparation
 		defer d.streamWorkers.Done()
 		d.finishCaptureGroup(group, broadcast, broadcast.Run())
 	}()
-	return broadcast, nil
+	return broadcast, minimumVideoLead, nil
 }
 
 // getOrStartCaptureGroup returns the capture group matching this stream's
@@ -1478,7 +1505,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		return nil, err
 	}
 
-	newBC := airplay.NewBroadcastCapture(capture)
+	newBC := airplay.NewBroadcastCaptureWithFrameRate(capture, d.cfg.FPS)
 	d.mu.Lock()
 	if d.captureGroups[key] != group || d.streams[entry.deviceIP] != entry || entry.captureGroup != group {
 		d.mu.Unlock()

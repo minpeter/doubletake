@@ -15,6 +15,7 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 	args := strings.Join(audioCapturePipelineArgs([]string{"audiotestsrc"}, AudioCodecALAC, true), " ")
 	for _, want := range []string{
 		"format=S16BE",
+		"queue max-size-buffers=0 max-size-bytes=0 max-size-time=250000000 leaky=no",
 		"rtpL16pay pt=96 mtu=60000 timestamp-offset=0 seqnum-offset=0 perfect-rtptime=true",
 		"rtponviftimestamp ntp-offset=-1 set-e-bit=false set-t-bit=false",
 		"rtpstreampay",
@@ -30,6 +31,9 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 	raw := strings.Join(audioCapturePipelineArgs([]string{"audiotestsrc"}, AudioCodecALAC, false), " ")
 	if !strings.Contains(raw, "format=S16LE") {
 		t.Fatalf("raw fallback pipeline %q does not retain S16LE", raw)
+	}
+	if !strings.Contains(raw, "queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream") {
+		t.Fatalf("raw fallback pipeline %q does not retain its bounded no-PTS drop policy", raw)
 	}
 	for _, unwanted := range []string{"rtpL16pay", "rtponviftimestamp", "rtpstreampay"} {
 		if strings.Contains(raw, unwanted) {

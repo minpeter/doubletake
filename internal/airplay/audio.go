@@ -46,6 +46,18 @@ const (
 
 	audioSyncPayloadTypeNTP = 0xd4
 	audioSyncPayloadTypePTP = 0xd7
+
+	// AirPlay receivers report missing audio on the control socket with the
+	// classic RTP retransmit request/response payload types. Keep the same
+	// bounded 512-packet history used by Apple's sender-side audio queues.
+	audioRetransmitRequestPayloadType  = 0xd5
+	audioRetransmitResponsePayloadType = 0xd6
+	audioRetransmitHistoryPackets      = 512
+
+	// Timestamped capture can absorb a short scheduler stall without losing raw
+	// PCM. This queue has no minimum threshold, so it does not add steady-state
+	// latency; source PTS still decides whether a recovered frame is timely.
+	audioCaptureStallBuffer = 250 * time.Millisecond
 )
 
 // ErrAACELDUnavailable means this build does not contain the optional FDK-AAC
@@ -131,9 +143,15 @@ func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bo
 		"!", "audioconvert",
 		"!", "audioresample",
 		"!", fmt.Sprintf("audio/x-raw,rate=%d,channels=%d,format=%s,layout=interleaved", audioSampleRate, audioChannels, format),
-		"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
 	)
 	if timestamped {
+		// Preserve complete source samples through short CPU/GPU scheduling stalls.
+		// The timestamp-aware Go reader can then discard only codec frames whose
+		// negotiated playout deadline has actually passed.
+		args = append(args,
+			"!", "queue", "max-size-buffers=0", "max-size-bytes=0",
+			fmt.Sprintf("max-size-time=%d", audioCaptureStallBuffer), "leaky=no",
+		)
 		// ceil(SPF / sampleRate) keeps a normal codec frame within one packet,
 		// while the Go reader remains correct if GStreamer splits or combines it.
 		maxPacketTime := (codecSPF*int64(time.Second) + audioSampleRate - 1) / audioSampleRate
@@ -144,6 +162,13 @@ func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bo
 			"perfect-rtptime=true", fmt.Sprintf("max-ptime=%d", maxPacketTime),
 			"!", "rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false",
 			"!", "rtpstreampay",
+		)
+	} else {
+		// The compatibility fallback has no source PTS with which to recognize a
+		// backlog. Retain its small downstream-leaky queue so a stalled reader
+		// cannot turn into permanent audio lag.
+		args = append(args,
+			"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
 		)
 	}
 	return append(args, "!", "fdsink", "fd=1", "sync=false", "async=false")
@@ -489,6 +514,12 @@ func detectPulseMonitor() string {
 	return sinkName + ".monitor"
 }
 
+type audioPacketHistoryEntry struct {
+	valid  bool
+	seq    uint16
+	packet []byte
+}
+
 // AudioStream manages the RTP audio channel to the AirPlay receiver.
 type AudioStream struct {
 	conn            net.PacketConn // local UDP socket for sending audio
@@ -508,6 +539,8 @@ type AudioStream struct {
 	spf             uint16 // samples per frame
 	latencySamples  uint32 // audio latency in samples (for sync packets)
 	mu              sync.Mutex
+	historyMu       sync.RWMutex
+	packetHistory   [audioRetransmitHistoryPackets]audioPacketHistoryEntry
 }
 
 // AudioCodec returns the codec negotiated for this mirror session.
@@ -734,6 +767,12 @@ func (as *AudioStream) sendAudioPacketWithSeqAndNonce(payload []byte, rtpTime ui
 	copy(packet[:12], header)
 	copy(packet[12:], packetPayload)
 
+	if reuseNonce == nil {
+		// Register the immutable message before network dispatch, matching the
+		// official sender's prepare/enqueue order and closing the lookup window
+		// before a later packet can expose this sequence as missing.
+		as.rememberAudioPacket(seq, packet)
+	}
 	_, err := as.conn.WriteTo(packet, as.remoteAddr)
 	if err != nil {
 		return usedNonce, err
@@ -745,6 +784,108 @@ func (as *AudioStream) sendAudioPacketWithSeqAndNonce(payload []byte, rtpTime ui
 		as.rtpTime = rtpTime
 	}
 	return usedNonce, nil
+}
+
+func (as *AudioStream) rememberAudioPacket(seq uint16, packet []byte) {
+	// sendAudioPacketWithSeqAndNonce fully serializes each fresh allocation before
+	// registering it and never mutates it afterward, so the ring can retain that
+	// allocation directly. This keeps retransmission byte-identical without a copy.
+	index := int(seq) % len(as.packetHistory)
+	as.historyMu.Lock()
+	as.packetHistory[index] = audioPacketHistoryEntry{valid: true, seq: seq, packet: packet}
+	as.historyMu.Unlock()
+}
+
+func (as *AudioStream) audioPacketForRetransmit(seq uint16) []byte {
+	index := int(seq) % len(as.packetHistory)
+	as.historyMu.RLock()
+	entry := as.packetHistory[index]
+	as.historyMu.RUnlock()
+	if !entry.valid || entry.seq != seq {
+		return nil
+	}
+	// Replacing a ring slot never mutates its previous backing allocation. This
+	// local slice keeps those immutable bytes alive after releasing the lock.
+	return entry.packet
+}
+
+type audioRetransmitRequest struct {
+	requestSeq uint16
+	firstSeq   uint16
+	count      uint16
+}
+
+func parseAudioRetransmitRequest(packet []byte) (audioRetransmitRequest, bool) {
+	if len(packet) != 8 || packet[0] != 0x80 || packet[1] != audioRetransmitRequestPayloadType {
+		return audioRetransmitRequest{}, false
+	}
+	request := audioRetransmitRequest{
+		requestSeq: binary.BigEndian.Uint16(packet[2:4]),
+		firstSeq:   binary.BigEndian.Uint16(packet[4:6]),
+		count:      binary.BigEndian.Uint16(packet[6:8]),
+	}
+	if request.count == 0 {
+		return audioRetransmitRequest{}, false
+	}
+	return request, true
+}
+
+// handleAudioControlPacket answers a receiver retransmit request on the same
+// control socket. A successful response is the four-byte 0xd6 wrapper followed
+// by the exact original RTP datagram. If history has expired, the eight-byte
+// form tells the receiver that retrying this sequence is futile.
+func (as *AudioStream) handleAudioControlPacket(packet []byte, addr net.Addr) (handled bool, resent int, err error) {
+	request, ok := parseAudioRetransmitRequest(packet)
+	if !ok {
+		return false, 0, nil
+	}
+
+	// At most one more lookup than the bounded history can succeed. This keeps a
+	// malformed count from amplifying traffic while still producing the official
+	// futile response at the first sequence we cannot serve.
+	requestCount := int(request.count)
+	if requestCount > len(as.packetHistory)+1 {
+		requestCount = len(as.packetHistory) + 1
+	}
+	for offset := 0; offset < requestCount; offset++ {
+		seq := request.firstSeq + uint16(offset)
+		original := as.audioPacketForRetransmit(seq)
+		if original == nil {
+			response := make([]byte, 8)
+			response[0] = 0x80
+			response[1] = audioRetransmitResponsePayloadType
+			binary.BigEndian.PutUint16(response[2:4], request.requestSeq)
+			binary.BigEndian.PutUint16(response[4:6], seq)
+			if _, writeErr := as.ctrlConn.WriteTo(response, addr); writeErr != nil {
+				return true, resent, writeErr
+			}
+			dbg("[AUDIO] retransmit request id=%d first=%d count=%d: resent=%d, sequence %d expired",
+				request.requestSeq, request.firstSeq, request.count, resent, seq)
+			return true, resent, nil
+		}
+
+		response := make([]byte, 4+len(original))
+		response[0] = 0x80
+		response[1] = audioRetransmitResponsePayloadType
+		binary.BigEndian.PutUint16(response[2:4], request.requestSeq)
+		copy(response[4:], original)
+		if _, writeErr := as.ctrlConn.WriteTo(response, addr); writeErr != nil {
+			return true, resent, writeErr
+		}
+		resent++
+	}
+
+	dbg("[AUDIO] retransmit request id=%d first=%d count=%d: resent=%d",
+		request.requestSeq, request.firstSeq, request.count, resent)
+	return true, resent, nil
+}
+
+func (as *AudioStream) audioControlPacketFromReceiver(addr net.Addr) bool {
+	if as.ctrlAddr == nil || len(as.ctrlAddr.IP) == 0 {
+		return true
+	}
+	peer, ok := addr.(*net.UDPAddr)
+	return ok && peer.IP.Equal(as.ctrlAddr.IP)
 }
 
 // aesEncryptAudioPayload encrypts audio data using AES-128-CBC.
@@ -856,7 +997,50 @@ func (s *MirrorSession) audioClockAt(local time.Time) (timestamp, timelineID uin
 const (
 	minimumAudioSendLead        = 5 * time.Millisecond
 	maximumInitialCatchupFrames = 128
+	audioSendBurstWindow        = 5 * time.Millisecond
+	maximumAudioPacketsPerBurst = 12
 )
+
+// audioSendBurstLimiter bounds only catch-up bursts. At normal ALAC/AAC-ELD
+// cadence every source frame arrives outside the five-millisecond window, so it
+// adds no steady-state delay. Apple's real-time audio sender uses the same
+// five-millisecond service cadence and a burst budget whose floor is 12.
+type audioSendBurstLimiter struct {
+	windowStart time.Time
+	packets     int
+}
+
+func (limiter *audioSendBurstLimiter) reserveDelay(now time.Time) time.Duration {
+	if now.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(limiter.windowStart)
+	if limiter.windowStart.IsZero() || elapsed < 0 || elapsed >= audioSendBurstWindow {
+		limiter.windowStart = now
+		limiter.packets = 0
+	}
+	if limiter.packets < maximumAudioPacketsPerBurst {
+		limiter.packets++
+		return 0
+	}
+	return audioSendBurstWindow - elapsed
+}
+
+func (limiter *audioSendBurstLimiter) wait(ctx context.Context) error {
+	for {
+		delay := limiter.reserveDelay(time.Now())
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
 
 func audioLatencyDuration(samples uint32) time.Duration {
 	return audioSamplesDuration(uint64(samples))
@@ -1021,7 +1205,7 @@ videoReady:
 		}
 	}()
 
-	// Listen for control packets (resend requests) in background
+	// Listen for control packets (primarily retransmit requests) in background.
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
@@ -1035,7 +1219,18 @@ videoReady:
 				dbg("[AUDIO] control read error: %v", err)
 				return
 			}
-			dbg("[AUDIO] control packet from %s: %d bytes: %02x", addr, n, buf[:n])
+			if !audioStream.audioControlPacketFromReceiver(addr) {
+				dbg("[AUDIO] ignoring control packet from unexpected peer %s", addr)
+				continue
+			}
+			handled, _, handleErr := audioStream.handleAudioControlPacket(buf[:n], addr)
+			if handleErr != nil {
+				dbg("[AUDIO] retransmit response error for %s: %v", addr, handleErr)
+				continue
+			}
+			if !handled {
+				dbg("[AUDIO] control packet from %s: %d bytes: %02x", addr, n, buf[:n])
+			}
 		}
 	}()
 
@@ -1046,6 +1241,13 @@ videoReady:
 		dbg("[AUDIO] FEC disabled for ChaCha-encrypted sessions: each frame sent once")
 	} else {
 		dbg("[AUDIO] FEC enabled: burst-8 + interleaved retransmit")
+	}
+	var burstLimiter audioSendBurstLimiter
+	sendPacket := func(payload []byte, rtpTime uint32, seq uint16, reuseNonce *uint64) (uint64, error) {
+		if err := burstLimiter.wait(ctx); err != nil {
+			return 0, err
+		}
+		return audioStream.sendAudioPacketWithSeqAndNonce(payload, rtpTime, seq, reuseNonce)
 	}
 
 	const retransmitDepth = 8
@@ -1135,12 +1337,12 @@ videoReady:
 		frameCount++
 		if !useFEC {
 			// Single-send: send each frame once
-			if _, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, frameRTP, frameSeq, nil); err != nil {
+			if _, err := sendPacket(payload, frameRTP, frameSeq, nil); err != nil {
 				return fmt.Errorf("audio send: %w", err)
 			}
 		} else if !burstDone {
 			// Initial burst phase: send frames immediately, fill retransmit buffer
-			nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, frameRTP, frameSeq, nil)
+			nonce, err := sendPacket(payload, frameRTP, frameSeq, nil)
 			if err != nil {
 				return fmt.Errorf("audio send: %w", err)
 			}
@@ -1154,12 +1356,12 @@ videoReady:
 		} else {
 			// Steady state: send retransmit of old frame, then new frame
 			old := retransmitBuf[retransmitIdx]
-			if _, err := audioStream.sendAudioPacketWithSeqAndNonce(old.payload, old.rtpTime, old.seq, &old.nonce); err != nil {
+			if _, err := sendPacket(old.payload, old.rtpTime, old.seq, &old.nonce); err != nil {
 				return fmt.Errorf("audio retransmit: %w", err)
 			}
 
 			// Store and send new frame
-			nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, frameRTP, frameSeq, nil)
+			nonce, err := sendPacket(payload, frameRTP, frameSeq, nil)
 			if err != nil {
 				return fmt.Errorf("audio send: %w", err)
 			}

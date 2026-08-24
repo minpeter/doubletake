@@ -467,14 +467,47 @@ var automaticHEVCProbeResults sync.Map // map[int]*automaticHEVCProbeResult, key
 const (
 	automaticHEVCProbeFrames       = 45
 	automaticHEVCProbeWarmupFrames = 10
-	// Apple expects capture, encode, transport, and decoder work to fit inside
-	// the screen lead. Reserve receiver/network room after the local source-to-AU
-	// age instead of merely scheduling a frame at the instant it leaves Go.
-	automaticHEVCDeliveryMargin = 50 * time.Millisecond
-	maximumAutomaticVideoLead   = 500 * time.Millisecond
+	liveHEVCProbeFrames            = 20
+	liveHEVCProbeWarmupFrames      = 5
+	// The screen timestamp equation requires capture, encode, transport, and
+	// decoder work to fit inside the presentation lead. Apple's ordinary
+	// virtual-display source also bounds queued
+	// frames to 67 ms. Apple uses that as an upstream drop ceiling, not a decoder
+	// allowance; using the same duration here is Doubletake's conservative
+	// delivery-room heuristic after local source-to-AU age. Never reserve less
+	// than two frame periods at lower rates.
+	ordinaryScreenFrameQueueDuration = 67 * time.Millisecond
+	maximumAutomaticVideoLead        = 500 * time.Millisecond
+	minimumLiveVideoProbeTimeout     = 3 * time.Second
 )
 
-func recommendedAutomaticVideoLatency(ages []time.Duration) (time.Duration, bool) {
+func liveVideoProbeTimeout(fps int) time.Duration {
+	if fps <= 0 {
+		fps = 30
+	}
+	frames := liveHEVCProbeWarmupFrames + liveHEVCProbeFrames
+	sampleWindow := (time.Duration(frames)*time.Second + time.Duration(fps) - 1) / time.Duration(fps)
+	// In addition to the nominal sample window, allow the launched encoder two
+	// seconds to negotiate resources and emit its first complete access unit.
+	timeout := sampleWindow + 2*time.Second
+	if timeout < minimumLiveVideoProbeTimeout {
+		return minimumLiveVideoProbeTimeout
+	}
+	return timeout
+}
+
+func automaticVideoDeliveryMargin(fps int) time.Duration {
+	if fps <= 0 {
+		fps = 30
+	}
+	margin := (2*time.Second + time.Duration(fps) - 1) / time.Duration(fps)
+	if margin < ordinaryScreenFrameQueueDuration {
+		margin = ordinaryScreenFrameQueueDuration
+	}
+	return margin
+}
+
+func recommendedAutomaticVideoLatency(ages []time.Duration, fps int) (time.Duration, bool) {
 	if len(ages) == 0 {
 		return 0, false
 	}
@@ -488,7 +521,7 @@ func recommendedAutomaticVideoLatency(ages []time.Duration) (time.Duration, bool
 		index = 1
 	}
 	p95 := ages[index-1]
-	lead := p95 + automaticHEVCDeliveryMargin
+	lead := p95 + automaticVideoDeliveryMargin(fps)
 	if lead < defaultVideoLatencyNormal {
 		lead = defaultVideoLatencyNormal
 	}
@@ -497,6 +530,82 @@ func recommendedAutomaticVideoLatency(ages []time.Duration) (time.Duration, bool
 		return 0, false
 	}
 	return lead, true
+}
+
+func measureVideoCaptureLatency(ctx context.Context, capture *ScreenCapture, fps, warmupFrames, measuredFrames int) (time.Duration, error) {
+	if capture == nil {
+		return 0, fmt.Errorf("measure video latency: nil capture")
+	}
+	if warmupFrames < 0 || measuredFrames <= 0 {
+		return 0, fmt.Errorf("measure video latency: invalid sample counts %d/%d", warmupFrames, measuredFrames)
+	}
+	ages := make([]time.Duration, 0, measuredFrames)
+	for frame := 0; frame < warmupFrames+measuredFrames; frame++ {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+		unit, err := capture.ReadVideoAccessUnit()
+		if err != nil {
+			return 0, err
+		}
+		if frame < warmupFrames || unit.PTS.IsZero() {
+			continue
+		}
+		age := time.Since(unit.PTS)
+		if age < 0 || age > maximumAutomaticVideoLead {
+			return 0, fmt.Errorf("capture produced implausible source age %v", age)
+		}
+		ages = append(ages, age)
+	}
+	lead, ok := recommendedAutomaticVideoLatency(ages, fps)
+	if !ok {
+		return 0, fmt.Errorf("capture cannot satisfy the bounded presentation lead")
+	}
+	return lead, nil
+}
+
+// MeasureVideoCaptureLatency consumes a short startup sample from an already
+// launched timestamped HEVC capture and returns the minimum presentation lead
+// for that real source, scaling, and encoder path. It must run before any other
+// reader or BroadcastCapture is attached. The discarded startup access units
+// are intentional; subsequent fan-out begins with a complete access unit. A
+// canceled or timed-out measurement stops the capture to interrupt its reader,
+// so callers must discard that capture.
+func MeasureVideoCaptureLatency(ctx context.Context, capture *ScreenCapture, fps int) (time.Duration, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, liveVideoProbeTimeout(fps))
+	defer cancel()
+	type result struct {
+		lead time.Duration
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		lead, err := measureVideoCaptureLatency(probeCtx, capture, fps, liveHEVCProbeWarmupFrames, liveHEVCProbeFrames)
+		resultCh <- result{lead: lead, err: err}
+	}()
+
+	select {
+	case measured := <-resultCh:
+		return measured.lead, measured.err
+	case <-probeCtx.Done():
+		// ReadVideoAccessUnit ultimately blocks in the capture pipe. Destroying a
+		// capture which cannot provide startup frames is the only safe interrupt:
+		// returning while its reader goroutine remains active would race fan-out.
+		// The caller treats this as failed preparation and does not reuse it.
+		select {
+		case measured := <-resultCh:
+			return measured.lead, measured.err
+		default:
+		}
+		capture.Stop()
+		<-resultCh
+		return 0, probeCtx.Err()
+	}
 }
 
 func probeAutomaticHEVC(fps int) (bool, time.Duration) {
@@ -525,26 +634,11 @@ func probeAutomaticHEVC(fps int) (bool, time.Duration) {
 	}
 	defer capture.Stop()
 
-	ages := make([]time.Duration, 0, automaticHEVCProbeFrames-automaticHEVCProbeWarmupFrames)
-	for frame := 0; frame < automaticHEVCProbeFrames; frame++ {
-		unit, readErr := capture.ReadVideoAccessUnit()
-		if readErr != nil {
-			dbg("[CAPTURE] automatic HEVC pipeline probe read failed: %v", readErr)
-			return false, 0
-		}
-		if frame < automaticHEVCProbeWarmupFrames || unit.PTS.IsZero() {
-			continue
-		}
-		age := time.Since(unit.PTS)
-		if age < 0 || age > maximumAutomaticVideoLead {
-			dbg("[CAPTURE] automatic HEVC pipeline produced implausible source age %v", age)
-			return false, 0
-		}
-		ages = append(ages, age)
-	}
-	lead, ok := recommendedAutomaticVideoLatency(ages)
-	if !ok {
-		dbg("[CAPTURE] automatic HEVC pipeline cannot satisfy the bounded presentation lead")
+	lead, err := measureVideoCaptureLatency(ctx, capture, fps,
+		automaticHEVCProbeWarmupFrames,
+		automaticHEVCProbeFrames-automaticHEVCProbeWarmupFrames)
+	if err != nil {
+		dbg("[CAPTURE] automatic HEVC pipeline timing probe failed: %v", err)
 		return false, 0
 	}
 	return true, lead

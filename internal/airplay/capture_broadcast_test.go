@@ -3,6 +3,7 @@ package airplay
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -11,6 +12,42 @@ import (
 type sliceVideoAccessUnitReader struct {
 	frames []VideoAccessUnit
 	index  int
+}
+
+type channelVideoAccessUnitReader struct {
+	frames <-chan VideoAccessUnit
+}
+
+func waitForBroadcastSinkState(t *testing.T, sink *BroadcastSink, predicate func(*BroadcastSink) bool, description string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		sink.mu.Lock()
+		ready := predicate(sink)
+		sink.mu.Unlock()
+		if ready {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for broadcast sink state: %s", description)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForBlockedBroadcastProducer(t *testing.T, sink *BroadcastSink) {
+	t.Helper()
+	waitForBroadcastSinkState(t, sink, func(s *BroadcastSink) bool {
+		return s.blockedProducers > 0
+	}, "producer blocked on single-target handoff")
+}
+
+func (r *channelVideoAccessUnitReader) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	frame, ok := <-r.frames
+	if !ok {
+		return VideoAccessUnit{}, io.EOF
+	}
+	return frame, nil
 }
 
 func (r *sliceVideoAccessUnitReader) ReadVideoAccessUnit() (VideoAccessUnit, error) {
@@ -41,12 +78,17 @@ func TestBroadcastCapturePreservesTimestampedAccessUnits(t *testing.T) {
 	for i, want := range frames {
 		for sinkIndex, sink := range []*ScreenCapture{firstSink, secondSink} {
 			got, err := sink.ReadVideoAccessUnit()
-			if err != nil && !(err == io.EOF && i == len(frames)-1) {
+			if err != nil {
 				t.Fatalf("sink %d frame %d: %v", sinkIndex, i, err)
 			}
 			if !bytes.Equal(got.AnnexB, want.AnnexB) || got.PTS != want.PTS {
 				t.Fatalf("sink %d frame %d = {%x %v}, want {%x %v}", sinkIndex, i, got.AnnexB, got.PTS, want.AnnexB, want.PTS)
 			}
+		}
+	}
+	for sinkIndex, sink := range []*ScreenCapture{firstSink, secondSink} {
+		if frame, err := sink.ReadVideoAccessUnit(); len(frame.AnnexB) != 0 || !errors.Is(err, io.EOF) {
+			t.Fatalf("sink %d read after final frame = (%x, %v), want empty EOF", sinkIndex, frame.AnnexB, err)
 		}
 	}
 	select {
@@ -56,6 +98,366 @@ func TestBroadcastCapturePreservesTimestampedAccessUnits(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timestamped broadcast did not finish after both sinks drained")
+	}
+}
+
+func TestBroadcastSinkBackpressuresWithOnePendingAccessUnit(t *testing.T) {
+	sink := newBroadcastSinkWithPolicy(nil, true)
+	base := time.Now()
+	first := VideoAccessUnit{AnnexB: []byte{1}, PTS: base}
+	second := VideoAccessUnit{AnnexB: []byte{2}, PTS: base.Add(time.Second / 30)}
+	if err := sink.enqueueFrame(first); err != nil {
+		t.Fatalf("enqueue first frame: %v", err)
+	}
+
+	enqueued := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		enqueued <- sink.enqueueFrame(second)
+	}()
+	<-started
+	waitForBlockedBroadcastProducer(t, sink)
+	got, err := sink.ReadVideoAccessUnit()
+	if err != nil || !bytes.Equal(got.AnnexB, first.AnnexB) {
+		t.Fatalf("read first frame = (%x, %v), want (%x, nil)", got.AnnexB, err, first.AnnexB)
+	}
+	select {
+	case err := <-enqueued:
+		if err != nil {
+			t.Fatalf("enqueue second frame after handoff: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dequeue did not release the backpressured producer")
+	}
+	got, err = sink.ReadVideoAccessUnit()
+	if err != nil || !bytes.Equal(got.AnnexB, second.AnnexB) {
+		t.Fatalf("read second frame = (%x, %v), want (%x, nil)", got.AnnexB, err, second.AnnexB)
+	}
+}
+
+func TestBroadcastSinkBackpressuresWithOnePendingByteChunk(t *testing.T) {
+	sink := newBroadcastSinkWithPolicy(nil, true)
+	first := []byte("first")
+	second := []byte("second")
+	if err := sink.enqueue(first); err != nil {
+		t.Fatalf("enqueue first chunk: %v", err)
+	}
+	enqueued := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		enqueued <- sink.enqueue(second)
+	}()
+	<-started
+	waitForBlockedBroadcastProducer(t, sink)
+	buf := make([]byte, len(first))
+	if n, err := io.ReadFull(sink, buf); err != nil || n != len(first) || !bytes.Equal(buf, first) {
+		t.Fatalf("read first chunk = (%q, %d, %v), want (%q, %d, nil)", buf, n, err, first, len(first))
+	}
+	select {
+	case err := <-enqueued:
+		if err != nil {
+			t.Fatalf("enqueue second chunk after handoff: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("byte dequeue did not release the backpressured producer")
+	}
+}
+
+func TestBroadcastSinkCloseUnblocksBackpressuredFrame(t *testing.T) {
+	sink := newBroadcastSinkWithPolicy(nil, true)
+	base := time.Now()
+	if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1}, PTS: base}); err != nil {
+		t.Fatalf("enqueue first frame: %v", err)
+	}
+	enqueued := make(chan error, 1)
+	go func() {
+		enqueued <- sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{2}, PTS: base.Add(time.Second / 30)})
+	}()
+	waitForBlockedBroadcastProducer(t, sink)
+	sink.Close()
+	select {
+	case err := <-enqueued:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("blocked enqueue after Close = %v, want closed pipe", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not release the backpressured producer")
+	}
+}
+
+func TestBroadcastSinkNonblockingFrameQueueUsesNominalDuration(t *testing.T) {
+	sink := newBroadcastSink(nil)
+	base := time.Now()
+	// A large or backward PTS gap can be caused by the upstream leaky queue; it
+	// must not turn one queued picture into an artificial duration overflow.
+	for i, offset := range []time.Duration{0, time.Second} {
+		frame := VideoAccessUnit{AnnexB: []byte{byte(i + 1)}, PTS: base.Add(offset)}
+		if err := sink.enqueueFrame(frame); err != nil {
+			t.Fatalf("enqueue frame %d at %v: %v", i, offset, err)
+		}
+	}
+	third := VideoAccessUnit{AnnexB: []byte{3}, PTS: base.Add(-time.Second)}
+	if err := sink.enqueueFrame(third); !errors.Is(err, errBroadcastSinkBacklog) {
+		t.Fatalf("enqueue third nominal 30fps frame = %v, want backlog error", err)
+	}
+}
+
+func TestBroadcastSinkNominalDurationUsesConfiguredFrameRate(t *testing.T) {
+	for _, test := range []struct {
+		fps             int
+		acceptedFrames  int
+		rejectedOrdinal int
+	}{
+		{fps: 20, acceptedFrames: 1, rejectedOrdinal: 2},
+		{fps: 60, acceptedFrames: 4, rejectedOrdinal: 5},
+	} {
+		t.Run(fmt.Sprintf("%dfps", test.fps), func(t *testing.T) {
+			broadcast := NewBroadcastCaptureWithFrameRate(nil, test.fps)
+			sink := broadcast.AddSink()
+			defer sink.Close()
+			for i := 0; i < test.acceptedFrames; i++ {
+				if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{byte(i + 1)}}); err != nil {
+					t.Fatalf("enqueue nominal frame %d: %v", i+1, err)
+				}
+			}
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{0xff}}); !errors.Is(err, errBroadcastSinkBacklog) {
+				t.Fatalf("enqueue nominal frame %d = %v, want backlog error", test.rejectedOrdinal, err)
+			}
+		})
+	}
+}
+
+func TestBackpressuredSinkRegistrationIsExclusive(t *testing.T) {
+	sharedBroadcast := NewBroadcastCapture(nil)
+	shared := sharedBroadcast.AddSink()
+	if sink, err := sharedBroadcast.AddBackpressuredSink(); sink != nil || !errors.Is(err, errBroadcastSinkMode) {
+		t.Fatalf("backpressured sink after shared sink = (%v, %v), want mode error", sink, err)
+	}
+	shared.Close()
+
+	exclusiveBroadcast := NewBroadcastCapture(nil)
+	exclusive, err := exclusiveBroadcast.AddBackpressuredSink()
+	if err != nil {
+		t.Fatalf("add first backpressured sink: %v", err)
+	}
+	defer exclusive.Close()
+	if sink, err := exclusiveBroadcast.AddBackpressuredSink(); sink != nil || !errors.Is(err, errBroadcastSinkMode) {
+		t.Fatalf("second backpressured sink = (%v, %v), want mode error", sink, err)
+	}
+	lateShared := exclusiveBroadcast.AddSink()
+	defer lateShared.Close()
+	if _, err := lateShared.ReadVideoAccessUnit(); !errors.Is(err, io.EOF) {
+		t.Fatalf("shared sink after exclusive reservation = %v, want EOF", err)
+	}
+}
+
+func TestBackpressuredTimestampedBroadcastHandoff(t *testing.T) {
+	frames := make(chan VideoAccessUnit)
+	capture := &ScreenCapture{
+		frames: &channelVideoAccessUnitReader{frames: frames},
+		waitCh: make(chan struct{}),
+	}
+	broadcast := NewBroadcastCaptureWithFrameRate(capture, 30)
+	sink, err := broadcast.AddBackpressuredSink()
+	if err != nil {
+		t.Fatalf("add backpressured sink: %v", err)
+	}
+	defer sink.Close()
+	runDone := make(chan error, 1)
+	go func() { runDone <- broadcast.Run() }()
+
+	base := time.Now()
+	first := VideoAccessUnit{AnnexB: []byte{1}, PTS: base}
+	second := VideoAccessUnit{AnnexB: []byte{2}, PTS: base.Add(time.Second / 30)}
+	frames <- first
+	waitForBroadcastSinkState(t, sink, func(s *BroadcastSink) bool {
+		return len(s.frameQueue) == 1
+	}, "first timestamped AU queued")
+	frames <- second
+	waitForBlockedBroadcastProducer(t, sink)
+
+	got, err := sink.ReadVideoAccessUnit()
+	if err != nil || !bytes.Equal(got.AnnexB, first.AnnexB) {
+		t.Fatalf("read first timestamped AU = (%x, %v), want (%x, nil)", got.AnnexB, err, first.AnnexB)
+	}
+	waitForBroadcastSinkState(t, sink, func(s *BroadcastSink) bool {
+		return len(s.frameQueue) == 1 && bytes.Equal(s.frameQueue[0].AnnexB, second.AnnexB)
+	}, "second timestamped AU handed off")
+	close(frames)
+	got, err = sink.ReadVideoAccessUnit()
+	if err != nil || !bytes.Equal(got.AnnexB, second.AnnexB) {
+		t.Fatalf("read second timestamped AU = (%x, %v), want (%x, nil)", got.AnnexB, err, second.AnnexB)
+	}
+	if _, err := sink.ReadVideoAccessUnit(); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after final timestamped AU = %v, want EOF", err)
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("timestamped broadcast run = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timestamped broadcast did not finish")
+	}
+}
+
+func TestBackpressuredByteBroadcastHandoff(t *testing.T) {
+	sourceReader, sourceWriter := io.Pipe()
+	capture := &ScreenCapture{stdout: sourceReader, waitCh: make(chan struct{})}
+	broadcast := NewBroadcastCapture(capture)
+	sink, err := broadcast.AddBackpressuredSink()
+	if err != nil {
+		t.Fatalf("add backpressured sink: %v", err)
+	}
+	defer sink.Close()
+	runDone := make(chan error, 1)
+	go func() { runDone <- broadcast.Run() }()
+
+	first := []byte("first")
+	second := []byte("second")
+	if _, err := sourceWriter.Write(first); err != nil {
+		t.Fatalf("write first source chunk: %v", err)
+	}
+	waitForBroadcastSinkState(t, sink, func(s *BroadcastSink) bool {
+		return len(s.queue) == 1
+	}, "first byte chunk queued")
+	secondWrite := make(chan error, 1)
+	go func() {
+		_, writeErr := sourceWriter.Write(second)
+		secondWrite <- writeErr
+	}()
+	waitForBlockedBroadcastProducer(t, sink)
+
+	buf := make([]byte, len(second))
+	if n, err := io.ReadFull(sink, buf[:len(first)]); err != nil || n != len(first) || !bytes.Equal(buf[:len(first)], first) {
+		t.Fatalf("read first byte chunk = (%q, %d, %v), want (%q, %d, nil)", buf[:len(first)], n, err, first, len(first))
+	}
+	select {
+	case err := <-secondWrite:
+		if err != nil {
+			t.Fatalf("write second source chunk: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second source write remained blocked after handoff")
+	}
+	if err := sourceWriter.Close(); err != nil {
+		t.Fatalf("close source writer: %v", err)
+	}
+	if n, err := io.ReadFull(sink, buf); err != nil || n != len(second) || !bytes.Equal(buf, second) {
+		t.Fatalf("read second byte chunk = (%q, %d, %v), want (%q, %d, nil)", buf, n, err, second, len(second))
+	}
+	if n, err := sink.Read(buf); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("read after final byte chunk = (%d, %v), want (0, EOF)", n, err)
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("byte broadcast run = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("byte broadcast did not finish")
+	}
+}
+
+func TestLoneSharedTimestampedSinkDoesNotBackpressureCapture(t *testing.T) {
+	base := time.Now()
+	frames := make([]VideoAccessUnit, 4)
+	for i := range frames {
+		frames[i] = VideoAccessUnit{
+			AnnexB: []byte{byte(i + 1)},
+			PTS:    base.Add(time.Duration(i) * time.Second / 30),
+		}
+	}
+	capture := &ScreenCapture{
+		frames: &sliceVideoAccessUnitReader{frames: frames},
+		waitCh: make(chan struct{}),
+	}
+	broadcast := NewBroadcastCapture(capture)
+	slow := broadcast.AddSink()
+	runDone := make(chan error, 1)
+	go func() { runDone <- broadcast.Run() }()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("shared broadcast run = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		// Avoid leaking the pump if a regression makes a shared sink wait like the
+		// direct single-target policy.
+		slow.Close()
+		<-runDone
+		t.Fatal("a lone shared sink backpressured the timestamped source")
+	}
+	if n, err := slow.ReadVideoAccessUnit(); len(n.AnnexB) != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("overflowed shared sink read = (%x, %v), want empty EOF", n.AnnexB, err)
+	}
+}
+
+func TestTimestampedSlowSinkDoesNotStallHealthyPeer(t *testing.T) {
+	frames := make(chan VideoAccessUnit)
+	capture := &ScreenCapture{
+		frames: &channelVideoAccessUnitReader{frames: frames},
+		waitCh: make(chan struct{}),
+	}
+	broadcast := NewBroadcastCapture(capture)
+	slow := broadcast.AddSink()
+	healthy := broadcast.AddSink()
+	runDone := make(chan error, 1)
+	go func() { runDone <- broadcast.Run() }()
+
+	healthyFrames := make(chan VideoAccessUnit, 8)
+	healthyDone := make(chan error, 1)
+	go func() {
+		for {
+			frame, err := healthy.ReadVideoAccessUnit()
+			if len(frame.AnnexB) > 0 {
+				healthyFrames <- frame
+			}
+			if err != nil {
+				healthyDone <- err
+				return
+			}
+		}
+	}()
+
+	base := time.Now()
+	for i := 0; i < 6; i++ {
+		want := VideoAccessUnit{
+			AnnexB: []byte{byte(i + 1)},
+			PTS:    base.Add(time.Duration(i) * time.Second / 30),
+		}
+		frames <- want
+		select {
+		case got := <-healthyFrames:
+			if !bytes.Equal(got.AnnexB, want.AnnexB) || !got.PTS.Equal(want.PTS) {
+				t.Fatalf("healthy frame %d = {%x %v}, want {%x %v}", i, got.AnnexB, got.PTS, want.AnnexB, want.PTS)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("healthy sink stalled at frame %d", i)
+		}
+	}
+	close(frames)
+	select {
+	case err := <-healthyDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("healthy sink ended with %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("healthy sink did not finish")
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("broadcast run = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("broadcast did not finish")
+	}
+	if n, err := slow.ReadVideoAccessUnit(); len(n.AnnexB) != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("overflowed slow sink read = (%x, %v), want empty EOF", n.AnnexB, err)
 	}
 }
 

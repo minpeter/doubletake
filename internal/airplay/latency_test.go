@@ -48,6 +48,9 @@ func TestTargetLatencyOverrideAppliesJointLead(t *testing.T) {
 	if got := TargetLatency(); got != 120*time.Millisecond {
 		t.Fatalf("TargetLatency = %v, want 120ms", got)
 	}
+	if !HasExplicitTargetLatency() {
+		t.Fatal("explicit target latency was not reported")
+	}
 	if got, want := targetLatencySamples44k1(), samplesFor44k1(120*time.Millisecond); got != want {
 		t.Fatalf("audio latency = %d samples, want %d", got, want)
 	}
@@ -55,6 +58,9 @@ func TestTargetLatencyOverrideAppliesJointLead(t *testing.T) {
 
 func TestTargetLatencyAutomaticAndClamp(t *testing.T) {
 	SetTargetLatency(0)
+	if HasExplicitTargetLatency() {
+		t.Fatal("automatic latency policy was reported as explicit")
+	}
 	t.Cleanup(func() {
 		SetTargetLatency(0)
 	})

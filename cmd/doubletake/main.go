@@ -377,29 +377,41 @@ func main() {
 	var broadcastDone chan error
 	startedWidth, startedHeight := -1, -1
 	startedCodec := airplay.VideoCodec("")
-	prepareVideo := func(width, height int, codec airplay.VideoCodec) error {
+	var liveVideoLead time.Duration
+	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
 		if capture != nil {
 			if codec == startedCodec {
 				if width != startedWidth || height != startedHeight {
 					log.Printf("receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session", codec, width, height, startedWidth, startedHeight)
 				}
-				return nil
+				return airplay.VideoPreparationResult{MinimumVideoLead: liveVideoLead}, nil
 			}
-			return fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup", startedCodec, startedWidth, startedHeight, codec, width, height)
+			return airplay.VideoPreparationResult{}, fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup", startedCodec, startedWidth, startedHeight, codec, width, height)
 		}
-		capture, err = capturePreparation.StartWithCodec(width, height, codec)
-		if err != nil {
-			return err
+		startedCapture, startErr := capturePreparation.StartWithCodec(width, height, codec)
+		if startErr != nil {
+			return airplay.VideoPreparationResult{}, startErr
 		}
+		if codec == airplay.VideoCodecHEVC && !airplay.HasExplicitTargetLatency() {
+			liveVideoLead, startErr = airplay.MeasureVideoCaptureLatency(ctx, startedCapture, *fps)
+			if startErr != nil {
+				startedCapture.Stop()
+				return airplay.VideoPreparationResult{}, fmt.Errorf("measure production HEVC timing: %w", startErr)
+			}
+			log.Printf("[CAPTURE] production HEVC timing requires at least %v video lead", liveVideoLead)
+		}
+		activeBroadcast := airplay.NewBroadcastCaptureWithFrameRate(startedCapture, *fps)
+		done := make(chan error, 1)
+		capture = startedCapture
+		broadcast = activeBroadcast
+		broadcastDone = done
 		startedWidth, startedHeight = width, height
 		startedCodec = codec
-		broadcast = airplay.NewBroadcastCapture(capture)
-		broadcastDone = make(chan error, 1)
-		go func(active *airplay.BroadcastCapture, done chan<- error) {
-			done <- active.Run()
-		}(broadcast, broadcastDone)
+		go func(active *airplay.BroadcastCapture, result chan<- error) {
+			result <- active.Run()
+		}(activeBroadcast, done)
 		log.Printf("screen capture started at %dx%d using %s", width, height, codec)
-		return nil
+		return airplay.VideoPreparationResult{MinimumVideoLead: liveVideoLead}, nil
 	}
 	defer func() {
 		capturePreparation.Close()
@@ -409,7 +421,7 @@ func main() {
 		}
 	}()
 
-	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
+	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
 	if errors.Is(err, airplay.ErrCredentialsRequired) {
 		// Some legacy receivers do not advertise their configured password in
 		// /info. They reveal it only by challenging the first media SETUP. Keep
@@ -426,7 +438,7 @@ func main() {
 			// the already safe concrete codec for the remainder of this session.
 			streamCfg.VideoCodec = startedCodec
 		}
-		session, err = client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
+		session, err = client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
 	}
 	if err != nil {
 		log.Fatalf("mirror setup failed: %v", err)
@@ -461,7 +473,10 @@ func main() {
 		log.Println("audio disabled (receiver did not provide audio ports)")
 	}
 
-	videoSink := broadcast.AddSink()
+	videoSink, err := broadcast.AddBackpressuredSink()
+	if err != nil {
+		log.Fatalf("attach single-target video capture: %v", err)
+	}
 	defer videoSink.Close()
 	if err := session.StreamFrames(ctx, videoSink.AsCapture(), 0*time.Second); err != nil && ctx.Err() == nil {
 		log.Fatalf("streaming error: %v", err)

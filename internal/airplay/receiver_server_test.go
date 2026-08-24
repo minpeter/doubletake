@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -435,6 +436,64 @@ func TestSetupMirrorAutomaticallySelectsHEVCFromSessionDisplayInfo(t *testing.T)
 	}
 }
 
+func TestLiveHEVCCaptureLeadIsCommittedBeforeMediaSetup(t *testing.T) {
+	tests := []struct {
+		name          string
+		preflight     time.Duration
+		live          time.Duration
+		override      time.Duration
+		wantVideoLead time.Duration
+		wantAudioLead time.Duration
+	}{
+		{
+			name: "live measurement raises preflight", preflight: 150 * time.Millisecond, live: 175 * time.Millisecond,
+			wantVideoLead: 175 * time.Millisecond, wantAudioLead: 185 * time.Millisecond,
+		},
+		{
+			name: "live measurement cannot lower preflight", preflight: 150 * time.Millisecond, live: 120 * time.Millisecond,
+			wantVideoLead: 150 * time.Millisecond, wantAudioLead: 160 * time.Millisecond,
+		},
+		{
+			name: "explicit joint target wins", preflight: 150 * time.Millisecond, live: 200 * time.Millisecond, override: 100 * time.Millisecond,
+			wantVideoLead: 100 * time.Millisecond, wantAudioLead: 100 * time.Millisecond,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			SetTargetLatency(test.override)
+			t.Cleanup(func() { SetTargetLatency(0) })
+			_, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{Profile: ReceiverProfileModern})
+			if err := client.Pair(ctx, ""); err != nil {
+				t.Fatalf("pair: %v", err)
+			}
+			if err := client.FairPlaySetup(ctx); err != nil {
+				t.Fatalf("FairPlay setup: %v", err)
+			}
+			session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
+				VideoCodec:             VideoCodecAuto,
+				AutomaticHEVCAvailable: true,
+				MeasuredVideoLatency:   test.preflight,
+			}, func(_, _ int, codec VideoCodec) (VideoPreparationResult, error) {
+				if codec != VideoCodecHEVC {
+					return VideoPreparationResult{}, fmt.Errorf("selected codec = %s, want HEVC", codec)
+				}
+				return VideoPreparationResult{MinimumVideoLead: test.live}, nil
+			})
+			if err != nil {
+				t.Fatalf("setup mirror: %v", err)
+			}
+			defer session.Close()
+			if session.timestampBias != test.wantVideoLead {
+				t.Fatalf("video lead = %v, want %v", session.timestampBias, test.wantVideoLead)
+			}
+			wantSamples := samplesFor44k1(test.wantAudioLead)
+			if session.audioStream == nil || session.audioStream.latencySamples != wantSamples {
+				t.Fatalf("audio lead = %#v, want %d samples", session.audioStream, wantSamples)
+			}
+		})
+	}
+}
+
 func TestMeasuredHEVCLatencyIsScopedAndExplicitOverrideWins(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -517,6 +576,61 @@ func TestMediaFirstAutoFallsBackBeforeCreatingLatencyMismatch(t *testing.T) {
 	}
 	if session.audioStream == nil || session.audioStream.latencySamples != samplesFor44k1(defaultAudioLatencyNormal) {
 		t.Fatalf("media-first audio lead = %#v, want %d samples", session.audioStream, samplesFor44k1(defaultAudioLatencyNormal))
+	}
+}
+
+func TestMediaFirstCalibratedAutoFallsBackBeforeLiveMeasurement(t *testing.T) {
+	SetTargetLatency(0)
+	t.Cleanup(func() { SetTargetLatency(0) })
+	_, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{
+		Profile: ReceiverProfileRoku, DisplayWidth: 3840, DisplayHeight: 2160,
+	})
+	if err := client.Pair(ctx, ""); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	var preparedCodec VideoCodec
+	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
+		VideoCodec:             VideoCodecAuto,
+		AutomaticHEVCAvailable: true,
+	}, func(_, _ int, codec VideoCodec) (VideoPreparationResult, error) {
+		preparedCodec = codec
+		if codec == VideoCodecHEVC {
+			return VideoPreparationResult{MinimumVideoLead: 175 * time.Millisecond}, nil
+		}
+		return VideoPreparationResult{}, nil
+	})
+	if err != nil {
+		t.Fatalf("setup mirror: %v", err)
+	}
+	defer session.Close()
+	if preparedCodec != VideoCodecH264 || session.videoCodec != VideoCodecH264 {
+		t.Fatalf("media-first calibrated codec = prepared %s/session %s, want H.264", preparedCodec, session.videoCodec)
+	}
+	if session.timestampBias != defaultVideoLatencyNormal || session.audioStream == nil ||
+		session.audioStream.latencySamples != samplesFor44k1(defaultAudioLatencyNormal) {
+		t.Fatalf("media-first calibrated leads = video %v audio %#v, want nominal coherent policy", session.timestampBias, session.audioStream)
+	}
+}
+
+func TestMediaFirstForcedHEVCRejectsLateLiveLead(t *testing.T) {
+	SetTargetLatency(0)
+	t.Cleanup(func() { SetTargetLatency(0) })
+	_, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{
+		Profile: ReceiverProfileRoku, DisplayWidth: 3840, DisplayHeight: 2160,
+	})
+	if err := client.Pair(ctx, ""); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	_, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
+		VideoCodec: VideoCodecHEVC,
+	}, func(_, _ int, codec VideoCodec) (VideoPreparationResult, error) {
+		if codec != VideoCodecHEVC {
+			return VideoPreparationResult{}, fmt.Errorf("prepared codec = %s, want HEVC", codec)
+		}
+		return VideoPreparationResult{MinimumVideoLead: 175 * time.Millisecond}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "media-first audio SETUP already committed") {
+		t.Fatalf("forced media-first HEVC setup = %v, want coherent late-lead rejection", err)
 	}
 }
 

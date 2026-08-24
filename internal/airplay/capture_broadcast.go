@@ -25,6 +25,7 @@ const (
 )
 
 var errBroadcastSinkBacklog = errors.New("broadcast sink backlog limit exceeded")
+var errBroadcastSinkMode = errors.New("backpressured broadcast sink requires an otherwise unused capture")
 
 // BroadcastCapture reads from a single ScreenCapture and fans the raw byte
 // stream out to multiple registered sinks. Each sink has an independent,
@@ -39,12 +40,17 @@ var errBroadcastSinkBacklog = errors.New("broadcast sink backlog limit exceeded"
 //	go session1.StreamFrames(ctx, sink1.AsCapture(), 0)
 //	go session2.StreamFrames(ctx, sink2.AsCapture(), 0)
 type BroadcastCapture struct {
-	src     *ScreenCapture
-	frames  bool
-	mu      sync.Mutex
-	done    chan struct{}
-	err     error // set before done is closed
-	stopped bool
+	src    *ScreenCapture
+	frames bool
+	// frameDuration is the configured source cadence, not the difference between
+	// adjacent PTS values. A leaky upstream queue can legitimately create large
+	// PTS gaps while only one encoded picture is pending.
+	frameDuration time.Duration
+	mu            sync.Mutex
+	done          chan struct{}
+	err           error // set before done is closed
+	stopped       bool
+	exclusive     bool // one backpressured sink owns this capture for its lifetime
 	// sequence is reserved before each source Read. A late sink starts at the
 	// following sequence, which gives attachment an exact cutover even when a
 	// source read has completed but has not yet been fanned out.
@@ -68,9 +74,20 @@ type BroadcastSink struct {
 	frameQueue  []VideoAccessUnit
 	headOffset  int
 	queuedBytes int
+	// queuedFrameDuration is a nominal sample-duration sum. It deliberately does
+	// not use the PTS span: source-frame dropping makes that span discontinuous.
+	queuedFrameDuration time.Duration
+	frameDuration       time.Duration
 
 	maxQueuedBytes  int
 	maxQueuedChunks int
+	// Apple's ordinary virtual-display source bounds its upstream frame queue to
+	// 67 ms and drops an incoming source frame at that limit. Doubletake derives
+	// a downstream encoded-relay ceiling from that value and counts configured
+	// sample durations. The byte and chunk limits remain independent safeguards.
+	maxFrameQueueDuration time.Duration
+	backpressure          bool
+	blockedProducers      int // number waiting for queue handoff; guarded by mu
 
 	inputClosed   bool // the source ended; drain queue, then return EOF
 	closed        bool // explicitly removed; discard queue and return EOF
@@ -79,34 +96,59 @@ type BroadcastSink struct {
 	startSequence uint64
 }
 
-func newBroadcastSink(owner *BroadcastCapture) *BroadcastSink {
+func newBroadcastSinkWithPolicy(owner *BroadcastCapture, backpressure bool) *BroadcastSink {
+	frameDuration := time.Second / 30
+	if owner != nil && owner.frameDuration > 0 {
+		frameDuration = owner.frameDuration
+	}
 	s := &BroadcastSink{
-		owner:           owner,
-		maxQueuedBytes:  broadcastSinkQueueBytes,
-		maxQueuedChunks: broadcastSinkQueueChunks,
-		done:            make(chan struct{}),
+		owner:                 owner,
+		maxQueuedBytes:        broadcastSinkQueueBytes,
+		maxQueuedChunks:       broadcastSinkQueueChunks,
+		maxFrameQueueDuration: ordinaryScreenFrameQueueDuration,
+		backpressure:          backpressure,
+		frameDuration:         frameDuration,
+		done:                  make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	return s
+}
+
+func newBroadcastSink(owner *BroadcastCapture) *BroadcastSink {
+	return newBroadcastSinkWithPolicy(owner, false)
 }
 
 // NewBroadcastCapture wraps src. Sinks may be added before or while Run is
 // active; running without sinks simply drains the encoder until a session is
 // ready to consume frames.
 func NewBroadcastCapture(src *ScreenCapture) *BroadcastCapture {
+	return NewBroadcastCaptureWithFrameRate(src, 30)
+}
+
+// NewBroadcastCaptureWithFrameRate wraps src and supplies the nominal sample
+// duration used to bound asynchronous fan-out queues. PTS remains the media
+// timestamp; frame rate is used only for queue-duration accounting.
+func NewBroadcastCaptureWithFrameRate(src *ScreenCapture, fps int) *BroadcastCapture {
+	if fps <= 0 {
+		fps = 30
+	}
 	return &BroadcastCapture{
-		src:          src,
-		frames:       src != nil && src.frames != nil,
-		done:         make(chan struct{}),
-		drainTimeout: broadcastSinkDrainTimeout,
+		src:           src,
+		frames:        src != nil && src.frames != nil,
+		frameDuration: time.Second / time.Duration(fps),
+		done:          make(chan struct{}),
+		drainTimeout:  broadcastSinkDrainTimeout,
 	}
 }
 
-// AddSink registers a new fan-out reader before or while Run is active.
+// AddSink registers a shared fan-out reader before or while Run is active. A
+// capture reserved by AddBackpressuredSink rejects later shared readers by
+// returning an already-finished sink, preserving the no-cross-target-stall
+// invariant even if a caller accidentally mixes the two modes.
 func (bc *BroadcastCapture) AddSink() *BroadcastSink {
-	s := newBroadcastSink(bc)
+	s := newBroadcastSinkWithPolicy(bc, false)
 	bc.mu.Lock()
-	if bc.stopped {
+	if bc.stopped || bc.exclusive {
 		bc.mu.Unlock()
 		s.finish()
 		return s
@@ -115,6 +157,31 @@ func (bc *BroadcastCapture) AddSink() *BroadcastSink {
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s
+}
+
+// AddBackpressuredSink registers a sink for a single-destination caller. It
+// permits only one pending chunk or access unit, propagating a stalled network
+// writer back into the capture pipeline's leaky raw-frame queue. Shared daemon
+// fan-out must use AddSink so one receiver can never block another. Registration
+// fails if any sink has already claimed the capture.
+func (bc *BroadcastCapture) AddBackpressuredSink() (*BroadcastSink, error) {
+	s := newBroadcastSinkWithPolicy(bc, true)
+	bc.mu.Lock()
+	if bc.stopped {
+		bc.mu.Unlock()
+		s.finish()
+		return s, nil
+	}
+	if bc.exclusive || len(bc.sinks) != 0 {
+		bc.mu.Unlock()
+		s.abort()
+		return nil, errBroadcastSinkMode
+	}
+	bc.exclusive = true
+	s.startSequence = bc.sequence + 1
+	bc.sinks = append(bc.sinks, s)
+	bc.mu.Unlock()
+	return s, nil
 }
 
 // RemoveSink closes and removes a sink so it no longer receives data. Any
@@ -276,8 +343,9 @@ func (bc *BroadcastCapture) Source() *ScreenCapture {
 
 // --- BroadcastSink ---
 
-// enqueue appends immutable capture data without waiting for the receiver. A
-// full queue is an error so BroadcastCapture can detach only that receiver.
+// enqueue appends immutable capture data. Shared sinks never wait for the
+// receiver and are detached on overflow; an explicitly backpressured sink waits
+// for its one pending chunk to be consumed.
 func (s *BroadcastSink) enqueue(p []byte) error {
 	if len(p) == 0 {
 		return nil
@@ -285,11 +353,20 @@ func (s *BroadcastSink) enqueue(p []byte) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.inputClosed {
-		return io.ErrClosedPipe
-	}
-	if len(s.queue) >= s.maxQueuedChunks || len(p) > s.maxQueuedBytes-s.queuedBytes {
-		return errBroadcastSinkBacklog
+	for {
+		if s.closed || s.inputClosed {
+			return io.ErrClosedPipe
+		}
+		if s.backpressure && len(s.queue) > 0 {
+			s.blockedProducers++
+			s.cond.Wait()
+			s.blockedProducers--
+			continue
+		}
+		if len(s.queue) >= s.maxQueuedChunks || len(p) > s.maxQueuedBytes-s.queuedBytes {
+			return errBroadcastSinkBacklog
+		}
+		break
 	}
 	s.queue = append(s.queue, p)
 	s.queuedBytes += len(p)
@@ -297,8 +374,21 @@ func (s *BroadcastSink) enqueue(p []byte) error {
 	return nil
 }
 
+func (s *BroadcastSink) frameQueueExceedsLimitsLocked(frame VideoAccessUnit) bool {
+	if len(s.frameQueue) >= s.maxQueuedChunks || len(frame.AnnexB) > s.maxQueuedBytes-s.queuedBytes {
+		return true
+	}
+	return len(s.frameQueue) > 0 && s.maxFrameQueueDuration > 0 &&
+		s.queuedFrameDuration+s.frameDuration > s.maxFrameQueueDuration
+}
+
 // enqueueFrame appends an immutable complete access unit without copying it.
 // The same backing bytes can safely be referenced by every receiver queue.
+// An explicitly single-destination sink waits once one AU is pending, rather
+// than accumulating encoded references which cannot safely be dropped. Shared
+// fan-out is nonblocking and detaches only the sink which exceeds Doubletake's
+// nominal-duration relay budget. This policy is distinct from Apple's upstream
+// source-frame dropping behavior.
 func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 	if len(frame.AnnexB) == 0 {
 		return nil
@@ -306,14 +396,27 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.inputClosed {
-		return io.ErrClosedPipe
-	}
-	if len(s.frameQueue) >= s.maxQueuedChunks || len(frame.AnnexB) > s.maxQueuedBytes-s.queuedBytes {
-		return errBroadcastSinkBacklog
+	for {
+		if s.closed || s.inputClosed {
+			return io.ErrClosedPipe
+		}
+		if len(s.frameQueue) == 0 && len(frame.AnnexB) > s.maxQueuedBytes {
+			return errBroadcastSinkBacklog
+		}
+		if s.backpressure && len(s.frameQueue) > 0 {
+			s.blockedProducers++
+			s.cond.Wait()
+			s.blockedProducers--
+			continue
+		}
+		if s.frameQueueExceedsLimitsLocked(frame) {
+			return errBroadcastSinkBacklog
+		}
+		break
 	}
 	s.frameQueue = append(s.frameQueue, frame)
 	s.queuedBytes += len(frame.AnnexB)
+	s.queuedFrameDuration += s.frameDuration
 	s.cond.Signal()
 	return nil
 }
@@ -351,6 +454,7 @@ func (s *BroadcastSink) abort() {
 		s.frameQueue = nil
 		s.headOffset = 0
 		s.queuedBytes = 0
+		s.queuedFrameDuration = 0
 		s.closeDoneLocked()
 		s.cond.Broadcast()
 	}
@@ -392,11 +496,12 @@ func (s *BroadcastSink) Read(p []byte) (int, error) {
 		s.queue[0] = nil
 		s.queue = s.queue[1:]
 		s.headOffset = 0
+		s.cond.Broadcast()
 		if len(s.queue) == 0 {
 			s.queue = nil
 			if s.inputClosed {
 				s.closeDoneLocked()
-				return n, io.EOF
+				return n, nil
 			}
 		}
 	}
@@ -423,11 +528,18 @@ func (s *BroadcastSink) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 	s.frameQueue[0].AnnexB = nil
 	s.frameQueue = s.frameQueue[1:]
 	s.queuedBytes -= len(frame.AnnexB)
+	s.queuedFrameDuration -= s.frameDuration
+	if s.queuedFrameDuration < 0 {
+		s.queuedFrameDuration = 0
+	}
+	// Wake a single-destination producer waiting to hand off the next complete
+	// AU. Broadcast is intentional because Close/finish share this condition.
+	s.cond.Broadcast()
 	if len(s.frameQueue) == 0 {
 		s.frameQueue = nil
 		if s.inputClosed && len(s.queue) == 0 {
 			s.closeDoneLocked()
-			return frame, io.EOF
+			return frame, nil
 		}
 	}
 	return frame, nil

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -467,5 +468,231 @@ func TestAudioChaChaAADUsesRTPNetworkOrder(t *testing.T) {
 	want := []byte{0x12, 0x34, 0x56, 0x78, 0x11, 0x22, 0x33, 0x44}
 	if !bytes.Equal(aad, want) {
 		t.Fatalf("AAD = %x, want %x", aad, want)
+	}
+}
+
+func TestParseAudioRetransmitRequest(t *testing.T) {
+	packet := []byte{0x80, 0xd5, 0x12, 0x34, 0xff, 0xfe, 0x00, 0x02}
+	request, ok := parseAudioRetransmitRequest(packet)
+	if !ok {
+		t.Fatal("valid audio retransmit request was rejected")
+	}
+	if request.requestSeq != 0x1234 || request.firstSeq != 0xfffe || request.count != 2 {
+		t.Fatalf("request = %#v, want id 0x1234, first 0xfffe, count 2", request)
+	}
+
+	for _, test := range []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "short", packet: packet[:7]},
+		{name: "long", packet: append(append([]byte(nil), packet...), 0)},
+		{name: "wrong version", packet: []byte{0x40, 0xd5, 0, 1, 0, 2, 0, 1}},
+		{name: "wrong payload type", packet: []byte{0x80, 0xd4, 0, 1, 0, 2, 0, 1}},
+		{name: "zero count", packet: []byte{0x80, 0xd5, 0, 1, 0, 2, 0, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, ok := parseAudioRetransmitRequest(test.packet); ok {
+				t.Fatalf("malformed request %x was accepted", test.packet)
+			}
+		})
+	}
+}
+
+func TestAudioRetransmitReturnsExactChaChaDatagramOnControlSocket(t *testing.T) {
+	aead, err := newAudioChaCha64AEAD(bytes.Repeat([]byte{0x5a}, chacha20poly1305.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataConn := &recordingPacketConn{}
+	ctrlConn := &recordingPacketConn{}
+	stream := &AudioStream{
+		conn:            dataConn,
+		ctrlConn:        ctrlConn,
+		remoteAddr:      &netUDPAddrForAudioTest,
+		chachaCipher:    aead,
+		chachaNonceMode: audioChaChaNonceCounter,
+		chachaAADMode:   audioChaChaAADTimestampSSRC,
+	}
+	const (
+		sequence = uint16(0xfffe)
+		rtpTime  = uint32(0x12345678)
+	)
+	if err := stream.sendAudioPacketWithSeq([]byte("recover this encrypted audio frame"), rtpTime, sequence); err != nil {
+		t.Fatal(err)
+	}
+	if len(dataConn.packets) != 1 {
+		t.Fatalf("sent %d original packets, want 1", len(dataConn.packets))
+	}
+	original := append([]byte(nil), dataConn.packets[0]...)
+
+	request := []byte{0x80, 0xd5, 0x00, 0x2a, 0xff, 0xfe, 0x00, 0x01}
+	requester := &net.UDPAddr{IP: net.ParseIP("192.0.2.25"), Port: 7001}
+	handled, resent, err := stream.handleAudioControlPacket(request, requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled || resent != 1 {
+		t.Fatalf("handled=%t resent=%d, want true, 1", handled, resent)
+	}
+	if len(ctrlConn.packets) != 1 {
+		t.Fatalf("sent %d control responses, want 1", len(ctrlConn.packets))
+	}
+	want := append([]byte{0x80, 0xd6, 0x00, 0x2a}, original...)
+	if !bytes.Equal(ctrlConn.packets[0], want) {
+		t.Fatalf("retransmit response = %x, want exact wrapped datagram %x", ctrlConn.packets[0], want)
+	}
+	if ctrlConn.addrs[0] != requester {
+		t.Fatalf("retransmit destination = %v, want request source %v", ctrlConn.addrs[0], requester)
+	}
+	if !bytes.Equal(dataConn.packets[0], original) {
+		t.Fatal("serving the retransmit mutated the original encrypted datagram")
+	}
+}
+
+func TestAudioRetransmitUsesFutileResponseForExpiredPacket(t *testing.T) {
+	ctrlConn := &recordingPacketConn{}
+	stream := &AudioStream{ctrlConn: ctrlConn}
+	request := []byte{0x80, 0xd5, 0x00, 0x07, 0x45, 0x67, 0x00, 0x03}
+	handled, resent, err := stream.handleAudioControlPacket(request, &netUDPAddrForAudioTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled || resent != 0 {
+		t.Fatalf("handled=%t resent=%d, want true, 0", handled, resent)
+	}
+	want := []byte{0x80, 0xd6, 0x00, 0x07, 0x45, 0x67, 0x00, 0x00}
+	if len(ctrlConn.packets) != 1 || !bytes.Equal(ctrlConn.packets[0], want) {
+		t.Fatalf("futile response = %x, want %x", ctrlConn.packets, want)
+	}
+}
+
+func TestAudioRetransmitRangeWrapsAndStopsAtFirstExpiredPacket(t *testing.T) {
+	ctrlConn := &recordingPacketConn{}
+	stream := &AudioStream{ctrlConn: ctrlConn}
+	stream.rememberAudioPacket(0xffff, []byte{0x80, 0x60, 0xff, 0xff, 0xaa})
+	request := []byte{0x80, 0xd5, 0x00, 0x01, 0xff, 0xff, 0x00, 0x02}
+	handled, resent, err := stream.handleAudioControlPacket(request, &netUDPAddrForAudioTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled || resent != 1 {
+		t.Fatalf("handled=%t resent=%d, want true, 1", handled, resent)
+	}
+	wantPackets := [][]byte{
+		{0x80, 0xd6, 0x00, 0x01, 0x80, 0x60, 0xff, 0xff, 0xaa},
+		{0x80, 0xd6, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+	}
+	if len(ctrlConn.packets) != len(wantPackets) {
+		t.Fatalf("sent %d responses, want %d", len(ctrlConn.packets), len(wantPackets))
+	}
+	for index, want := range wantPackets {
+		if !bytes.Equal(ctrlConn.packets[index], want) {
+			t.Fatalf("response %d = %x, want %x", index, ctrlConn.packets[index], want)
+		}
+	}
+}
+
+func TestAudioRetransmitHistoryIsBoundedAndSequenceAware(t *testing.T) {
+	stream := &AudioStream{}
+	const oldSequence = uint16(17)
+	newSequence := oldSequence + audioRetransmitHistoryPackets
+	stream.rememberAudioPacket(oldSequence, []byte("old"))
+	stream.rememberAudioPacket(newSequence, []byte("new"))
+
+	if packet := stream.audioPacketForRetransmit(oldSequence); packet != nil {
+		t.Fatalf("evicted sequence returned %q", packet)
+	}
+	if packet := stream.audioPacketForRetransmit(newSequence); !bytes.Equal(packet, []byte("new")) {
+		t.Fatalf("new sequence returned %q, want new", packet)
+	}
+}
+
+func TestAudioRetransmitHistoryConcurrentReplacement(t *testing.T) {
+	stream := &AudioStream{}
+	const firstSequence = uint16(29)
+	secondSequence := firstSequence + audioRetransmitHistoryPackets
+	sequences := [...]uint16{firstSequence, secondSequence}
+	start := make(chan struct{})
+	errCh := make(chan string, 1)
+	report := func(message string) {
+		select {
+		case errCh <- message:
+		default:
+		}
+	}
+
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		<-start
+		for index := 0; index < 2000; index++ {
+			seq := sequences[index%len(sequences)]
+			packet := make([]byte, 2)
+			binary.BigEndian.PutUint16(packet, seq)
+			stream.rememberAudioPacket(seq, packet)
+		}
+	}()
+	for reader := 0; reader < 4; reader++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			for index := 0; index < 2000; index++ {
+				seq := sequences[index%len(sequences)]
+				packet := stream.audioPacketForRetransmit(seq)
+				if packet != nil && (len(packet) != 2 || binary.BigEndian.Uint16(packet) != seq) {
+					report(fmt.Sprintf("sequence %d returned mismatched packet %x", seq, packet))
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	select {
+	case message := <-errCh:
+		t.Fatal(message)
+	default:
+	}
+}
+
+func TestAudioControlPeerUsesNegotiatedReceiverIP(t *testing.T) {
+	stream := &AudioStream{ctrlAddr: &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 7000}}
+	if !stream.audioControlPacketFromReceiver(&net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 9000}) {
+		t.Fatal("matching receiver IP was rejected because its source port differed")
+	}
+	if stream.audioControlPacketFromReceiver(&net.UDPAddr{IP: net.ParseIP("192.0.2.11"), Port: 7000}) {
+		t.Fatal("unexpected control peer IP was accepted")
+	}
+}
+
+func TestAudioSendBurstLimiterOnlyDelaysCatchupBurst(t *testing.T) {
+	base := time.Unix(1787616000, 0)
+	var limiter audioSendBurstLimiter
+	for packet := 0; packet < maximumAudioPacketsPerBurst; packet++ {
+		if delay := limiter.reserveDelay(base); delay != 0 {
+			t.Fatalf("packet %d delay = %v, want 0", packet+1, delay)
+		}
+	}
+	if delay := limiter.reserveDelay(base); delay != audioSendBurstWindow {
+		t.Fatalf("first excess packet delay = %v, want %v", delay, audioSendBurstWindow)
+	}
+	if delay := limiter.reserveDelay(base.Add(2 * time.Millisecond)); delay != 3*time.Millisecond {
+		t.Fatalf("partway through window delay = %v, want 3ms", delay)
+	}
+	if delay := limiter.reserveDelay(base.Add(audioSendBurstWindow)); delay != 0 {
+		t.Fatalf("packet at next window delay = %v, want 0", delay)
+	}
+
+	// Ordinary codec frames arrive about 8ms (ALAC) or 11ms (AAC-ELD) apart,
+	// outside the limiter window, and must never accumulate artificial delay.
+	limiter = audioSendBurstLimiter{}
+	for frame := 0; frame < 100; frame++ {
+		now := base.Add(time.Duration(frame) * 8 * time.Millisecond)
+		if delay := limiter.reserveDelay(now); delay != 0 {
+			t.Fatalf("normally paced frame %d delay = %v, want 0", frame, delay)
+		}
 	}
 }

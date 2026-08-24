@@ -111,23 +111,116 @@ func TestAutomaticHEVCAvailabilityRequiresHardwareAndFullTimestampStack(t *testi
 }
 
 func TestRecommendedAutomaticVideoLatencyUsesP95AndDeliveryMargin(t *testing.T) {
-	if _, ok := recommendedAutomaticVideoLatency(nil); ok {
+	if _, ok := recommendedAutomaticVideoLatency(nil, 30); ok {
 		t.Fatal("empty latency sample set was accepted")
 	}
-	if got, ok := recommendedAutomaticVideoLatency([]time.Duration{20 * time.Millisecond}); !ok || got != defaultVideoLatencyNormal {
+	if got, ok := recommendedAutomaticVideoLatency([]time.Duration{5 * time.Millisecond}, 30); !ok || got != defaultVideoLatencyNormal {
 		t.Fatalf("fast pipeline recommendation = (%v, %t), want (%v, true)", got, ok, defaultVideoLatencyNormal)
 	}
 	ages := make([]time.Duration, 20)
 	for i := range ages {
 		ages[i] = time.Duration(80+i) * time.Millisecond
 	}
-	got, ok := recommendedAutomaticVideoLatency(ages)
-	// p95 is the nineteenth value (98 ms); reserve the 50 ms delivery margin.
-	if !ok || got != 148*time.Millisecond {
-		t.Fatalf("measured recommendation = (%v, %t), want (148ms, true)", got, ok)
+	got, ok := recommendedAutomaticVideoLatency(ages, 30)
+	// p95 is the nineteenth value (98 ms); reserve the 67 ms delivery-margin
+	// heuristic derived from Apple's upstream source-queue ceiling.
+	if !ok || got != 165*time.Millisecond {
+		t.Fatalf("measured recommendation = (%v, %t), want (165ms, true)", got, ok)
 	}
-	if _, ok := recommendedAutomaticVideoLatency([]time.Duration{460 * time.Millisecond}); ok {
+	if _, ok := recommendedAutomaticVideoLatency([]time.Duration{440 * time.Millisecond}, 30); ok {
 		t.Fatal("pipeline exceeding the bounded automatic lead was accepted")
+	}
+	if got := automaticVideoDeliveryMargin(20); got != 100*time.Millisecond {
+		t.Fatalf("20fps delivery margin = %v, want two frame periods", got)
+	}
+	if got := automaticVideoDeliveryMargin(60); got != ordinaryScreenFrameQueueDuration {
+		t.Fatalf("60fps delivery margin = %v, want ordinary 67ms floor", got)
+	}
+}
+
+func TestLiveVideoProbeTimeoutTracksConfiguredFrameRate(t *testing.T) {
+	if got := liveVideoProbeTimeout(30); got != minimumLiveVideoProbeTimeout {
+		t.Fatalf("30fps live probe timeout = %v, want %v", got, minimumLiveVideoProbeTimeout)
+	}
+	if got := liveVideoProbeTimeout(5); got != 7*time.Second {
+		t.Fatalf("5fps live probe timeout = %v, want 7s", got)
+	}
+	if got := liveVideoProbeTimeout(0); got != minimumLiveVideoProbeTimeout {
+		t.Fatalf("default-fps live probe timeout = %v, want %v", got, minimumLiveVideoProbeTimeout)
+	}
+}
+
+type fixedAgeVideoReader struct {
+	age time.Duration
+	pts bool
+}
+
+func (r fixedAgeVideoReader) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	frame := VideoAccessUnit{AnnexB: []byte{0, 0, 0, 1, 0x26}}
+	if r.pts {
+		frame.PTS = time.Now().Add(-r.age)
+	}
+	return frame, nil
+}
+
+func TestMeasureVideoCaptureLatencyUsesProductionSourceAge(t *testing.T) {
+	capture := &ScreenCapture{
+		frames: fixedAgeVideoReader{age: 100 * time.Millisecond, pts: true},
+		waitCh: make(chan struct{}),
+	}
+	lead, err := MeasureVideoCaptureLatency(context.Background(), capture, 30)
+	if err != nil {
+		t.Fatalf("measure production capture: %v", err)
+	}
+	if lead < 167*time.Millisecond || lead > 200*time.Millisecond {
+		t.Fatalf("production lead = %v, want approximately 167ms", lead)
+	}
+
+	untimestamped := &ScreenCapture{
+		frames: fixedAgeVideoReader{},
+		waitCh: make(chan struct{}),
+	}
+	if _, err := MeasureVideoCaptureLatency(context.Background(), untimestamped, 30); err == nil {
+		t.Fatal("untimestamped production capture was accepted")
+	}
+}
+
+type blockingVideoReader struct {
+	closed chan struct{}
+	waitCh chan struct{}
+}
+
+func (r *blockingVideoReader) Read([]byte) (int, error) {
+	<-r.closed
+	return 0, os.ErrClosed
+}
+
+func (r *blockingVideoReader) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	<-r.closed
+	return VideoAccessUnit{}, os.ErrClosed
+}
+
+func (r *blockingVideoReader) Close() error {
+	close(r.closed)
+	close(r.waitCh)
+	return nil
+}
+
+func TestMeasureVideoCaptureLatencyCancellationInterruptsRead(t *testing.T) {
+	waitCh := make(chan struct{})
+	reader := &blockingVideoReader{closed: make(chan struct{}), waitCh: waitCh}
+	capture := &ScreenCapture{stdout: reader, frames: reader, waitCh: waitCh}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := MeasureVideoCaptureLatency(ctx, capture, 30); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("canceled measurement = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled measurement took %v", elapsed)
+	}
+	if !capture.stopped {
+		t.Fatal("canceled measurement left its capture reader active")
 	}
 }
 
