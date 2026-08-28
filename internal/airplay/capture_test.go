@@ -1,6 +1,7 @@
 package airplay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -13,6 +14,25 @@ import (
 
 	"github.com/godbus/dbus/v5"
 )
+
+func TestRawVideoRelayCapsNegotiateWithInstalledParser(t *testing.T) {
+	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+		t.Skip("gst-launch-1.0 is unavailable")
+	}
+	const width, height = 4, 2
+	args := []string{
+		"--quiet",
+		"fdsrc", "fd=0",
+		"!", "video/x-raw,format=NV12,width=4,height=2,framerate=30/1",
+		"!", "rawvideoparse", "use-sink-caps=true",
+		"!", "fakesink",
+	}
+	cmd := exec.Command("gst-launch-1.0", args...)
+	cmd.Stdin = bytes.NewReader(make([]byte, width*height*3/2))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("raw relay caps failed real GStreamer negotiation: %v\n%s", err, output)
+	}
+}
 
 func TestWaylandEncoderStartFailureClosesEveryPipeDescriptor(t *testing.T) {
 	before := openDescriptorCount(t)
