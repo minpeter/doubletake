@@ -404,6 +404,87 @@ func TestResetRestoreTokenConcurrentDisconnectReportsCancellationAndOverallState
 	}
 }
 
+func TestCanceledResetReportsRollbackPersistenceFailures(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		lookupErrAt int
+		saveErrAt   int
+	}{
+		{name: "rollback lookup", lookupErrAt: 2},
+		{name: "rollback save", saveErrAt: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &controlledCredentialBackend{
+				credentials: &airplay.SavedCredentials{RestoreToken: "restore-1"},
+				lookupErrAt: test.lookupErrAt,
+				saveErrAt:   test.saveErrAt,
+			}
+			d, entry, _, _ := newResetTestDaemon(t, backend)
+			cleanupStarted := make(chan struct{})
+			cleanupRelease := make(chan struct{})
+			originalCancel := entry.cancelFn
+			entry.cancelFn = func() {
+				close(cleanupStarted)
+				<-cleanupRelease
+				originalCancel()
+			}
+			defer d.Shutdown()
+
+			resetResponse := make(chan Response, 1)
+			go func() {
+				resetResponse <- d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+			}()
+			waitForResetSignal(t, cleanupStarted, "cleanup did not start")
+			if response := d.handleDisconnect(Request{Cmd: "disconnect", Target: resetTestTarget}); !response.OK {
+				t.Fatalf("disconnect response = %+v", response)
+			}
+			close(cleanupRelease)
+
+			response := waitForResetResponse(t, resetResponse)
+			if response.OK || !strings.Contains(response.Error, "rollback failed") {
+				t.Fatalf("reset response = %+v, want explicit rollback failure", response)
+			}
+		})
+	}
+}
+
+func TestRestoreTokenResetReservationMigratesChangedCanvasExclusively(t *testing.T) {
+	d, entry, reservation, _ := newResetTestDaemon(t, &controlledCredentialBackend{})
+	oldKey := reservation.key
+	newKey := normalizedVideoCaptureKey(1280, 720, airplay.VideoCodecH264)
+	reservation.broadcast = nil
+	reservation.resetReservedBy = entry
+
+	d.mu.Lock()
+	migrated, err := d.migrateRestoreTokenResetReservationLocked(entry, newKey)
+	oldReleased := d.captureGroups[oldKey] == nil
+	newOwned := d.captureGroups[newKey] == reservation
+	d.mu.Unlock()
+	if err != nil || migrated != reservation || !oldReleased || !newOwned {
+		t.Fatalf("migration = %p, %v, oldReleased=%t newOwned=%t", migrated, err, oldReleased, newOwned)
+	}
+
+	occupiedKey := normalizedVideoCaptureKey(3840, 2160, airplay.VideoCodecH264)
+	occupied := &videoCaptureGroup{key: occupiedKey}
+	d.mu.Lock()
+	d.captureGroups[occupiedKey] = occupied
+	_, err = d.migrateRestoreTokenResetReservationLocked(entry, occupiedKey)
+	stillOwned := d.captureGroups[newKey] == reservation && entry.captureGroup == reservation
+	d.mu.Unlock()
+	if err == nil || !errors.Is(err, errCaptureGroupResetReserved) || !stillOwned {
+		t.Fatalf("occupied migration = %v, stillOwned=%t", err, stillOwned)
+	}
+
+	d.mu.Lock()
+	cleanup := d.detachStreamLocked(resetTestTarget)
+	reservationReleased := d.captureGroups[newKey] == nil
+	d.mu.Unlock()
+	cleanup.run()
+	if !reservationReleased {
+		t.Fatal("disconnect left migrated reservation behind")
+	}
+}
+
 func TestResetRestoreTokenClearsExclusiveTargetAndReconnectsActualPort(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -499,9 +580,17 @@ type controlledCredentialBackend struct {
 	saveStarted chan struct{}
 	saveRelease <-chan struct{}
 	saveOnce    sync.Once
+	lookupCalls int
+	saveCalls   int
+	lookupErrAt int
+	saveErrAt   int
 }
 
 func (b *controlledCredentialBackend) Lookup(string) (*airplay.SavedCredentials, error) {
+	b.lookupCalls++
+	if b.lookupErrAt > 0 && b.lookupCalls == b.lookupErrAt {
+		return nil, errors.New("injected lookup failure")
+	}
 	if b.lookupErr != nil {
 		err := b.lookupErr
 		b.lookupErr = nil
@@ -520,6 +609,10 @@ func (b *controlledCredentialBackend) Save(_ string, credentials *airplay.SavedC
 	}
 	if b.saveRelease != nil {
 		<-b.saveRelease
+	}
+	b.saveCalls++
+	if b.saveErrAt > 0 && b.saveCalls == b.saveErrAt {
+		return errors.New("injected save failure")
 	}
 	if b.saveErr != nil {
 		return b.saveErr

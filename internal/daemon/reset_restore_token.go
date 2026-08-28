@@ -1,6 +1,10 @@
 package daemon
 
-import "context"
+import (
+	"context"
+
+	"doubletake/internal/airplay"
+)
 
 func (d *Daemon) handleResetRestoreToken(req Request) Response {
 	d.mu.Lock()
@@ -68,22 +72,18 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 			group.resetReservedBy = nil
 		}
 		d.mu.Unlock()
-		if clearErr == nil {
-			_ = credentialReset.Rollback()
-		}
+		rollbackErr := rollbackRestoreTokenReset(credentialReset, clearErr)
 		d.streamWorkers.Done()
-		return Response{OK: false, State: state, Error: "daemon is shutting down"}
+		return Response{OK: false, State: state, Error: resetFailure("daemon is shutting down", rollbackErr)}
 	}
 	if !reservationCurrent {
 		if group.resetReservedBy == entry {
 			group.resetReservedBy = nil
 		}
 		d.mu.Unlock()
-		if clearErr == nil {
-			_ = credentialReset.Rollback()
-		}
+		rollbackErr := rollbackRestoreTokenReset(credentialReset, clearErr)
 		d.streamWorkers.Done()
-		return Response{OK: false, State: state, Error: "restore token reset was canceled for " + target}
+		return Response{OK: false, State: state, Error: resetFailure("restore token reset was canceled for "+target, rollbackErr)}
 	}
 	if clearErr != nil {
 		group.resetReservedBy = nil
@@ -132,12 +132,12 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 		d.mu.Unlock()
 		abandoned.run()
 		cancel()
-		_ = credentialReset.Rollback()
+		rollbackErr := credentialReset.Rollback()
 		d.streamWorkers.Done()
 		if shuttingDown {
-			return Response{OK: false, State: state, Error: "daemon is shutting down"}
+			return Response{OK: false, State: state, Error: resetFailure("daemon is shutting down", rollbackErr)}
 		}
-		return Response{OK: false, State: state, Error: "restore token reset was canceled for " + target}
+		return Response{OK: false, State: state, Error: resetFailure("restore token reset was canceled for "+target, rollbackErr)}
 	}
 	d.clearLastErrorForTargetLocked(target)
 	state = d.overallStateLocked()
@@ -149,6 +149,20 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 		d.connectAndStream(connCtx, replacement, target, port, "")
 	}()
 	return Response{OK: true, State: state, Device: target, DeviceIP: target}
+}
+
+func rollbackRestoreTokenReset(reset *airplay.RestoreTokenReset, clearErr error) error {
+	if clearErr != nil {
+		return nil
+	}
+	return reset.Rollback()
+}
+
+func resetFailure(message string, rollbackErr error) string {
+	if rollbackErr == nil {
+		return message
+	}
+	return message + "; restore token rollback failed: " + rollbackErr.Error()
 }
 
 // restoreTokenResetReservationCurrentLocked reports whether the exact stream

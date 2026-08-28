@@ -1354,6 +1354,10 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(ctx context.Context, entry *acti
 	if d.captureGroups == nil {
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
 	}
+	if _, err := d.migrateRestoreTokenResetReservationLocked(entry, key); err != nil {
+		d.mu.Unlock()
+		return nil, 0, err
+	}
 	group := d.captureGroups[key]
 	var captureCtx context.Context
 	var captureCancel context.CancelFunc
@@ -1474,6 +1478,10 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 	if d.captureGroups == nil {
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
 	}
+	if _, err := d.migrateRestoreTokenResetReservationLocked(entry, key); err != nil {
+		d.mu.Unlock()
+		return nil, err
+	}
 	group := d.captureGroups[key]
 	var captureCtx context.Context
 	var captureCancel context.CancelFunc
@@ -1563,6 +1571,30 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 	}()
 
 	return newBC, nil
+}
+
+// migrateRestoreTokenResetReservationLocked moves an owner-only reset claim
+// when the receiver negotiates a different canvas after reconnecting. It never
+// joins an occupied destination: reset replacement remains exclusive.
+func (d *Daemon) migrateRestoreTokenResetReservationLocked(entry *activeStream, key videoCaptureKey) (*videoCaptureGroup, error) {
+	reservation := entry.captureGroup
+	if reservation == nil || reservation.resetReservedBy != entry ||
+		reservation.broadcast != nil || reservation.capture != nil || reservation.cancel != nil {
+		return nil, nil
+	}
+	if reservation.key == key {
+		return reservation, nil
+	}
+	if d.captureGroups[reservation.key] != reservation {
+		return nil, context.Canceled
+	}
+	if d.captureGroups[key] != nil {
+		return nil, fmt.Errorf("%w: replacement canvas %dx%d is already active", errCaptureGroupResetReserved, key.maxWidth, key.maxHeight)
+	}
+	delete(d.captureGroups, reservation.key)
+	reservation.key = key
+	d.captureGroups[key] = reservation
+	return reservation, nil
 }
 
 // detachStreamLocked removes a single stream and transfers ownership of its
