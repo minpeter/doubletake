@@ -3,6 +3,7 @@ package airplay
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -64,6 +65,32 @@ func (b *recordingCredentialBackend) Save(deviceID string, creds *SavedCredentia
 	b.devices[deviceID] = creds
 	b.saves = append(b.saves, deviceID)
 	return nil
+}
+
+func TestCredentialStoreClearRestoreTokenRollsBackFileBackendAfterPersistFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store, err := NewCredentialStore(path)
+	if err != nil {
+		t.Fatalf("NewCredentialStore: %v", err)
+	}
+	if err := store.SaveRestoreToken("device-1", "restore-1"); err != nil {
+		t.Fatalf("SaveRestoreToken: %v", err)
+	}
+
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block mkdir"), 0600); err != nil {
+		t.Fatalf("create blocked parent: %v", err)
+	}
+	backend := store.backend.(*fileBackend)
+	backend.path = filepath.Join(blockedParent, "credentials.json")
+
+	if err := store.ClearRestoreToken("device-1"); err == nil {
+		t.Fatal("ClearRestoreToken unexpectedly succeeded with an invalid credential path")
+	}
+	creds := store.Lookup("device-1")
+	if creds == nil || creds.RestoreToken != "restore-1" {
+		t.Fatalf("failed persistence changed in-memory credentials: %+v", creds)
+	}
 }
 
 func TestCredentialStoreClearRestoreTokenUsesBackendWithoutDeletingEntry(t *testing.T) {

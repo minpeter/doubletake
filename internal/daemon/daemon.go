@@ -234,7 +234,10 @@ type videoCaptureGroup struct {
 	capture          *airplay.ScreenCapture
 	minimumVideoLead time.Duration
 	cancel           context.CancelFunc
+	resetReservedBy  *activeStream
 }
+
+var errCaptureGroupResetReserved = errors.New("capture group is reserved for restore-token reset")
 
 // daemonCleanup owns resources detached from the daemon's state maps. Building
 // a cleanup plan while holding d.mu makes the state change atomic; running it
@@ -265,6 +268,9 @@ func (cleanup *daemonCleanup) addStream(entry *activeStream) {
 		cleanup.clients = append(cleanup.clients, entry.client)
 		entry.client = nil
 	}
+	if entry.captureGroup != nil && entry.captureGroup.resetReservedBy == entry {
+		entry.captureGroup.resetReservedBy = nil
+	}
 	entry.captureGroup = nil
 }
 
@@ -278,6 +284,7 @@ func (cleanup *daemonCleanup) addCaptureGroup(group *videoCaptureGroup) {
 		group.capture = nil
 	}
 	group.broadcast = nil
+	group.resetReservedBy = nil
 }
 
 // run may block and therefore must never be called with d.mu held. Cancel all
@@ -1347,6 +1354,10 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(ctx context.Context, entry *acti
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
 	}
 	if group := d.captureGroups[key]; group != nil {
+		if group.resetReservedBy != nil && group.resetReservedBy != entry {
+			d.mu.Unlock()
+			return nil, 0, fmt.Errorf("%w: %dx%d", errCaptureGroupResetReserved, key.maxWidth, key.maxHeight)
+		}
 		entry.captureGroup = group
 		broadcast := group.broadcast
 		d.mu.Unlock()
@@ -1453,6 +1464,10 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
 	}
 	if group := d.captureGroups[key]; group != nil {
+		if group.resetReservedBy != nil && group.resetReservedBy != entry {
+			d.mu.Unlock()
+			return nil, fmt.Errorf("%w: %dx%d", errCaptureGroupResetReserved, key.maxWidth, key.maxHeight)
+		}
 		entry.captureGroup = group
 		broadcast := group.broadcast
 		d.mu.Unlock()

@@ -240,8 +240,17 @@ func (fb *fileBackend) Lookup(deviceID string) (*SavedCredentials, error) {
 }
 
 func (fb *fileBackend) Save(deviceID string, creds *SavedCredentials) error {
+	previous, existed := fb.devices[deviceID]
 	fb.devices[deviceID] = creds
-	return fb.persist()
+	if err := fb.persist(); err != nil {
+		if existed {
+			fb.devices[deviceID] = previous
+		} else {
+			delete(fb.devices, deviceID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (fb *fileBackend) persist() error {

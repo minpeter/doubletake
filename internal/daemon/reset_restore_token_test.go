@@ -2,11 +2,15 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"doubletake/internal/airplay"
 )
 
 func TestResetRestoreTokenRejectsMissingUnknownAndNonStreamingTargetsWithoutMutation(t *testing.T) {
@@ -75,6 +79,269 @@ func TestResetRestoreTokenRejectsSharedCaptureGroupWithoutMutation(t *testing.T)
 	creds := d.credStore.Lookup("device-1")
 	if creds == nil || creds.RestoreToken != "restore-1" {
 		t.Fatalf("shared-group rejection mutated credentials: %+v", creds)
+	}
+}
+
+func TestResetRestoreTokenKeepsDaemonResponsiveDuringCredentialSave(t *testing.T) {
+	saveStarted := make(chan struct{})
+	saveRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSave := func() { releaseOnce.Do(func() { close(saveRelease) }) }
+	backend := &controlledCredentialBackend{
+		credentials: &airplay.SavedCredentials{RestoreToken: "restore-1"},
+		saveStarted: saveStarted,
+		saveRelease: saveRelease,
+		saveErr:     errors.New("save failed"),
+	}
+	d, _, _, _ := newResetTestDaemon(t, backend)
+	defer d.Shutdown()
+	defer releaseSave()
+
+	resetResponse := make(chan Response, 1)
+	go func() {
+		resetResponse <- d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+	}()
+	waitForResetSignal(t, saveStarted, "credential save did not start")
+
+	statusResponse := make(chan Response, 1)
+	go func() {
+		statusResponse <- d.handleStatus()
+	}()
+	select {
+	case response := <-statusResponse:
+		if response.State != StateStreaming {
+			t.Fatalf("status during credential save = %+v, want original stream", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status blocked behind credential backend I/O")
+	}
+
+	releaseSave()
+	response := waitForResetResponse(t, resetResponse)
+	if response.OK || !strings.Contains(response.Error, "save failed") {
+		t.Fatalf("reset response = %+v, want credential save failure", response)
+	}
+}
+
+func TestResetRestoreTokenCredentialFailureIsAtomic(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		lookupErr error
+		saveErr   error
+	}{
+		{name: "lookup failure", lookupErr: errors.New("lookup failed")},
+		{name: "save failure", saveErr: errors.New("save failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &controlledCredentialBackend{
+				credentials: &airplay.SavedCredentials{PairingID: "pair-1", RestoreToken: "restore-1"},
+				lookupErr:   test.lookupErr,
+				saveErr:     test.saveErr,
+			}
+			d, entry, group, streamCtx := newResetTestDaemon(t, backend)
+			defer d.Shutdown()
+			d.lastError = "existing stream error"
+			d.lastErrorTarget = resetTestTarget
+
+			response := d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+
+			if response.OK {
+				t.Fatalf("reset unexpectedly succeeded: %+v", response)
+			}
+			d.mu.Lock()
+			streamPreserved := d.streams[resetTestTarget] == entry
+			groupPreserved := d.captureGroups[group.key] == group && entry.captureGroup == group
+			errorPreserved := d.lastError == "existing stream error" && d.lastErrorTarget == resetTestTarget
+			d.mu.Unlock()
+			if !streamPreserved || !groupPreserved {
+				t.Fatalf("credential failure changed stream state: stream=%t group=%t", streamPreserved, groupPreserved)
+			}
+			if !errorPreserved {
+				t.Fatalf("credential failure changed last error: %q for %q", d.lastError, d.lastErrorTarget)
+			}
+			select {
+			case <-streamCtx.Done():
+				t.Fatal("credential failure canceled the original stream")
+			default:
+			}
+			creds := d.credStore.Lookup("device-1")
+			if creds == nil || creds.RestoreToken != "restore-1" {
+				t.Fatalf("credential failure changed restore token: %+v", creds)
+			}
+
+			peer := &activeStream{deviceIP: "192.0.2.11", state: StateConnecting}
+			d.mu.Lock()
+			d.streams[peer.deviceIP] = peer
+			d.mu.Unlock()
+			broadcast, _, err := d.getOrStartPreparedCaptureGroup(context.Background(), peer, nil, 1920, 1080, airplay.VideoCodecH264)
+			if err != nil || broadcast != group.broadcast {
+				t.Fatalf("capture reservation remained after failed reset: broadcast=%p err=%v", broadcast, err)
+			}
+			d.mu.Lock()
+			delete(d.streams, peer.deviceIP)
+			peer.captureGroup = nil
+			d.mu.Unlock()
+		})
+	}
+}
+
+func TestResetRestoreTokenReservationExcludesCaptureGroupJoin(t *testing.T) {
+	saveStarted := make(chan struct{})
+	saveRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSave := func() { releaseOnce.Do(func() { close(saveRelease) }) }
+	backend := &controlledCredentialBackend{
+		credentials: &airplay.SavedCredentials{RestoreToken: "restore-1"},
+		saveStarted: saveStarted,
+		saveRelease: saveRelease,
+		saveErr:     errors.New("save failed"),
+	}
+	d, _, _, _ := newResetTestDaemon(t, backend)
+	defer d.Shutdown()
+	defer releaseSave()
+	peer := &activeStream{deviceIP: "192.0.2.11", state: StateConnecting}
+	d.streams[peer.deviceIP] = peer
+
+	resetResponse := make(chan Response, 1)
+	go func() {
+		resetResponse <- d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+	}()
+	waitForResetSignal(t, saveStarted, "credential save did not start")
+
+	type joinResult struct {
+		err error
+	}
+	joinResults := make(chan joinResult, 1)
+	go func() {
+		_, _, err := d.getOrStartPreparedCaptureGroup(context.Background(), peer, nil, 1920, 1080, airplay.VideoCodecH264)
+		joinResults <- joinResult{err: err}
+	}()
+	var result joinResult
+	select {
+	case result = <-joinResults:
+	case <-time.After(time.Second):
+		t.Fatal("peer capture join blocked behind credential backend I/O")
+	}
+	if result.err == nil || !strings.Contains(result.err.Error(), "reserved for restore-token reset") {
+		t.Fatalf("peer capture join error = %v, want reset reservation rejection", result.err)
+	}
+	d.mu.Lock()
+	joined := peer.captureGroup != nil
+	delete(d.streams, peer.deviceIP)
+	d.mu.Unlock()
+	if joined {
+		t.Fatal("peer joined capture group while restore-token reset was reserved")
+	}
+
+	releaseSave()
+	response := waitForResetResponse(t, resetResponse)
+	if response.OK || !strings.Contains(response.Error, "save failed") {
+		t.Fatalf("reset response = %+v, want credential save failure", response)
+	}
+}
+
+func TestResetRestoreTokenReservationMakesShutdownWait(t *testing.T) {
+	saveStarted := make(chan struct{})
+	saveRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSave := func() { releaseOnce.Do(func() { close(saveRelease) }) }
+	backend := &controlledCredentialBackend{
+		credentials: &airplay.SavedCredentials{RestoreToken: "restore-1"},
+		saveStarted: saveStarted,
+		saveRelease: saveRelease,
+	}
+	d, entry, _, _ := newResetTestDaemon(t, backend)
+	defer releaseSave()
+
+	cancelEvents := make(chan struct{}, 2)
+	originalCancel := entry.cancelFn
+	entry.cancelFn = func() {
+		originalCancel()
+		cancelEvents <- struct{}{}
+	}
+	resetResponse := make(chan Response, 1)
+	resetDone := make(chan struct{})
+	go func() {
+		resetResponse <- d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+		close(resetDone)
+	}()
+	defer func() {
+		releaseSave()
+		waitForResetSignal(t, resetDone, "reset did not finish during cleanup")
+	}()
+	waitForResetSignal(t, saveStarted, "credential save did not start")
+	select {
+	case <-cancelEvents:
+		// The old implementation canceled before credential I/O. Drain that event
+		// so only shutdown detachment can satisfy the wait below.
+	default:
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		d.Shutdown()
+		close(shutdownDone)
+	}()
+	waitForResetSignal(t, cancelEvents, "shutdown did not detach the reserved stream")
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned while credential I/O was still blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseSave()
+	response := waitForResetResponse(t, resetResponse)
+	if response.OK || !strings.Contains(response.Error, "shutting down") || response.State != StateIdle {
+		t.Fatalf("reset response during shutdown = %+v", response)
+	}
+	waitForResetSignal(t, shutdownDone, "Shutdown did not finish after reset released its reservation")
+}
+
+func TestResetRestoreTokenConcurrentDisconnectReportsCancellationAndOverallState(t *testing.T) {
+	backend := &controlledCredentialBackend{
+		credentials: &airplay.SavedCredentials{RestoreToken: "restore-1"},
+	}
+	d, entry, _, _ := newResetTestDaemon(t, backend)
+	cleanupStarted := make(chan struct{})
+	cleanupRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCleanup := func() { releaseOnce.Do(func() { close(cleanupRelease) }) }
+	originalCancel := entry.cancelFn
+	entry.cancelFn = func() {
+		close(cleanupStarted)
+		<-cleanupRelease
+		originalCancel()
+	}
+	independentGroup := &videoCaptureGroup{key: normalizedVideoCaptureKey(1280, 720)}
+	independent := &activeStream{
+		deviceIP:     "192.0.2.20",
+		deviceID:     "device-2",
+		port:         7000,
+		state:        StateStreaming,
+		captureGroup: independentGroup,
+	}
+	d.streams[independent.deviceIP] = independent
+	d.captureGroups[independentGroup.key] = independentGroup
+	defer d.Shutdown()
+	defer releaseCleanup()
+
+	resetResponse := make(chan Response, 1)
+	go func() {
+		resetResponse <- d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+	}()
+	waitForResetSignal(t, cleanupStarted, "old stream cleanup did not start")
+
+	disconnect := d.handleDisconnect(Request{Cmd: "disconnect", Target: resetTestTarget})
+	if !disconnect.OK || disconnect.State != StateStreaming {
+		t.Fatalf("concurrent disconnect response = %+v, want independent stream preserved", disconnect)
+	}
+	releaseCleanup()
+	response := waitForResetResponse(t, resetResponse)
+	if response.OK || !strings.Contains(response.Error, "canceled") {
+		t.Fatalf("reset response = %+v, want concurrent cancellation", response)
+	}
+	if strings.Contains(response.Error, "shutting down") || response.State != StateStreaming {
+		t.Fatalf("reset misreported concurrent disconnect: %+v", response)
 	}
 }
 
@@ -157,5 +424,91 @@ func TestResetRestoreTokenClearsExclusiveTargetAndReconnectsActualPort(t *testin
 		defer conn.Close()
 	case <-time.After(3 * time.Second):
 		t.Fatal("reset did not reconnect to the target's actual port")
+	}
+}
+
+const resetTestTarget = "192.0.2.10"
+
+type controlledCredentialBackend struct {
+	credentials *airplay.SavedCredentials
+	lookupErr   error
+	saveErr     error
+	saveStarted chan struct{}
+	saveRelease <-chan struct{}
+}
+
+func (b *controlledCredentialBackend) Lookup(string) (*airplay.SavedCredentials, error) {
+	if b.lookupErr != nil {
+		err := b.lookupErr
+		b.lookupErr = nil
+		return nil, err
+	}
+	if b.credentials == nil {
+		return nil, nil
+	}
+	credentials := *b.credentials
+	return &credentials, nil
+}
+
+func (b *controlledCredentialBackend) Save(_ string, credentials *airplay.SavedCredentials) error {
+	if b.saveStarted != nil {
+		close(b.saveStarted)
+	}
+	if b.saveRelease != nil {
+		<-b.saveRelease
+	}
+	if b.saveErr != nil {
+		return b.saveErr
+	}
+	updated := *credentials
+	b.credentials = &updated
+	return nil
+}
+
+func newResetTestDaemon(t *testing.T, backend airplay.CredentialBackend) (*Daemon, *activeStream, *videoCaptureGroup, context.Context) {
+	t.Helper()
+	d, err := New(Config{
+		SocketPath: filepath.Join(t.TempDir(), "doubletake.sock"),
+		CredFile:   filepath.Join(t.TempDir(), "credentials.json"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.credStore = airplay.NewCredentialStoreWithBackend(backend)
+	group := &videoCaptureGroup{
+		key:       normalizedVideoCaptureKey(1920, 1080),
+		broadcast: airplay.NewBroadcastCapture(nil),
+	}
+	streamCtx, cancel := context.WithCancel(context.Background())
+	entry := &activeStream{
+		deviceIP:     resetTestTarget,
+		deviceID:     "device-1",
+		port:         7000,
+		state:        StateStreaming,
+		captureGroup: group,
+		cancelFn:     cancel,
+	}
+	d.streams[resetTestTarget] = entry
+	d.captureGroups[group.key] = group
+	return d, entry, group, streamCtx
+}
+
+func waitForResetSignal(t *testing.T, signal <-chan struct{}, failure string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal(failure)
+	}
+}
+
+func waitForResetResponse(t *testing.T, responses <-chan Response) Response {
+	t.Helper()
+	select {
+	case response := <-responses:
+		return response
+	case <-time.After(time.Second):
+		t.Fatal("reset did not return")
+		return Response{}
 	}
 }
