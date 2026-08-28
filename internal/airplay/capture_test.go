@@ -138,6 +138,19 @@ func TestRecommendedAutomaticVideoLatencyUsesP95AndDeliveryMargin(t *testing.T) 
 	}
 }
 
+func TestCaptureMinimumVideoLeadIncludesWaylandRawRelay(t *testing.T) {
+	const measured = 300 * time.Millisecond
+	if got := captureMinimumVideoLead(capturePreparationWayland, 0); got != 250*time.Millisecond {
+		t.Fatalf("unmeasured Wayland split lead = %v, want 250ms", got)
+	}
+	if got := captureMinimumVideoLead(capturePreparationWayland, measured); got != measured {
+		t.Fatalf("larger measured Wayland lead = %v, want %v", got, measured)
+	}
+	if got := captureMinimumVideoLead(capturePreparationX11, 0); got != 0 {
+		t.Fatalf("X11 minimum lead = %v, want no split-pipeline override", got)
+	}
+}
+
 func TestLiveVideoProbeTimeoutTracksConfiguredFrameRate(t *testing.T) {
 	if got := liveVideoProbeTimeout(30); got != minimumLiveVideoProbeTimeout {
 		t.Fatalf("30fps live probe timeout = %v, want %v", got, minimumLiveVideoProbeTimeout)
@@ -392,7 +405,10 @@ func TestPipeWireVideoSourceCopiesPortalBuffersForSoftwareConversion(t *testing.
 
 func TestVAAPIPostprocReceivesOriginalPortalDMABuffer(t *testing.T) {
 	got := vaapiVideoImportStages()
-	want := []gstStage{{"vapostproc"}}
+	want := []gstStage{
+		{"vapostproc", "disable-passthrough=true"},
+		{"video/x-raw,format=NV12"},
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("VA-API import stages = %v, want %v", got, want)
 	}
@@ -406,10 +422,13 @@ func TestWaylandVideoInputStagesPreservePortalBufferOwnership(t *testing.T) {
 		wantImports []gstStage
 	}{
 		{
-			name:        "VA-API imports original portal buffer",
-			useVAAPI:    true,
-			wantSource:  gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=33"},
-			wantImports: []gstStage{{"vapostproc"}},
+			name:       "VA-API imports original portal buffer",
+			useVAAPI:   true,
+			wantSource: gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=33"},
+			wantImports: []gstStage{
+				{"vapostproc", "disable-passthrough=true"},
+				{"video/x-raw,format=NV12"},
+			},
 		},
 		{
 			name:       "software conversion copies portal buffer",
@@ -501,6 +520,53 @@ func TestBuildGstVideoPipeline(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("GStreamer pipeline = %v, want %v", got, want)
+	}
+}
+
+func TestBuildSplitWaylandVideoPipelineSerializesRawFramesBeforeEncoding(t *testing.T) {
+	encoder := encoderResult{
+		parts:     gstStage{"testh264enc", "bitrate=2500"},
+		rawFormat: "NV12",
+	}
+	producer, consumer := buildSplitGstVideoPipeline(
+		gstStage{"pipewiresrc", "fd=3", "path=42"},
+		[]gstStage{
+			{"vapostproc"},
+			{"compositor", "force-live=true"},
+			{"video/x-raw,width=2880,height=1800,framerate=30/1"},
+			lowLatencyVideoQueueStage(),
+		},
+		nil,
+		encoder,
+		1280,
+		720,
+		30,
+		true,
+	)
+	wantProducerSuffix := []string{
+		"!", "video/x-raw,width=1280,height=720,pixel-aspect-ratio=1/1",
+		"!", "fdsink", "fd=1", "sync=false", "async=false",
+	}
+	if got := producer[len(producer)-len(wantProducerSuffix):]; !reflect.DeepEqual(got, wantProducerSuffix) {
+		t.Fatalf("raw producer suffix = %v, want %v", got, wantProducerSuffix)
+	}
+	wantConsumerPrefix := []string{
+		"--quiet", "fdsrc", "fd=0", "do-timestamp=true",
+		"!", "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1",
+		"!", "rawvideoparse", "use-sink-caps=true",
+		"!", "testh264enc", "bitrate=2500",
+	}
+	if got := consumer[:len(wantConsumerPrefix)]; !reflect.DeepEqual(got, wantConsumerPrefix) {
+		t.Fatalf("encoder consumer prefix = %v, want %v", got, wantConsumerPrefix)
+	}
+	wantConsumerSuffix := []string{
+		"!", "rtph264pay", "pt=96", "mtu=60000", "aggregate-mode=none", "timestamp-offset=0", "seqnum-offset=0",
+		"!", "rtponviftimestamp", "ntp-offset=-1", "set-e-bit=false", "set-t-bit=false",
+		"!", "rtpstreampay",
+		"!", "fdsink", "fd=1", "sync=false", "async=false",
+	}
+	if got := consumer[len(consumer)-len(wantConsumerSuffix):]; !reflect.DeepEqual(got, wantConsumerSuffix) {
+		t.Fatalf("timestamped consumer suffix = %v, want %v", got, wantConsumerSuffix)
 	}
 }
 

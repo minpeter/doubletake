@@ -61,19 +61,25 @@ const (
 	// uses a fixed resolution.
 	testCaptureWidth  = 1920
 	testCaptureHeight = 1080
+
+	// The isolated Wayland encoder receives copied raw frames over a pipe. Its
+	// bounded copy/encode interval exceeds Apple's nominal 75 ms screen lead on
+	// the supported integrated-GPU path.
+	waylandRawRelayMinimumVideoLead = 250 * time.Millisecond
 )
 
 // ScreenCapture manages screen capture via GStreamer.
 type ScreenCapture struct {
-	cmd      *exec.Cmd // gst-launch-1.0 process
-	stdout   io.ReadCloser
-	frames   videoAccessUnitReader
-	cancel   context.CancelFunc
-	pwNodeID uint32
-	dbusConn *dbus.Conn    // portal session D-Bus connection (must stay open for Wayland)
-	waitCh   chan struct{} // closed when process exits
-	waitErr  error         // set before waitCh is closed
-	stopped  bool
+	cmd       *exec.Cmd // gst-launch-1.0 encoder process
+	sourceCmd *exec.Cmd // optional Wayland capture/serialization process
+	stdout    io.ReadCloser
+	frames    videoAccessUnitReader
+	cancel    context.CancelFunc
+	pwNodeID  uint32
+	dbusConn  *dbus.Conn    // portal session D-Bus connection (must stay open for Wayland)
+	waitCh    chan struct{} // closed when process exits
+	waitErr   error         // set before waitCh is closed
+	stopped   bool
 }
 
 type capturePreparationKind uint8
@@ -83,6 +89,13 @@ const (
 	capturePreparationWayland
 	capturePreparationTest
 )
+
+func captureMinimumVideoLead(kind capturePreparationKind, measured time.Duration) time.Duration {
+	if kind == capturePreparationWayland && measured < waylandRawRelayMinimumVideoLead {
+		return waylandRawRelayMinimumVideoLead
+	}
+	return measured
+}
 
 // CapturePreparation performs the potentially interactive part of screen
 // capture before the receiver session starts. In particular, a Wayland
@@ -101,8 +114,8 @@ type CapturePreparation struct {
 
 	timestampedOutput  bool
 	automaticHEVCAvail bool
-	// measuredVideoLatency is the minimum screen lead measured by the local 4K
-	// HEVC preflight. It is zero for H.264 and unmeasured software fallback.
+	// measuredVideoLatency is the minimum screen lead required by local capture:
+	// either the 4K HEVC preflight or the isolated Wayland raw relay.
 	measuredVideoLatency time.Duration
 
 	pwNodeID   uint32
@@ -204,6 +217,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	preparation.pwNodeID = nodeID
 	preparation.pwFd = pwFd
 	preparation.dbusConn = dbusConn
+	preparation.measuredVideoLatency = captureMinimumVideoLead(kind, preparation.measuredVideoLatency)
 	return preparation, nil
 }
 
@@ -742,7 +756,10 @@ func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, copyPortalBuffers 
 }
 
 func vaapiVideoImportStages() []gstStage {
-	return []gstStage{{"vapostproc"}}
+	return []gstStage{
+		{"vapostproc", "disable-passthrough=true"},
+		{"video/x-raw,format=NV12"},
+	}
 }
 
 func waylandVideoInputStages(fd int, nodeID uint32, fps int, useVAAPI bool) (gstStage, []gstStage) {
@@ -814,6 +831,10 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
 	for _, stage := range afterScale {
 		args = appendGstStage(args, stage)
 	}
+	return appendGstEncoderPipeline(args, encoder, timestampedOutput)
+}
+
+func appendGstEncoderPipeline(args []string, encoder encoderResult, timestampedOutput bool) []string {
 	if encoder.needsVulkan {
 		args = appendGstStage(args, gstStage{"vulkanupload"})
 	}
@@ -838,6 +859,35 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
 		args = appendGstStage(args, gstStage{"rtpstreampay"})
 	}
 	return appendGstStage(args, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
+}
+
+func buildSplitGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage, encoder encoderResult, maxWidth, maxHeight, fps int, timestampedOutput bool) (producer, consumer []string) {
+	producer = append([]string{"--quiet"}, source...)
+	for _, stage := range beforeConvert {
+		producer = appendGstStage(producer, stage)
+	}
+	producer = appendGstStage(producer, gstStage{"videoconvert"})
+	producer = appendGstStage(producer, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
+	for _, stage := range receiverScaleStages(maxWidth, maxHeight) {
+		producer = appendGstStage(producer, stage)
+	}
+	for _, stage := range afterScale {
+		producer = appendGstStage(producer, stage)
+	}
+	producer = appendGstStage(producer, gstStage{"fdsink", "fd=1", "sync=false", "async=false"})
+
+	maxWidth &^= 1
+	maxHeight &^= 1
+	consumer = []string{"--quiet", "fdsrc", "fd=0", "do-timestamp=true"}
+	consumer = appendGstStage(consumer, gstStage{
+		fmt.Sprintf(
+			"video/x-raw,format=%s,width=%d,height=%d,framerate=%d/1",
+			encoder.rawFormat, maxWidth, maxHeight, fps,
+		),
+	})
+	consumer = appendGstStage(consumer, gstStage{"rawvideoparse", "use-sink-caps=true"})
+	consumer = appendGstEncoderPipeline(consumer, encoder, timestampedOutput)
+	return producer, consumer
 }
 
 func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int, timestampedOutput bool) (*ScreenCapture, error) {
@@ -882,58 +932,107 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 		beforeConvert = append(beforeConvert,
 			gstStage{"compositor", "force-live=true", "ignore-inactive-pads=true", "background=black"},
 			gstStage{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", streamSize[0], streamSize[1], fps)},
+			lowLatencyVideoQueueStage(),
 		)
 	} else {
 		log.Printf("[CAPTURE] idle-frame compositor unavailable; using portal frame timing")
 	}
-	if hasCompositor {
-		afterScale = append(afterScale, lowLatencyVideoQueueStage())
-	} else {
+	if !hasCompositor {
 		afterScale = append(afterScale,
 			gstStage{"videorate", "drop-only=true", "skip-to-first=true"},
 			frameRateStage(fps),
 			lowLatencyVideoQueueStage(),
 		)
 	}
-	gstArgs := buildGstVideoPipeline(source, beforeConvert, afterScale, encoderParts, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+	rawWidth, rawHeight := cfg.MaxWidth&^1, cfg.MaxHeight&^1
+	if rawWidth <= 0 || rawHeight <= 0 {
+		rawWidth, rawHeight = streamSize[0]&^1, streamSize[1]&^1
+	}
+	if rawWidth <= 0 || rawHeight <= 0 {
+		cancel()
+		_ = pwFd.Close()
+		_ = dbusConn.Close()
+		return nil, fmt.Errorf("Wayland capture is missing both receiver and portal dimensions")
+	}
+	sourceArgs, encoderArgs := buildSplitGstVideoPipeline(
+		source, beforeConvert, afterScale, encoderParts,
+		rawWidth, rawHeight, fps, timestampedOutput,
+	)
+	dbg("[CAPTURE] gst-launch-1.0 (wayland source) %s", strings.Join(sourceArgs, " "))
+	dbg("[CAPTURE] gst-launch-1.0 (wayland encoder) %s", strings.Join(encoderArgs, " "))
 
-	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
-	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
-	cmd.ExtraFiles = []*os.File{pwFd}
+	sourceCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", sourceArgs...)
+	sourceCmd.ExtraFiles = []*os.File{pwFd}
+	rawFrames, err := sourceCmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		_ = pwFd.Close()
+		_ = dbusConn.Close()
+		return nil, fmt.Errorf("capture serialization pipe: %w", err)
+	}
+	sourceStderr, _ := sourceCmd.StderrPipe()
 
+	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", encoderArgs...)
+	cmd.Stdin = rawFrames
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		pwFd.Close()
-		dbusConn.Close()
-		return nil, fmt.Errorf("gst stdout pipe: %w", err)
+		_ = rawFrames.Close()
+		_ = pwFd.Close()
+		_ = dbusConn.Close()
+		return nil, fmt.Errorf("encoder stdout pipe: %w", err)
 	}
-	stderr, _ := cmd.StderrPipe()
+	encoderStderr, _ := cmd.StderrPipe()
 
-	waitResult, err := startGStreamerCommand(cmd)
+	encoderWait, err := startGStreamerCommand(cmd)
 	if err != nil {
 		cancel()
-		pwFd.Close()
-		dbusConn.Close()
-		return nil, fmt.Errorf("start gst-launch: %w", err)
+		_ = rawFrames.Close()
+		_ = pwFd.Close()
+		_ = dbusConn.Close()
+		return nil, fmt.Errorf("start encoder gst-launch: %w", err)
 	}
-	pwFd.Close() // child inherited it
+	sourceWait, err := startGStreamerCommand(sourceCmd)
+	if err != nil {
+		cancel()
+		_ = rawFrames.Close()
+		_ = pwFd.Close()
+		_ = dbusConn.Close()
+		<-encoderWait
+		return nil, fmt.Errorf("start capture gst-launch: %w", err)
+	}
+	_ = pwFd.Close() // source child inherited it
 
-	go logStderr("GST", stderr)
+	go logStderr("GST-SOURCE", sourceStderr)
+	go logStderr("GST-ENCODER", encoderStderr)
 
 	capture := &ScreenCapture{
-		cmd:      cmd,
-		stdout:   stdout,
-		cancel:   cancel,
-		pwNodeID: nodeID,
-		dbusConn: dbusConn,
-		waitCh:   make(chan struct{}),
+		cmd:       cmd,
+		sourceCmd: sourceCmd,
+		stdout:    stdout,
+		cancel:    cancel,
+		pwNodeID:  nodeID,
+		dbusConn:  dbusConn,
+		waitCh:    make(chan struct{}),
 	}
 	if timestampedOutput {
 		capture.frames = newRTPVideoAccessUnitReader(stdout, encoderParts.codec)
 	}
 	go func() {
-		capture.waitErr = <-waitResult
+		type processResult struct {
+			name string
+			err  error
+		}
+		results := make(chan processResult, 2)
+		go func() { results <- processResult{name: "capture", err: <-sourceWait} }()
+		go func() { results <- processResult{name: "encoder", err: <-encoderWait} }()
+		first := <-results
+		dbg("[CAPTURE] %s pipeline exited: %v", first.name, first.err)
+		cancel()
+		<-results
+		if first.err != nil {
+			capture.waitErr = fmt.Errorf("%s pipeline: %w", first.name, first.err)
+		}
 		close(capture.waitCh)
 	}()
 
@@ -1069,12 +1168,18 @@ func (sc *ScreenCapture) Stop() {
 	if sc.cmd != nil && sc.cmd.Process != nil {
 		_ = sc.cmd.Process.Signal(os.Interrupt)
 	}
+	if sc.sourceCmd != nil && sc.sourceCmd.Process != nil {
+		_ = sc.sourceCmd.Process.Signal(os.Interrupt)
+	}
 
 	select {
 	case <-sc.waitCh:
 	case <-time.After(2 * time.Second):
 		if sc.cmd != nil && sc.cmd.Process != nil {
 			_ = sc.cmd.Process.Kill()
+		}
+		if sc.sourceCmd != nil && sc.sourceCmd.Process != nil {
+			_ = sc.sourceCmd.Process.Kill()
 		}
 		<-sc.waitCh
 	}

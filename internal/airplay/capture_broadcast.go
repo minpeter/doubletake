@@ -24,8 +24,10 @@ const (
 	broadcastSinkDrainTimeout = 2 * time.Second
 )
 
-var errBroadcastSinkBacklog = errors.New("broadcast sink backlog limit exceeded")
-var errBroadcastSinkMode = errors.New("backpressured broadcast sink requires an otherwise unused capture")
+var (
+	errBroadcastSinkBacklog = errors.New("broadcast sink backlog limit exceeded")
+	errBroadcastSinkMode    = errors.New("backpressured broadcast sink requires an otherwise unused capture")
+)
 
 // BroadcastCapture reads from a single ScreenCapture and fans the raw byte
 // stream out to multiple registered sinks. Each sink has an independent,
@@ -55,6 +57,10 @@ type BroadcastCapture struct {
 	// following sequence, which gives attachment an exact cutover even when a
 	// source read has completed but has not yet been fanned out.
 	sequence uint64
+	// primer is the latest complete parameter-set plus random-access AU. A
+	// receiver attached after capture starts needs it before live P-frames are
+	// decodable.
+	primer VideoAccessUnit
 
 	drainTimeout time.Duration
 
@@ -72,6 +78,7 @@ type BroadcastSink struct {
 
 	queue       [][]byte
 	frameQueue  []VideoAccessUnit
+	primer      VideoAccessUnit
 	headOffset  int
 	queuedBytes int
 	// queuedFrameDuration is a nominal sample-duration sum. It deliberately does
@@ -154,6 +161,7 @@ func (bc *BroadcastCapture) AddSink() *BroadcastSink {
 		return s
 	}
 	s.startSequence = bc.sequence + 1
+	s.primer = bc.primer
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s
@@ -179,6 +187,7 @@ func (bc *BroadcastCapture) AddBackpressuredSink() (*BroadcastSink, error) {
 	}
 	bc.exclusive = true
 	s.startSequence = bc.sequence + 1
+	s.primer = bc.primer
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s, nil
@@ -266,6 +275,12 @@ func (bc *BroadcastCapture) runFrames() error {
 		frame, readErr := bc.src.ReadVideoAccessUnit()
 		if len(frame.AnnexB) > 0 {
 			bc.mu.Lock()
+			if len(frame.AnnexB) <= broadcastSinkQueueBytes && isDecoderPrimer(frame.AnnexB) {
+				bc.primer = VideoAccessUnit{
+					AnnexB: append(bc.primer.AnnexB[:0], frame.AnnexB...),
+					PTS:    frame.PTS,
+				}
+			}
 			sinks := make([]*BroadcastSink, 0, len(bc.sinks))
 			for _, sink := range bc.sinks {
 				if sink.startSequence <= sequence {
@@ -285,6 +300,39 @@ func (bc *BroadcastCapture) runFrames() error {
 			return readErr
 		}
 	}
+}
+
+func isDecoderPrimer(annexB []byte) bool {
+	var h264SPS, h264PPS, h264IDR bool
+	var hevcVPS, hevcSPS, hevcPPS, hevcIRAP bool
+	for _, nal := range splitAnnexBAccessUnit(annexB) {
+		raw := stripStartCode(nal)
+		if len(raw) == 0 {
+			continue
+		}
+		switch raw[0] & 0x1f {
+		case 5:
+			h264IDR = true
+		case 7:
+			h264SPS = true
+		case 8:
+			h264PPS = true
+		}
+		if len(raw) < 2 {
+			continue
+		}
+		switch nalType := hevcNALType(raw); nalType {
+		case 32:
+			hevcVPS = true
+		case 33:
+			hevcSPS = true
+		case 34:
+			hevcPPS = true
+		default:
+			hevcIRAP = hevcIRAP || nalType >= 16 && nalType <= 23
+		}
+	}
+	return h264SPS && h264PPS && h264IDR || hevcVPS && hevcSPS && hevcPPS && hevcIRAP
 }
 
 // finish stops accepting sinks, lets existing sinks drain, and only then
@@ -422,7 +470,7 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 }
 
 func (s *BroadcastSink) queueEmptyLocked() bool {
-	return len(s.queue) == 0 && len(s.frameQueue) == 0
+	return len(s.queue) == 0 && len(s.frameQueue) == 0 && len(s.primer.AnnexB) == 0
 }
 
 // finish marks source EOF without discarding data already queued.
@@ -452,6 +500,7 @@ func (s *BroadcastSink) abort() {
 			s.frameQueue[i].AnnexB = nil
 		}
 		s.frameQueue = nil
+		s.primer = VideoAccessUnit{}
 		s.headOffset = 0
 		s.queuedBytes = 0
 		s.queuedFrameDuration = 0
@@ -518,6 +567,17 @@ func (s *BroadcastSink) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 	}
 	if s.closed {
 		return VideoAccessUnit{}, io.EOF
+	}
+	if len(s.primer.AnnexB) > 0 {
+		primer := s.primer
+		s.primer = VideoAccessUnit{}
+		if len(s.frameQueue) > 0 && !s.frameQueue[0].PTS.IsZero() {
+			primer.PTS = s.frameQueue[0].PTS.Add(-s.frameDuration)
+		}
+		if s.inputClosed && len(s.frameQueue) == 0 && len(s.queue) == 0 {
+			s.closeDoneLocked()
+		}
+		return primer, nil
 	}
 	if len(s.frameQueue) == 0 {
 		s.closeDoneLocked()
