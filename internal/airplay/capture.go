@@ -734,26 +734,15 @@ func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, copyPortalBuffers 
 		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
 	}
 	if copyPortalBuffers {
-		// The compositor and pipewiresrc's keepalive path both retain the latest
-		// GstBuffer. With a small portal pool that can keep every PipeWire buffer
-		// checked out and freeze screencopy. Copying here returns the portal buffer
-		// as soon as pipewiresrc pulls it while downstream retains only the copy.
+		// The software path cannot import a portal DMA-BUF through VA-API. Copy
+		// immediately so downstream never retains a PipeWire-owned buffer.
 		stage = append(stage, "always-copy=true")
 	}
 	return stage
 }
 
 func vaapiVideoImportStages() []gstStage {
-	// Force a fresh VA surface even when the portal's DMA-BUF already satisfies
-	// downstream caps, then download it into system memory. The forced-live
-	// compositor may retain its latest input; retaining the portal DMA-BUF would
-	// eventually exhaust PipeWire's pool and repeat one stale capture timestamp.
-	return []gstStage{
-		{"vapostproc", "disable-passthrough=true"},
-		// An unfeatured raw caps filter means system memory while leaving the
-		// pixel format negotiable, preserving 10-bit portal input for HEVC.
-		{"video/x-raw"},
-	}
+	return []gstStage{{"vapostproc"}}
 }
 
 func waylandVideoInputStages(fd int, nodeID uint32, fps int, useVAAPI bool) (gstStage, []gstStage) {

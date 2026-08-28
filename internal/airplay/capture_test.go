@@ -390,12 +390,9 @@ func TestPipeWireVideoSourceCopiesPortalBuffersForSoftwareConversion(t *testing.
 	}
 }
 
-func TestVAAPIPostprocCopiesPortalDMABufferToSystemMemory(t *testing.T) {
+func TestVAAPIPostprocReceivesOriginalPortalDMABuffer(t *testing.T) {
 	got := vaapiVideoImportStages()
-	want := []gstStage{
-		{"vapostproc", "disable-passthrough=true"},
-		{"video/x-raw"},
-	}
+	want := []gstStage{{"vapostproc"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("VA-API import stages = %v, want %v", got, want)
 	}
@@ -409,13 +406,10 @@ func TestWaylandVideoInputStagesPreservePortalBufferOwnership(t *testing.T) {
 		wantImports []gstStage
 	}{
 		{
-			name:       "VA-API imports before system-memory copy",
-			useVAAPI:   true,
-			wantSource: gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=33"},
-			wantImports: []gstStage{
-				{"vapostproc", "disable-passthrough=true"},
-				{"video/x-raw"},
-			},
+			name:        "VA-API imports original portal buffer",
+			useVAAPI:    true,
+			wantSource:  gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=33"},
+			wantImports: []gstStage{{"vapostproc"}},
 		},
 		{
 			name:       "software conversion copies portal buffer",
