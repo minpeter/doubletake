@@ -181,14 +181,20 @@ func TestBroadcastCaptureReplaysDecoderPrimerToLateSink(t *testing.T) {
 		PTS:    boundary.PTS.Add(time.Second / 30),
 	}
 	frames <- live
+	<-reads
+	randomAccess := VideoAccessUnit{
+		AnnexB: []byte{0, 0, 0, 1, 0x65, 0x80},
+		PTS:    live.PTS.Add(time.Second / 30),
+	}
+	frames <- randomAccess
 	close(frames)
 
 	next, err := sink.ReadVideoAccessUnit()
 	if err != nil {
 		t.Fatalf("read live frame after decoder primer: %v", err)
 	}
-	if !bytes.Equal(next.AnnexB, live.AnnexB) || !next.PTS.Equal(live.PTS) {
-		t.Fatalf("live frame after primer = {%x %v}, want {%x %v}", next.AnnexB, next.PTS, live.AnnexB, live.PTS)
+	if !bytes.Equal(next.AnnexB, randomAccess.AnnexB) || !next.PTS.Equal(randomAccess.PTS) {
+		t.Fatalf("live frame after primer = {%x %v}, want random access {%x %v}", next.AnnexB, next.PTS, randomAccess.AnnexB, randomAccess.PTS)
 	}
 	if err := <-runDone; !errors.Is(err, io.EOF) {
 		t.Fatalf("broadcast run = %v, want EOF", err)

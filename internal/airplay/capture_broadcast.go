@@ -96,6 +96,7 @@ type BroadcastSink struct {
 	maxFrameQueueDuration time.Duration
 	backpressure          bool
 	blockedProducers      int // number waiting for queue handoff; guarded by mu
+	awaitingRandomAccess  bool
 
 	inputClosed   bool // the source ended; drain queue, then return EOF
 	closed        bool // explicitly removed; discard queue and return EOF
@@ -166,6 +167,7 @@ func (bc *BroadcastCapture) AddSink() *BroadcastSink {
 	s.primer = bc.primer
 	if len(s.primer.AnnexB) > 0 {
 		s.primer.PTS = bc.now()
+		s.awaitingRandomAccess = true
 	}
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
@@ -195,6 +197,7 @@ func (bc *BroadcastCapture) AddBackpressuredSink() (*BroadcastSink, error) {
 	s.primer = bc.primer
 	if len(s.primer.AnnexB) > 0 {
 		s.primer.PTS = bc.now()
+		s.awaitingRandomAccess = true
 	}
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
@@ -343,6 +346,25 @@ func isDecoderPrimer(annexB []byte) bool {
 	return h264SPS && h264PPS && h264IDR || hevcVPS && hevcSPS && hevcPPS && hevcIRAP
 }
 
+func isRandomAccessUnit(annexB []byte) bool {
+	for _, nal := range splitAnnexBAccessUnit(annexB) {
+		raw := stripStartCode(nal)
+		if len(raw) == 0 {
+			continue
+		}
+		if raw[0]&0x1f == 5 {
+			return true
+		}
+		if len(raw) >= 2 {
+			nalType := hevcNALType(raw)
+			if nalType >= 16 && nalType <= 23 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // finish stops accepting sinks, lets existing sinks drain, and only then
 // publishes BroadcastCapture completion.
 func (bc *BroadcastCapture) finish(err error) {
@@ -455,6 +477,12 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 	for {
 		if s.closed || s.inputClosed {
 			return io.ErrClosedPipe
+		}
+		if s.awaitingRandomAccess {
+			if !isRandomAccessUnit(frame.AnnexB) {
+				return nil
+			}
+			s.awaitingRandomAccess = false
 		}
 		if len(s.frameQueue) == 0 && len(frame.AnnexB) > s.maxQueuedBytes {
 			return errBroadcastSinkBacklog
