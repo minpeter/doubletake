@@ -48,7 +48,6 @@ type BroadcastCapture struct {
 	// adjacent PTS values. A leaky upstream queue can legitimately create large
 	// PTS gaps while only one encoded picture is pending.
 	frameDuration time.Duration
-	now           func() time.Time
 	mu            sync.Mutex
 	done          chan struct{}
 	err           error // set before done is closed
@@ -58,11 +57,6 @@ type BroadcastCapture struct {
 	// following sequence, which gives attachment an exact cutover even when a
 	// source read has completed but has not yet been fanned out.
 	sequence uint64
-	// Timestamped access-unit fan-out caches the latest complete parameter-set
-	// plus random-access AU. Legacy byte-stream fan-out retains its exact
-	// next-read cutover and therefore waits for the encoder's next keyframe.
-	primer VideoAccessUnit
-
 	drainTimeout time.Duration
 
 	sinks []*BroadcastSink
@@ -79,7 +73,6 @@ type BroadcastSink struct {
 
 	queue       [][]byte
 	frameQueue  []VideoAccessUnit
-	primer      VideoAccessUnit
 	headOffset  int
 	queuedBytes int
 	// queuedFrameDuration is a nominal sample-duration sum. It deliberately does
@@ -96,7 +89,6 @@ type BroadcastSink struct {
 	maxFrameQueueDuration time.Duration
 	backpressure          bool
 	blockedProducers      int // number waiting for queue handoff; guarded by mu
-	awaitingRandomAccess  bool
 
 	inputClosed   bool // the source ended; drain queue, then return EOF
 	closed        bool // explicitly removed; discard queue and return EOF
@@ -145,7 +137,6 @@ func NewBroadcastCaptureWithFrameRate(src *ScreenCapture, fps int) *BroadcastCap
 		src:           src,
 		frames:        src != nil && src.frames != nil,
 		frameDuration: time.Second / time.Duration(fps),
-		now:           time.Now,
 		done:          make(chan struct{}),
 		drainTimeout:  broadcastSinkDrainTimeout,
 	}
@@ -164,11 +155,6 @@ func (bc *BroadcastCapture) AddSink() *BroadcastSink {
 		return s
 	}
 	s.startSequence = bc.sequence + 1
-	s.primer = bc.primer
-	if len(s.primer.AnnexB) > 0 {
-		s.primer.PTS = bc.now()
-		s.awaitingRandomAccess = true
-	}
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s
@@ -194,11 +180,6 @@ func (bc *BroadcastCapture) AddBackpressuredSink() (*BroadcastSink, error) {
 	}
 	bc.exclusive = true
 	s.startSequence = bc.sequence + 1
-	s.primer = bc.primer
-	if len(s.primer.AnnexB) > 0 {
-		s.primer.PTS = bc.now()
-		s.awaitingRandomAccess = true
-	}
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s, nil
@@ -286,12 +267,6 @@ func (bc *BroadcastCapture) runFrames() error {
 		frame, readErr := bc.src.ReadVideoAccessUnit()
 		if len(frame.AnnexB) > 0 {
 			bc.mu.Lock()
-			if len(frame.AnnexB) <= broadcastSinkQueueBytes && isDecoderPrimer(frame.AnnexB) {
-				bc.primer = VideoAccessUnit{
-					AnnexB: append([]byte(nil), frame.AnnexB...),
-					PTS:    frame.PTS,
-				}
-			}
 			sinks := make([]*BroadcastSink, 0, len(bc.sinks))
 			for _, sink := range bc.sinks {
 				if sink.startSequence <= sequence {
@@ -311,58 +286,6 @@ func (bc *BroadcastCapture) runFrames() error {
 			return readErr
 		}
 	}
-}
-
-func isDecoderPrimer(annexB []byte) bool {
-	var h264SPS, h264PPS, h264IDR bool
-	var hevcVPS, hevcSPS, hevcPPS, hevcIRAP bool
-	for _, nal := range splitAnnexBAccessUnit(annexB) {
-		raw := stripStartCode(nal)
-		if len(raw) == 0 {
-			continue
-		}
-		switch raw[0] & 0x1f {
-		case 5:
-			h264IDR = true
-		case 7:
-			h264SPS = true
-		case 8:
-			h264PPS = true
-		}
-		if len(raw) < 2 {
-			continue
-		}
-		switch nalType := hevcNALType(raw); nalType {
-		case 32:
-			hevcVPS = true
-		case 33:
-			hevcSPS = true
-		case 34:
-			hevcPPS = true
-		default:
-			hevcIRAP = hevcIRAP || nalType >= 16 && nalType <= 23
-		}
-	}
-	return h264SPS && h264PPS && h264IDR || hevcVPS && hevcSPS && hevcPPS && hevcIRAP
-}
-
-func isRandomAccessUnit(annexB []byte) bool {
-	for _, nal := range splitAnnexBAccessUnit(annexB) {
-		raw := stripStartCode(nal)
-		if len(raw) == 0 {
-			continue
-		}
-		if raw[0]&0x1f == 5 {
-			return true
-		}
-		if len(raw) >= 2 {
-			nalType := hevcNALType(raw)
-			if nalType >= 16 && nalType <= 23 {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // finish stops accepting sinks, lets existing sinks drain, and only then
@@ -478,12 +401,6 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 		if s.closed || s.inputClosed {
 			return io.ErrClosedPipe
 		}
-		if s.awaitingRandomAccess {
-			if !isRandomAccessUnit(frame.AnnexB) {
-				return nil
-			}
-			s.awaitingRandomAccess = false
-		}
 		if len(s.frameQueue) == 0 && len(frame.AnnexB) > s.maxQueuedBytes {
 			return errBroadcastSinkBacklog
 		}
@@ -506,7 +423,7 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 }
 
 func (s *BroadcastSink) queueEmptyLocked() bool {
-	return len(s.queue) == 0 && len(s.frameQueue) == 0 && len(s.primer.AnnexB) == 0
+	return len(s.queue) == 0 && len(s.frameQueue) == 0
 }
 
 // finish marks source EOF without discarding data already queued.
@@ -536,7 +453,6 @@ func (s *BroadcastSink) abort() {
 			s.frameQueue[i].AnnexB = nil
 		}
 		s.frameQueue = nil
-		s.primer = VideoAccessUnit{}
 		s.headOffset = 0
 		s.queuedBytes = 0
 		s.queuedFrameDuration = 0
@@ -598,19 +514,11 @@ func (s *BroadcastSink) Read(p []byte) (int, error) {
 func (s *BroadcastSink) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for len(s.primer.AnnexB) == 0 && len(s.frameQueue) == 0 && !s.inputClosed && !s.closed {
+	for len(s.frameQueue) == 0 && !s.inputClosed && !s.closed {
 		s.cond.Wait()
 	}
 	if s.closed {
 		return VideoAccessUnit{}, io.EOF
-	}
-	if len(s.primer.AnnexB) > 0 {
-		primer := s.primer
-		s.primer = VideoAccessUnit{}
-		if s.inputClosed && len(s.frameQueue) == 0 && len(s.queue) == 0 {
-			s.closeDoneLocked()
-		}
-		return primer, nil
 	}
 	if len(s.frameQueue) == 0 {
 		s.closeDoneLocked()
