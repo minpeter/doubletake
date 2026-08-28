@@ -151,6 +151,17 @@ func TestCaptureMinimumVideoLeadIncludesWaylandRawRelay(t *testing.T) {
 	}
 }
 
+func TestWaylandRawVideoSizeBoundsReceiverCanvas(t *testing.T) {
+	width, height := waylandRawVideoSize(1<<30, 1<<30, [2]int{2880, 1800})
+	if width != 2160 || height != 2160 {
+		t.Fatalf("hostile square receiver canvas = %dx%d, want bounded 2160x2160", width, height)
+	}
+	width, height = waylandRawVideoSize(0, 0, [2]int{2881, 1801})
+	if width != 2880 || height != 1800 {
+		t.Fatalf("portal fallback canvas = %dx%d, want even 2880x1800", width, height)
+	}
+}
+
 func TestLiveVideoProbeTimeoutTracksConfiguredFrameRate(t *testing.T) {
 	if got := liveVideoProbeTimeout(30); got != minimumLiveVideoProbeTimeout {
 		t.Fatalf("30fps live probe timeout = %v, want %v", got, minimumLiveVideoProbeTimeout)

@@ -48,6 +48,7 @@ type BroadcastCapture struct {
 	// adjacent PTS values. A leaky upstream queue can legitimately create large
 	// PTS gaps while only one encoded picture is pending.
 	frameDuration time.Duration
+	now           func() time.Time
 	mu            sync.Mutex
 	done          chan struct{}
 	err           error // set before done is closed
@@ -57,9 +58,9 @@ type BroadcastCapture struct {
 	// following sequence, which gives attachment an exact cutover even when a
 	// source read has completed but has not yet been fanned out.
 	sequence uint64
-	// primer is the latest complete parameter-set plus random-access AU. A
-	// receiver attached after capture starts needs it before live P-frames are
-	// decodable.
+	// Timestamped access-unit fan-out caches the latest complete parameter-set
+	// plus random-access AU. Legacy byte-stream fan-out retains its exact
+	// next-read cutover and therefore waits for the encoder's next keyframe.
 	primer VideoAccessUnit
 
 	drainTimeout time.Duration
@@ -143,6 +144,7 @@ func NewBroadcastCaptureWithFrameRate(src *ScreenCapture, fps int) *BroadcastCap
 		src:           src,
 		frames:        src != nil && src.frames != nil,
 		frameDuration: time.Second / time.Duration(fps),
+		now:           time.Now,
 		done:          make(chan struct{}),
 		drainTimeout:  broadcastSinkDrainTimeout,
 	}
@@ -162,6 +164,9 @@ func (bc *BroadcastCapture) AddSink() *BroadcastSink {
 	}
 	s.startSequence = bc.sequence + 1
 	s.primer = bc.primer
+	if len(s.primer.AnnexB) > 0 {
+		s.primer.PTS = bc.now()
+	}
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s
@@ -188,6 +193,9 @@ func (bc *BroadcastCapture) AddBackpressuredSink() (*BroadcastSink, error) {
 	bc.exclusive = true
 	s.startSequence = bc.sequence + 1
 	s.primer = bc.primer
+	if len(s.primer.AnnexB) > 0 {
+		s.primer.PTS = bc.now()
+	}
 	bc.sinks = append(bc.sinks, s)
 	bc.mu.Unlock()
 	return s, nil
@@ -277,7 +285,7 @@ func (bc *BroadcastCapture) runFrames() error {
 			bc.mu.Lock()
 			if len(frame.AnnexB) <= broadcastSinkQueueBytes && isDecoderPrimer(frame.AnnexB) {
 				bc.primer = VideoAccessUnit{
-					AnnexB: append(bc.primer.AnnexB[:0], frame.AnnexB...),
+					AnnexB: append([]byte(nil), frame.AnnexB...),
 					PTS:    frame.PTS,
 				}
 			}
@@ -562,7 +570,7 @@ func (s *BroadcastSink) Read(p []byte) (int, error) {
 func (s *BroadcastSink) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for len(s.frameQueue) == 0 && !s.inputClosed && !s.closed {
+	for len(s.primer.AnnexB) == 0 && len(s.frameQueue) == 0 && !s.inputClosed && !s.closed {
 		s.cond.Wait()
 	}
 	if s.closed {
@@ -571,9 +579,6 @@ func (s *BroadcastSink) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 	if len(s.primer.AnnexB) > 0 {
 		primer := s.primer
 		s.primer = VideoAccessUnit{}
-		if len(s.frameQueue) > 0 && !s.frameQueue[0].PTS.IsZero() {
-			primer.PTS = s.frameQueue[0].PTS.Add(-s.frameDuration)
-		}
 		if s.inputClosed && len(s.frameQueue) == 0 && len(s.queue) == 0 {
 			s.closeDoneLocked()
 		}

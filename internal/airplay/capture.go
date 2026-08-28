@@ -97,6 +97,14 @@ func captureMinimumVideoLead(kind capturePreparationKind, measured time.Duration
 	return measured
 }
 
+func waylandRawVideoSize(receiverWidth, receiverHeight int, streamSize [2]int) (int, int) {
+	if receiverWidth <= 0 || receiverHeight <= 0 {
+		receiverWidth, receiverHeight = streamSize[0], streamSize[1]
+	}
+	receiverWidth, receiverHeight = fitVideoSize(receiverWidth, receiverHeight, 3840, 2160)
+	return receiverWidth &^ 1, receiverHeight &^ 1
+}
+
 // CapturePreparation performs the potentially interactive part of screen
 // capture before the receiver session starts. In particular, a Wayland
 // preparation completes the screencast portal request and retains its PipeWire
@@ -115,8 +123,9 @@ type CapturePreparation struct {
 	timestampedOutput  bool
 	automaticHEVCAvail bool
 	// measuredVideoLatency is the minimum screen lead required by local capture:
-	// either the 4K HEVC preflight or the isolated Wayland raw relay.
+	// the 4K HEVC preflight. minimumVideoLead also includes transport overhead.
 	measuredVideoLatency time.Duration
+	minimumVideoLead     time.Duration
 
 	pwNodeID   uint32
 	pwFd       *os.File
@@ -217,7 +226,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	preparation.pwNodeID = nodeID
 	preparation.pwFd = pwFd
 	preparation.dbusConn = dbusConn
-	preparation.measuredVideoLatency = captureMinimumVideoLead(kind, preparation.measuredVideoLatency)
+	preparation.minimumVideoLead = captureMinimumVideoLead(kind, preparation.measuredVideoLatency)
 	return preparation, nil
 }
 
@@ -403,6 +412,14 @@ func (p *CapturePreparation) MeasuredVideoLatency() time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.measuredVideoLatency
+}
+
+// MinimumVideoLead returns the full local capture/transport scheduling floor.
+func (p *CapturePreparation) MinimumVideoLead() time.Duration {
+	if p == nil {
+		return 0
+	}
+	return p.minimumVideoLead
 }
 
 // Close releases an unconsumed portal preparation. Once Start has taken
@@ -944,10 +961,7 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 			lowLatencyVideoQueueStage(),
 		)
 	}
-	rawWidth, rawHeight := cfg.MaxWidth&^1, cfg.MaxHeight&^1
-	if rawWidth <= 0 || rawHeight <= 0 {
-		rawWidth, rawHeight = streamSize[0]&^1, streamSize[1]&^1
-	}
+	rawWidth, rawHeight := waylandRawVideoSize(cfg.MaxWidth, cfg.MaxHeight, streamSize)
 	if rawWidth <= 0 || rawHeight <= 0 {
 		cancel()
 		_ = pwFd.Close()

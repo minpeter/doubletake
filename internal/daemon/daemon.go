@@ -1135,6 +1135,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	streamCfg := d.mirrorStreamConfig()
 	streamCfg.AutomaticHEVCAvailable = capturePreparation.AutomaticHEVCAvailable()
 	streamCfg.MeasuredVideoLatency = capturePreparation.MeasuredVideoLatency()
+	streamCfg.MinimumVideoLead = capturePreparation.MinimumVideoLead()
 	var broadcast *airplay.BroadcastCapture
 	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
 	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {

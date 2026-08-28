@@ -123,6 +123,8 @@ func TestBroadcastCaptureReplaysDecoderPrimerToLateSink(t *testing.T) {
 		waitCh: make(chan struct{}),
 	}
 	broadcast := NewBroadcastCaptureWithFrameRate(capture, 30)
+	replayPTS := time.Unix(110, 0)
+	broadcast.now = func() time.Time { return replayPTS }
 	runDone := make(chan error, 1)
 	go func() { runDone <- broadcast.Run() }()
 
@@ -140,6 +142,34 @@ func TestBroadcastCaptureReplaysDecoderPrimerToLateSink(t *testing.T) {
 
 	sink := broadcast.AddSink()
 	defer sink.Close()
+	replayDone := make(chan struct {
+		frame VideoAccessUnit
+		err   error
+	}, 1)
+	go func() {
+		frame, err := sink.ReadVideoAccessUnit()
+		replayDone <- struct {
+			frame VideoAccessUnit
+			err   error
+		}{frame: frame, err: err}
+	}()
+	var replayed VideoAccessUnit
+	select {
+	case result := <-replayDone:
+		if result.err != nil {
+			t.Fatalf("read replayed decoder primer: %v", result.err)
+		}
+		replayed = result.frame
+	case <-time.After(time.Second):
+		t.Fatal("cached decoder primer was not available immediately")
+	}
+	if !bytes.Equal(replayed.AnnexB, primer.AnnexB) {
+		t.Fatalf("first late-sink frame = %x, want cached decoder primer %x", replayed.AnnexB, primer.AnnexB)
+	}
+	if !replayed.PTS.Equal(replayPTS) {
+		t.Fatalf("replayed primer PTS = %v, want attachment PTS %v", replayed.PTS, replayPTS)
+	}
+
 	boundary := VideoAccessUnit{
 		AnnexB: []byte{0, 0, 0, 1, 0x61, 0x40},
 		PTS:    primer.PTS.Add(10 * time.Second),
@@ -153,16 +183,6 @@ func TestBroadcastCaptureReplaysDecoderPrimerToLateSink(t *testing.T) {
 	frames <- live
 	close(frames)
 
-	replayed, err := sink.ReadVideoAccessUnit()
-	if err != nil {
-		t.Fatalf("read replayed decoder primer: %v", err)
-	}
-	if !bytes.Equal(replayed.AnnexB, primer.AnnexB) {
-		t.Fatalf("first late-sink frame = %x, want cached decoder primer %x", replayed.AnnexB, primer.AnnexB)
-	}
-	if wantPTS := live.PTS.Add(-time.Second / 30); !replayed.PTS.Equal(wantPTS) {
-		t.Fatalf("replayed primer PTS = %v, want one frame before live PTS %v", replayed.PTS, wantPTS)
-	}
 	next, err := sink.ReadVideoAccessUnit()
 	if err != nil {
 		t.Fatalf("read live frame after decoder primer: %v", err)
@@ -170,6 +190,49 @@ func TestBroadcastCaptureReplaysDecoderPrimerToLateSink(t *testing.T) {
 	if !bytes.Equal(next.AnnexB, live.AnnexB) || !next.PTS.Equal(live.PTS) {
 		t.Fatalf("live frame after primer = {%x %v}, want {%x %v}", next.AnnexB, next.PTS, live.AnnexB, live.PTS)
 	}
+	if err := <-runDone; !errors.Is(err, io.EOF) {
+		t.Fatalf("broadcast run = %v, want EOF", err)
+	}
+}
+
+func TestBroadcastCapturePrimerSnapshotSurvivesRefresh(t *testing.T) {
+	frames := make(chan VideoAccessUnit)
+	reads := make(chan struct{}, 4)
+	capture := &ScreenCapture{
+		frames: &signaledVideoAccessUnitReader{frames: frames, reads: reads},
+		waitCh: make(chan struct{}),
+	}
+	broadcast := NewBroadcastCapture(capture)
+	broadcast.now = func() time.Time { return time.Unix(120, 0) }
+	runDone := make(chan error, 1)
+	go func() { runDone <- broadcast.Run() }()
+
+	first := VideoAccessUnit{AnnexB: []byte{
+		0, 0, 0, 1, 0x67, 0x42,
+		0, 0, 0, 1, 0x68, 0xce,
+		0, 0, 0, 1, 0x65, 0xaa,
+	}}
+	second := VideoAccessUnit{AnnexB: []byte{
+		0, 0, 0, 1, 0x67, 0x64,
+		0, 0, 0, 1, 0x68, 0xee,
+		0, 0, 0, 1, 0x65, 0xbb,
+	}}
+	<-reads
+	frames <- first
+	<-reads
+	sink := broadcast.AddSink()
+	defer sink.Close()
+	frames <- second
+	<-reads
+
+	got, err := sink.ReadVideoAccessUnit()
+	if err != nil {
+		t.Fatalf("read primer snapshot: %v", err)
+	}
+	if !bytes.Equal(got.AnnexB, first.AnnexB) {
+		t.Fatalf("primer snapshot = %x, want %x", got.AnnexB, first.AnnexB)
+	}
+	close(frames)
 	if err := <-runDone; !errors.Is(err, io.EOF) {
 		t.Fatalf("broadcast run = %v, want EOF", err)
 	}
