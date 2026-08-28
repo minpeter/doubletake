@@ -14,6 +14,52 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+func TestWaylandEncoderStartFailureClosesEveryPipeDescriptor(t *testing.T) {
+	before := openDescriptorCount(t)
+	for i := 0; i < 20; i++ {
+		source := exec.Command("true")
+		encoder := exec.Command("/definitely/not/a/doubletake-test-command")
+		pipes, err := openWaylandSplitPipes(source, encoder)
+		if err != nil {
+			t.Fatalf("openWaylandSplitPipes: %v", err)
+		}
+		if _, err := startWaylandEncoder(encoder, pipes); err == nil {
+			t.Fatal("startWaylandEncoder unexpectedly succeeded")
+		}
+	}
+	after := openDescriptorCount(t)
+	if after > before {
+		t.Fatalf("stderr setup failures leaked descriptors: before=%d after=%d", before, after)
+	}
+}
+
+func TestOpenWaylandSplitPipesCloseReleasesEveryDescriptor(t *testing.T) {
+	before := openDescriptorCount(t)
+	source := exec.Command("true")
+	encoder := exec.Command("true")
+	pipes, err := openWaylandSplitPipes(source, encoder)
+	if err != nil {
+		t.Fatalf("openWaylandSplitPipes: %v", err)
+	}
+	pipes.close()
+	after := openDescriptorCount(t)
+	if after > before {
+		t.Fatalf("pipe close leaked descriptors: before=%d after=%d", before, after)
+	}
+}
+
+func openDescriptorCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("/proc/self/fd is unavailable")
+	}
+	if err != nil {
+		t.Fatalf("read /proc/self/fd: %v", err)
+	}
+	return len(entries)
+}
+
 func TestCapturePreparationCloseReleasesUnstartedResources(t *testing.T) {
 	portalFD, peerFD, err := os.Pipe()
 	if err != nil {

@@ -907,6 +907,76 @@ func buildSplitGstVideoPipeline(source gstStage, beforeConvert, afterScale []gst
 	return producer, consumer
 }
 
+type waylandSplitPipes struct {
+	rawFrames     *os.File
+	sourceOutput  *os.File
+	sourceStderr  *os.File
+	sourceErrOut  *os.File
+	stdout        *os.File
+	encoderOutput *os.File
+	encoderStderr *os.File
+	encoderErrOut *os.File
+}
+
+func openWaylandSplitPipes(sourceCmd, encoderCmd *exec.Cmd) (*waylandSplitPipes, error) {
+	pipes := &waylandSplitPipes{}
+	var err error
+	pipes.rawFrames, pipes.sourceOutput, err = os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("capture serialization pipe: %w", err)
+	}
+	sourceCmd.Stdout = pipes.sourceOutput
+	pipes.sourceStderr, pipes.sourceErrOut, err = os.Pipe()
+	if err != nil {
+		pipes.close()
+		return nil, fmt.Errorf("capture stderr pipe: %w", err)
+	}
+	sourceCmd.Stderr = pipes.sourceErrOut
+	encoderCmd.Stdin = pipes.rawFrames
+	pipes.stdout, pipes.encoderOutput, err = os.Pipe()
+	if err != nil {
+		pipes.close()
+		return nil, fmt.Errorf("encoder stdout pipe: %w", err)
+	}
+	encoderCmd.Stdout = pipes.encoderOutput
+	pipes.encoderStderr, pipes.encoderErrOut, err = os.Pipe()
+	if err != nil {
+		pipes.close()
+		return nil, fmt.Errorf("encoder stderr pipe: %w", err)
+	}
+	encoderCmd.Stderr = pipes.encoderErrOut
+	return pipes, nil
+}
+
+func (pipes *waylandSplitPipes) close() {
+	if pipes == nil {
+		return
+	}
+	for _, closer := range []io.Closer{
+		pipes.rawFrames,
+		pipes.sourceOutput,
+		pipes.sourceStderr,
+		pipes.sourceErrOut,
+		pipes.stdout,
+		pipes.encoderOutput,
+		pipes.encoderStderr,
+		pipes.encoderErrOut,
+	} {
+		if closer != nil {
+			_ = closer.Close()
+		}
+	}
+}
+
+func startWaylandEncoder(cmd *exec.Cmd, pipes *waylandSplitPipes) (<-chan error, error) {
+	wait, err := startGStreamerCommand(cmd)
+	if err != nil {
+		pipes.close()
+		return nil, err
+	}
+	return wait, nil
+}
+
 func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int, timestampedOutput bool) (*ScreenCapture, error) {
 	if pwFd == nil || dbusConn == nil {
 		if pwFd != nil {
@@ -977,60 +1047,58 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 
 	sourceCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", sourceArgs...)
 	sourceCmd.ExtraFiles = []*os.File{pwFd}
-	rawFrames, err := sourceCmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		_ = pwFd.Close()
-		_ = dbusConn.Close()
-		return nil, fmt.Errorf("capture serialization pipe: %w", err)
-	}
-	sourceStderr, _ := sourceCmd.StderrPipe()
-
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", encoderArgs...)
-	cmd.Stdin = rawFrames
-	stdout, err := cmd.StdoutPipe()
+	pipes, err := openWaylandSplitPipes(sourceCmd, cmd)
 	if err != nil {
 		cancel()
-		_ = rawFrames.Close()
 		_ = pwFd.Close()
 		_ = dbusConn.Close()
-		return nil, fmt.Errorf("encoder stdout pipe: %w", err)
+		return nil, err
 	}
-	encoderStderr, _ := cmd.StderrPipe()
 
-	encoderWait, err := startGStreamerCommand(cmd)
+	encoderWait, err := startWaylandEncoder(cmd, pipes)
 	if err != nil {
 		cancel()
-		_ = rawFrames.Close()
 		_ = pwFd.Close()
 		_ = dbusConn.Close()
 		return nil, fmt.Errorf("start encoder gst-launch: %w", err)
 	}
+	_ = pipes.rawFrames.Close()
+	_ = pipes.encoderOutput.Close()
+	_ = pipes.encoderErrOut.Close()
 	sourceWait, err := startGStreamerCommand(sourceCmd)
 	if err != nil {
 		cancel()
-		_ = rawFrames.Close()
+		pipes.close()
 		_ = pwFd.Close()
 		_ = dbusConn.Close()
 		<-encoderWait
 		return nil, fmt.Errorf("start capture gst-launch: %w", err)
 	}
+	_ = pipes.sourceOutput.Close()
+	_ = pipes.sourceErrOut.Close()
 	_ = pwFd.Close() // source child inherited it
 
-	go logStderr("GST-SOURCE", sourceStderr)
-	go logStderr("GST-ENCODER", encoderStderr)
+	go func() {
+		defer pipes.sourceStderr.Close()
+		logStderr("GST-SOURCE", pipes.sourceStderr)
+	}()
+	go func() {
+		defer pipes.encoderStderr.Close()
+		logStderr("GST-ENCODER", pipes.encoderStderr)
+	}()
 
 	capture := &ScreenCapture{
 		cmd:       cmd,
 		sourceCmd: sourceCmd,
-		stdout:    stdout,
+		stdout:    pipes.stdout,
 		cancel:    cancel,
 		pwNodeID:  nodeID,
 		dbusConn:  dbusConn,
 		waitCh:    make(chan struct{}),
 	}
 	if timestampedOutput {
-		capture.frames = newRTPVideoAccessUnitReader(stdout, encoderParts.codec)
+		capture.frames = newRTPVideoAccessUnitReader(pipes.stdout, encoderParts.codec)
 	}
 	go func() {
 		type processResult struct {
