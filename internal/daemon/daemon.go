@@ -1354,24 +1354,34 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(ctx context.Context, entry *acti
 	if d.captureGroups == nil {
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
 	}
-	if group := d.captureGroups[key]; group != nil {
+	group := d.captureGroups[key]
+	var captureCtx context.Context
+	var captureCancel context.CancelFunc
+	if group != nil {
 		if group.resetReservedBy != nil && group.resetReservedBy != entry {
 			d.mu.Unlock()
 			return nil, 0, fmt.Errorf("%w: %dx%d", errCaptureGroupResetReserved, key.maxWidth, key.maxHeight)
 		}
-		entry.captureGroup = group
-		broadcast := group.broadcast
-		d.mu.Unlock()
-		preparation.Close()
-		if broadcast == nil {
-			return nil, 0, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+		if group.resetReservedBy == entry && group.broadcast == nil && group.capture == nil && group.cancel == nil {
+			captureCtx, captureCancel = context.WithCancel(context.Background())
+			group.cancel = captureCancel
+			group.resetReservedBy = nil
+		} else {
+			entry.captureGroup = group
+			broadcast := group.broadcast
+			d.mu.Unlock()
+			preparation.Close()
+			if broadcast == nil {
+				return nil, 0, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+			}
+			return broadcast, group.minimumVideoLead, nil
 		}
-		return broadcast, group.minimumVideoLead, nil
+	} else {
+		captureCtx, captureCancel = context.WithCancel(context.Background())
+		group = &videoCaptureGroup{key: key, cancel: captureCancel}
+		d.captureGroups[key] = group
+		entry.captureGroup = group
 	}
-
-	captureCtx, captureCancel := context.WithCancel(context.Background())
-	group := &videoCaptureGroup{key: key, cancel: captureCancel}
-	d.captureGroups[key] = group
 	entry.captureGroup = group
 	d.mu.Unlock()
 
@@ -1464,26 +1474,33 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 	if d.captureGroups == nil {
 		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
 	}
-	if group := d.captureGroups[key]; group != nil {
+	group := d.captureGroups[key]
+	var captureCtx context.Context
+	var captureCancel context.CancelFunc
+	if group != nil {
 		if group.resetReservedBy != nil && group.resetReservedBy != entry {
 			d.mu.Unlock()
 			return nil, fmt.Errorf("%w: %dx%d", errCaptureGroupResetReserved, key.maxWidth, key.maxHeight)
 		}
-		entry.captureGroup = group
-		broadcast := group.broadcast
-		d.mu.Unlock()
-		if broadcast == nil {
-			return nil, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+		if group.resetReservedBy == entry && group.broadcast == nil && group.capture == nil && group.cancel == nil {
+			captureCtx, captureCancel = context.WithCancel(context.Background())
+			group.cancel = captureCancel
+			group.resetReservedBy = nil
+		} else {
+			entry.captureGroup = group
+			broadcast := group.broadcast
+			d.mu.Unlock()
+			if broadcast == nil {
+				return nil, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+			}
+			return broadcast, nil
 		}
-		return broadcast, nil
+	} else {
+		captureCtx, captureCancel = context.WithCancel(context.Background())
+		group = &videoCaptureGroup{key: key, cancel: captureCancel}
+		d.captureGroups[key] = group
+		entry.captureGroup = group
 	}
-
-	// Publish the group and cancellation hook before entering the display portal
-	// or launching GStreamer. A targeted disconnect can then cancel an orphaned
-	// startup without affecting captures used by other canvas groups.
-	captureCtx, captureCancel := context.WithCancel(context.Background())
-	group := &videoCaptureGroup{key: key, cancel: captureCancel}
-	d.captureGroups[key] = group
 	entry.captureGroup = group
 	d.mu.Unlock()
 

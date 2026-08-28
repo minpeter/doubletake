@@ -58,25 +58,35 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
-	clearErr := d.credStore.ClearRestoreToken(deviceID)
+	credentialReset, clearErr := d.credStore.BeginRestoreTokenReset(deviceID)
 
 	d.mu.Lock()
 	reservationCurrent := d.restoreTokenResetReservationCurrentLocked(target, deviceID, port, entry, group)
-	if group.resetReservedBy == entry {
-		group.resetReservedBy = nil
-	}
 	state := d.overallStateLocked()
 	if d.shuttingDown {
+		if group.resetReservedBy == entry {
+			group.resetReservedBy = nil
+		}
 		d.mu.Unlock()
+		if clearErr == nil {
+			_ = credentialReset.Rollback()
+		}
 		d.streamWorkers.Done()
 		return Response{OK: false, State: state, Error: "daemon is shutting down"}
 	}
 	if !reservationCurrent {
+		if group.resetReservedBy == entry {
+			group.resetReservedBy = nil
+		}
 		d.mu.Unlock()
+		if clearErr == nil {
+			_ = credentialReset.Rollback()
+		}
 		d.streamWorkers.Done()
 		return Response{OK: false, State: state, Error: "restore token reset was canceled for " + target}
 	}
 	if clearErr != nil {
+		group.resetReservedBy = nil
 		d.mu.Unlock()
 		d.streamWorkers.Done()
 		return Response{OK: false, State: state, Error: "clear restore token: " + clearErr.Error()}
@@ -91,7 +101,17 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 		cancelFn:     cancel,
 		credentialCh: make(chan string, 1),
 	}
+	// Replace the old generation with an owner-only claim before releasing the
+	// daemon lock. Peers cannot create or join this key while physical cleanup
+	// runs; the designated replacement later converts the claim into a capture.
+	group.resetReservedBy = nil
 	cleanup := d.detachStreamLocked(target)
+	reservation := &videoCaptureGroup{
+		key:             group.key,
+		resetReservedBy: replacement,
+	}
+	replacement.captureGroup = reservation
+	d.captureGroups[group.key] = reservation
 	d.streams[target] = replacement
 	d.mu.Unlock()
 
@@ -112,6 +132,7 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 		d.mu.Unlock()
 		abandoned.run()
 		cancel()
+		_ = credentialReset.Rollback()
 		d.streamWorkers.Done()
 		if shuttingDown {
 			return Response{OK: false, State: state, Error: "daemon is shutting down"}
@@ -122,6 +143,7 @@ func (d *Daemon) handleResetRestoreToken(req Request) Response {
 	state = d.overallStateLocked()
 	d.mu.Unlock()
 
+	credentialReset.Commit()
 	go func() {
 		defer d.streamWorkers.Done()
 		d.connectAndStream(connCtx, replacement, target, port, "")

@@ -111,3 +111,47 @@ func TestCredentialStoreClearRestoreTokenUsesBackendWithoutDeletingEntry(t *test
 		t.Fatalf("backend credentials after clear = %+v", creds)
 	}
 }
+
+func TestRestoreTokenResetRollbackMergesConcurrentCredentialChanges(t *testing.T) {
+	backend := &recordingCredentialBackend{devices: map[string]*SavedCredentials{
+		"device-1": {PairingID: "pair-1", RestoreToken: "restore-1"},
+	}}
+	store := NewCredentialStoreWithBackend(backend)
+
+	reset, err := store.BeginRestoreTokenReset("device-1")
+	if err != nil {
+		t.Fatalf("BeginRestoreTokenReset: %v", err)
+	}
+	backend.devices["device-1"] = &SavedCredentials{
+		PairingID:    "pair-2",
+		RestoreToken: "",
+	}
+
+	if err := reset.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	creds := backend.devices["device-1"]
+	if creds.PairingID != "pair-2" || creds.RestoreToken != "restore-1" {
+		t.Fatalf("credentials after rollback = %+v", creds)
+	}
+}
+
+func TestRestoreTokenResetRollbackDoesNotOverwriteConcurrentToken(t *testing.T) {
+	backend := &recordingCredentialBackend{devices: map[string]*SavedCredentials{
+		"device-1": {RestoreToken: "restore-1"},
+	}}
+	store := NewCredentialStoreWithBackend(backend)
+
+	reset, err := store.BeginRestoreTokenReset("device-1")
+	if err != nil {
+		t.Fatalf("BeginRestoreTokenReset: %v", err)
+	}
+	backend.devices["device-1"] = &SavedCredentials{RestoreToken: "restore-2"}
+
+	if err := reset.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if got := backend.devices["device-1"].RestoreToken; got != "restore-2" {
+		t.Fatalf("restore token after rollback = %q, want concurrent token", got)
+	}
+}

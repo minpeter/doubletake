@@ -240,6 +240,59 @@ func TestResetRestoreTokenReservationExcludesCaptureGroupJoin(t *testing.T) {
 	}
 }
 
+func TestResetRestoreTokenReservationSurvivesPhysicalCaptureCleanup(t *testing.T) {
+	backend := &controlledCredentialBackend{
+		credentials: &airplay.SavedCredentials{RestoreToken: "restore-1"},
+	}
+	d, entry, oldGroup, _ := newResetTestDaemon(t, backend)
+	cleanupStarted := make(chan struct{})
+	cleanupRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCleanup := func() { releaseOnce.Do(func() { close(cleanupRelease) }) }
+	originalCancel := entry.cancelFn
+	entry.cancelFn = func() {
+		close(cleanupStarted)
+		<-cleanupRelease
+		originalCancel()
+	}
+	peer := &activeStream{deviceIP: "192.0.2.11", state: StateConnecting}
+	d.streams[peer.deviceIP] = peer
+	defer d.Shutdown()
+	defer releaseCleanup()
+
+	resetResponse := make(chan Response, 1)
+	go func() {
+		resetResponse <- d.handleResetRestoreToken(Request{Cmd: "reset-restore-token", Target: resetTestTarget})
+	}()
+	waitForResetSignal(t, cleanupStarted, "old capture cleanup did not start")
+
+	d.mu.Lock()
+	replacement := d.streams[resetTestTarget]
+	reservation := d.captureGroups[oldGroup.key]
+	reserved := reservation != nil && reservation != oldGroup &&
+		reservation.resetReservedBy == replacement &&
+		replacement.captureGroup == reservation
+	d.mu.Unlock()
+	if !reserved {
+		t.Fatal("replacement did not retain an exclusive capture-key reservation during cleanup")
+	}
+
+	_, _, joinErr := d.getOrStartPreparedCaptureGroup(
+		context.Background(), peer, nil, 1920, 1080, airplay.VideoCodecH264,
+	)
+	if joinErr == nil || !strings.Contains(joinErr.Error(), "reserved for restore-token reset") {
+		t.Fatalf("capture join during cleanup = %v, want reset reservation rejection", joinErr)
+	}
+	d.mu.Lock()
+	delete(d.streams, peer.deviceIP)
+	d.mu.Unlock()
+
+	releaseCleanup()
+	if response := waitForResetResponse(t, resetResponse); !response.OK {
+		t.Fatalf("reset response = %+v", response)
+	}
+}
+
 func TestResetRestoreTokenReservationMakesShutdownWait(t *testing.T) {
 	saveStarted := make(chan struct{})
 	saveRelease := make(chan struct{})
@@ -294,6 +347,9 @@ func TestResetRestoreTokenReservationMakesShutdownWait(t *testing.T) {
 	if response.OK || !strings.Contains(response.Error, "shutting down") || response.State != StateIdle {
 		t.Fatalf("reset response during shutdown = %+v", response)
 	}
+	if credentials := d.credStore.Lookup("device-1"); credentials == nil || credentials.RestoreToken != "restore-1" {
+		t.Fatalf("shutdown cancellation lost restore token: %+v", credentials)
+	}
 	waitForResetSignal(t, shutdownDone, "Shutdown did not finish after reset released its reservation")
 }
 
@@ -342,6 +398,9 @@ func TestResetRestoreTokenConcurrentDisconnectReportsCancellationAndOverallState
 	}
 	if strings.Contains(response.Error, "shutting down") || response.State != StateStreaming {
 		t.Fatalf("reset misreported concurrent disconnect: %+v", response)
+	}
+	if credentials := d.credStore.Lookup("device-1"); credentials == nil || credentials.RestoreToken != "restore-1" {
+		t.Fatalf("disconnect cancellation lost restore token: %+v", credentials)
 	}
 }
 
@@ -406,15 +465,19 @@ func TestResetRestoreTokenClearsExclusiveTargetAndReconnectsActualPort(t *testin
 	}
 	d.mu.Lock()
 	replacement := d.streams[old.deviceIP]
-	groupStillPresent := d.captureGroups[group.key] != nil
+	replacementGroup := d.captureGroups[group.key]
+	oldGroupStillPresent := replacementGroup == group
 	independentPreserved := d.streams[independent.deviceIP] == independent &&
 		d.captureGroups[independentGroup.key] == independentGroup
 	d.mu.Unlock()
 	if replacement == nil || replacement == old || replacement.port != address.Port {
 		t.Fatalf("replacement stream = %+v, want new entry on port %d", replacement, address.Port)
 	}
-	if groupStillPresent {
+	if oldGroupStillPresent {
 		t.Fatal("exclusive old capture group remained active")
+	}
+	if replacementGroup != nil && replacement.captureGroup != replacementGroup {
+		t.Fatal("replacement did not own the reserved capture generation")
 	}
 	if !independentPreserved {
 		t.Fatal("reset changed an independent stream or capture group")
@@ -435,6 +498,7 @@ type controlledCredentialBackend struct {
 	saveErr     error
 	saveStarted chan struct{}
 	saveRelease <-chan struct{}
+	saveOnce    sync.Once
 }
 
 func (b *controlledCredentialBackend) Lookup(string) (*airplay.SavedCredentials, error) {
@@ -452,7 +516,7 @@ func (b *controlledCredentialBackend) Lookup(string) (*airplay.SavedCredentials,
 
 func (b *controlledCredentialBackend) Save(_ string, credentials *airplay.SavedCredentials) error {
 	if b.saveStarted != nil {
-		close(b.saveStarted)
+		b.saveOnce.Do(func() { close(b.saveStarted) })
 	}
 	if b.saveRelease != nil {
 		<-b.saveRelease
