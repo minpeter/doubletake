@@ -725,19 +725,43 @@ func frameIntervalMillis(fps int) int {
 	return max(1, 1000/fps)
 }
 
-func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int) gstStage {
-	return gstStage{
+func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, copyPortalBuffers bool) gstStage {
+	stage := gstStage{
 		"pipewiresrc",
 		fmt.Sprintf("fd=%d", fd),
 		fmt.Sprintf("path=%d", nodeID),
 		"do-timestamp=true",
 		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
+	}
+	if copyPortalBuffers {
 		// The compositor and pipewiresrc's keepalive path both retain the latest
 		// GstBuffer. With a small portal pool that can keep every PipeWire buffer
 		// checked out and freeze screencopy. Copying here returns the portal buffer
 		// as soon as pipewiresrc pulls it while downstream retains only the copy.
-		"always-copy=true",
+		stage = append(stage, "always-copy=true")
 	}
+	return stage
+}
+
+func vaapiVideoImportStages() []gstStage {
+	// Force a fresh VA surface even when the portal's DMA-BUF already satisfies
+	// downstream caps, then download it into system memory. The forced-live
+	// compositor may retain its latest input; retaining the portal DMA-BUF would
+	// eventually exhaust PipeWire's pool and repeat one stale capture timestamp.
+	return []gstStage{
+		{"vapostproc", "disable-passthrough=true"},
+		// An unfeatured raw caps filter means system memory while leaving the
+		// pixel format negotiable, preserving 10-bit portal input for HEVC.
+		{"video/x-raw"},
+	}
+}
+
+func waylandVideoInputStages(fd int, nodeID uint32, fps int, useVAAPI bool) (gstStage, []gstStage) {
+	source := pipeWireVideoSourceStage(fd, nodeID, fps, !useVAAPI)
+	if !useVAAPI {
+		return source, nil
+	}
+	return source, vaapiVideoImportStages()
 }
 
 func lowLatencyVideoQueueStage() gstStage {
@@ -853,14 +877,14 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 	// The encoded dimensions are capped to the receiver's advertised display size
 	// when available. The actual result is read back from the codec SPS downstream.
 	const pwFdNum = 3
-	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
-
 	hasCompositor := streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor")
-
-	var beforeConvert []gstStage
-	if hasGstElement("vapostproc") {
-		beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
-	} else {
+	hasVAAPIPostproc := hasGstElement("vapostproc")
+	// VA-API needs the portal's original DMA-BUF. pipewiresrc's always-copy path
+	// can turn DMA-BUF map failures into black fallback frames before vapostproc
+	// gets a chance to import them. The software path still copies immediately
+	// so a forced-live compositor cannot exhaust a small portal buffer pool.
+	source, beforeConvert := waylandVideoInputStages(pwFdNum, nodeID, fps, hasVAAPIPostproc)
+	if !hasVAAPIPostproc {
 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
 	}
 

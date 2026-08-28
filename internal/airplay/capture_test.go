@@ -361,8 +361,22 @@ func TestFrameIntervalMillis(t *testing.T) {
 	}
 }
 
-func TestPipeWireVideoSourceCopiesPortalBuffers(t *testing.T) {
-	got := pipeWireVideoSourceStage(3, 42, 30)
+func TestPipeWireVideoSourcePreservesDMABuffersForVAAPI(t *testing.T) {
+	got := pipeWireVideoSourceStage(3, 42, 30, false)
+	want := gstStage{
+		"pipewiresrc",
+		"fd=3",
+		"path=42",
+		"do-timestamp=true",
+		"keepalive-time=33",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PipeWire VA-API source stage = %v, want %v", got, want)
+	}
+}
+
+func TestPipeWireVideoSourceCopiesPortalBuffersForSoftwareConversion(t *testing.T) {
+	got := pipeWireVideoSourceStage(3, 42, 30, true)
 	want := gstStage{
 		"pipewiresrc",
 		"fd=3",
@@ -372,7 +386,52 @@ func TestPipeWireVideoSourceCopiesPortalBuffers(t *testing.T) {
 		"always-copy=true",
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("PipeWire source stage = %v, want %v", got, want)
+		t.Fatalf("PipeWire software source stage = %v, want %v", got, want)
+	}
+}
+
+func TestVAAPIPostprocCopiesPortalDMABufferToSystemMemory(t *testing.T) {
+	got := vaapiVideoImportStages()
+	want := []gstStage{
+		{"vapostproc", "disable-passthrough=true"},
+		{"video/x-raw"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("VA-API import stages = %v, want %v", got, want)
+	}
+}
+
+func TestWaylandVideoInputStagesPreservePortalBufferOwnership(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		useVAAPI    bool
+		wantSource  gstStage
+		wantImports []gstStage
+	}{
+		{
+			name:       "VA-API imports before system-memory copy",
+			useVAAPI:   true,
+			wantSource: gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=33"},
+			wantImports: []gstStage{
+				{"vapostproc", "disable-passthrough=true"},
+				{"video/x-raw"},
+			},
+		},
+		{
+			name:       "software conversion copies portal buffer",
+			useVAAPI:   false,
+			wantSource: gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=33", "always-copy=true"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gotSource, gotImports := waylandVideoInputStages(3, 42, 30, tt.useVAAPI)
+			if !reflect.DeepEqual(gotSource, tt.wantSource) {
+				t.Fatalf("source stage = %v, want %v", gotSource, tt.wantSource)
+			}
+			if !reflect.DeepEqual(gotImports, tt.wantImports) {
+				t.Fatalf("import stages = %v, want %v", gotImports, tt.wantImports)
+			}
+		})
 	}
 }
 
