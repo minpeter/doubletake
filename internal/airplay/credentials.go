@@ -193,6 +193,24 @@ func (cs *CredentialStore) SaveRestoreToken(deviceID, restoreToken string) error
 	return cs.backend.Save(deviceID, creds)
 }
 
+// ClearRestoreToken removes only the Wayland screencast restore token for a
+// device. Pairing credentials and all other device entries are preserved.
+func (cs *CredentialStore) ClearRestoreToken(deviceID string) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	creds, err := cs.backend.Lookup(deviceID)
+	if err != nil {
+		return err
+	}
+	if creds == nil || creds.RestoreToken == "" {
+		return nil
+	}
+	updated := *creds
+	updated.RestoreToken = ""
+	return cs.backend.Save(deviceID, &updated)
+}
+
 // fileBackend stores credentials as a JSON file on disk.
 type fileBackend struct {
 	path    string

@@ -204,6 +204,7 @@ type activeStream struct {
 	device         string // friendly name
 	deviceIP       string
 	deviceID       string
+	port           int
 	state          State
 	audioMuted     bool
 	session        *airplay.MirrorSession
@@ -548,6 +549,8 @@ func (d *Daemon) handleRequest(req Request) Response {
 		return d.handleConnect(req)
 	case "disconnect":
 		return d.handleDisconnect(req)
+	case "reset-restore-token":
+		return d.handleResetRestoreToken(req)
 	case "mute":
 		return d.handleSetMute(req, true)
 	case "unmute":
@@ -783,6 +786,7 @@ func (d *Daemon) handleConnect(req Request) Response {
 	connCtx, cancel := context.WithCancel(context.Background())
 	entry := &activeStream{
 		deviceIP:     target,
+		port:         port,
 		state:        StateConnecting,
 		cancelFn:     cancel,
 		credentialCh: make(chan string, 1),
